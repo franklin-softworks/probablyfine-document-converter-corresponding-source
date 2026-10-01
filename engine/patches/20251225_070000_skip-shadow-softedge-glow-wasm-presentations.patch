@@ -1,0 +1,61 @@
+diff --git a/drawinglayer/source/processor2d/vclmetafileprocessor2d.cxx b/drawinglayer/source/processor2d/vclmetafileprocessor2d.cxx
+index 127f6819492b..dc42adcc5bd1 100644
+--- a/drawinglayer/source/processor2d/vclmetafileprocessor2d.cxx
++++ b/drawinglayer/source/processor2d/vclmetafileprocessor2d.cxx
+@@ -64,6 +64,9 @@
+ #include <drawinglayer/primitive2d/epsprimitive2d.hxx>
+ #include <drawinglayer/primitive2d/structuretagprimitive2d.hxx>
+ #include <drawinglayer/primitive2d/objectinfoprimitive2d.hxx> // for Title/Description metadata
++#include <drawinglayer/primitive2d/softedgeprimitive2d.hxx>  // for WASM skip
++#include <drawinglayer/primitive2d/glowprimitive2d.hxx>      // for WASM skip
++#include <drawinglayer/primitive2d/shadowprimitive2d.hxx>    // for WASM skip
+ #include <drawinglayer/primitive2d/fillgraphicprimitive2d.hxx>
+ #include <drawinglayer/converters.hxx>
+ #include <basegfx/matrix/b2dhommatrixtools.hxx>
+@@ -913,6 +916,46 @@ void VclMetafileProcessor2D::processBasePrimitive2D(const primitive2d::BasePrimi
+             // while painting these, so just ignore these
+             break;
+         }
++        case PRIMITIVE2D_ID_SOFTEDGEPRIMITIVE2D:
++        {
++#ifdef __EMSCRIPTEN__
++            // WASM: Skip soft edge blur effect - ProcessAndBlurAlphaMask causes hang.
++            // Just render children without the blur effect for faster PDF export.
++            const auto& rSoftEdge = static_cast<const primitive2d::SoftEdgePrimitive2D&>(rCandidate);
++            process(rSoftEdge.getChildren());
++#else
++            // Normal path: process recursively (will decompose and apply blur)
++            process(rCandidate);
++#endif
++            break;
++        }
++        case PRIMITIVE2D_ID_SHADOWPRIMITIVE2D:
++        {
++#ifdef __EMSCRIPTEN__
++            // WASM: Skip shadow blur effect - ProcessAndBlurAlphaMask causes hang.
++            // Just render children without the shadow blur for faster PDF export.
++            // Note: Shadows with blur > 0 use BitmapFilterStackBlur which hangs in WASM.
++            const auto& rShadow = static_cast<const primitive2d::ShadowPrimitive2D&>(rCandidate);
++            process(rShadow.getChildren());
++#else
++            // Normal path: process recursively (will decompose and apply shadow)
++            process(rCandidate);
++#endif
++            break;
++        }
++        case PRIMITIVE2D_ID_GLOWPRIMITIVE2D:
++        {
++#ifdef __EMSCRIPTEN__
++            // WASM: Skip glow blur effect - ProcessAndBlurAlphaMask causes hang.
++            // Just render children without the glow effect for faster PDF export.
++            const auto& rGlow = static_cast<const primitive2d::GlowPrimitive2D&>(rCandidate);
++            process(rGlow.getChildren());
++#else
++            // Normal path: process recursively (will decompose and apply glow)
++            process(rCandidate);
++#endif
++            break;
++        }
+         default:
+         {
+             // process recursively
