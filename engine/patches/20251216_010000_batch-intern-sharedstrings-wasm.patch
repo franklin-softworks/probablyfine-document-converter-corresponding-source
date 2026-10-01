@@ -1,0 +1,204 @@
+diff --git a/include/svl/sharedstringpool.hxx b/include/svl/sharedstringpool.hxx
+index 6880fec2a101..c704317d270b 100644
+--- a/include/svl/sharedstringpool.hxx
++++ b/include/svl/sharedstringpool.hxx
+@@ -13,6 +13,7 @@
+ #include <svl/svldllapi.h>
+ #include <rtl/ustring.hxx>
+ #include <memory>
++#include <vector>
+ 
+ class CharClass;
+ 
+@@ -47,6 +48,18 @@ public:
+      */
+     SharedString intern(const OUString& rStr);
+ 
++#ifdef __EMSCRIPTEN__
++    /**
++     * Batch intern multiple strings into the shared string pool.
++     * This is optimized for WASM to reduce WASM<->JS boundary crossings
++     * by processing strings in batches with fast ASCII uppercase conversion.
++     *
++     * @param rStrings vector of strings to intern
++     * @param nChunkSize number of strings to process per batch (0 = all at once)
++     */
++    void internBatch(const std::vector<OUString>& rStrings, size_t nChunkSize = 10000);
++#endif
++
+     /**
+      * Go through all string objects in the pool, and clear those that are no
+      * longer used outside of the pool.
+diff --git a/sc/source/filter/oox/sharedstringsbuffer.cxx b/sc/source/filter/oox/sharedstringsbuffer.cxx
+index 6198c8e1301a..4d4772b30f97 100644
+--- a/sc/source/filter/oox/sharedstringsbuffer.cxx
++++ b/sc/source/filter/oox/sharedstringsbuffer.cxx
+@@ -19,6 +19,11 @@
+ 
+ #include <sharedstringsbuffer.hxx>
+ 
++#ifdef __EMSCRIPTEN__
++#include <document.hxx>
++#include <svl/sharedstringpool.hxx>
++#endif
++
+ namespace oox::xls {
+ 
+ SharedStringsBuffer::SharedStringsBuffer( const WorkbookHelper& rHelper ) :
+@@ -37,6 +42,36 @@ void SharedStringsBuffer::finalizeImport()
+ {
+     for (auto & rString : maStrings)
+         rString->finalizeImport(*this);
++
++#ifdef __EMSCRIPTEN__
++    // WASM optimization: Pre-intern all shared strings in batch to reduce
++    // WASM<->JS boundary crossings. Each intern() call normally triggers UNO
++    // service calls that cross the boundary. By batching, we minimize this overhead.
++    // This is especially important for large XLSX files with many unique strings.
++    if (!maStrings.empty())
++    {
++        std::vector<OUString> aStringsToIntern;
++        aStringsToIntern.reserve(maStrings.size());
++
++        // Collect all plain string content from shared strings
++        for (const auto& rString : maStrings)
++        {
++            if (rString)
++            {
++                OUString aContent = rString->getStringContent();
++                if (!aContent.isEmpty())
++                    aStringsToIntern.push_back(aContent);
++            }
++        }
++
++        // Batch intern all strings with chunking (10K strings per chunk)
++        if (!aStringsToIntern.empty())
++        {
++            svl::SharedStringPool& rPool = getScDocument().GetSharedStringPool();
++            rPool.internBatch(aStringsToIntern, 10000);
++        }
++    }
++#endif
+ }
+ 
+ RichStringRef SharedStringsBuffer::getString( sal_Int32 nStringId ) const
+diff --git a/svl/source/misc/sharedstringpool.cxx b/svl/source/misc/sharedstringpool.cxx
+index 06cf8a5cef31..4a549cf458a8 100644
+--- a/svl/source/misc/sharedstringpool.cxx
++++ b/svl/source/misc/sharedstringpool.cxx
+@@ -10,6 +10,9 @@
+ #include <svl/sharedstringpool.hxx>
+ #include <svl/sharedstring.hxx>
+ #include <unotools/charclass.hxx>
++#ifdef __EMSCRIPTEN__
++#include <rtl/ustrbuf.hxx>
++#endif
+ 
+ #include <mutex>
+ #include <unordered_map>
+@@ -113,6 +116,105 @@ SharedString SharedStringPool::intern(const OUString& rStr)
+     return SharedString(rStr.pData, aUpper.pData);
+ }
+ 
++#ifdef __EMSCRIPTEN__
++namespace
++{
++// Fast ASCII-only uppercase conversion to avoid UNO service calls for common cases.
++// Returns empty OUString if string contains non-ASCII characters.
++OUString fastAsciiUppercase(const OUString& rStr)
++{
++    const sal_Int32 nLen = rStr.getLength();
++    const sal_Unicode* pChars = rStr.getStr();
++
++    // First pass: check if all ASCII and if any lowercase
++    bool bHasLowercase = false;
++    for (sal_Int32 i = 0; i < nLen; ++i)
++    {
++        sal_Unicode c = pChars[i];
++        if (c > 127)
++            return OUString(); // Non-ASCII, caller must use CharClass
++        if (c >= 'a' && c <= 'z')
++            bHasLowercase = true;
++    }
++
++    // If no lowercase, the string is already uppercase
++    if (!bHasLowercase)
++        return rStr;
++
++    // Convert to uppercase
++    OUStringBuffer aBuf(nLen);
++    for (sal_Int32 i = 0; i < nLen; ++i)
++    {
++        sal_Unicode c = pChars[i];
++        if (c >= 'a' && c <= 'z')
++            aBuf.append(static_cast<sal_Unicode>(c - 32));
++        else
++            aBuf.append(c);
++    }
++    return aBuf.makeStringAndClear();
++}
++}
++
++void SharedStringPool::internBatch(const std::vector<OUString>& rStrings, size_t nChunkSize)
++{
++    if (rStrings.empty())
++        return;
++
++    // Use default chunk size if not specified
++    if (nChunkSize == 0)
++        nChunkSize = rStrings.size();
++
++    // Process strings in chunks to allow progress reporting and reduce lock contention
++    const size_t nTotal = rStrings.size();
++
++    for (size_t nStart = 0; nStart < nTotal; nStart += nChunkSize)
++    {
++        const size_t nEnd = std::min(nStart + nChunkSize, nTotal);
++
++        // Hold lock for the duration of this chunk
++        std::scoped_lock<std::mutex> aGuard(mpImpl->maMutex);
++
++        for (size_t i = nStart; i < nEnd; ++i)
++        {
++            const OUString& rStr = rStrings[i];
++            StringWithHash aStrWithHash(rStr);
++
++            // Check if already in pool
++            auto [mapIt, bInserted] = mpImpl->maStrMap.emplace(aStrWithHash, rStr);
++            if (!bInserted)
++                continue; // Already exists, skip
++
++            // New string - compute uppercase
++            // Try fast ASCII path first to avoid expensive UNO call
++            OUString aUpper = fastAsciiUppercase(rStr);
++            if (aUpper.isEmpty() && !rStr.isEmpty())
++            {
++                // Non-ASCII string, must use CharClass (UNO service)
++                aUpper = mpImpl->mrCharClass.uppercase(rStr);
++            }
++
++            if (aUpper == rStr)
++                continue; // Already uppercase mapping
++
++            // Insert lower->upper mapping
++            StringWithHash aUpperWithHash(aUpper);
++            auto mapIt2 = mpImpl->maStrMap.find(aUpperWithHash);
++            if (mapIt2 != mpImpl->maStrMap.end())
++            {
++                // Upper string already exists
++                mapIt->second = mapIt2->first.str;
++            }
++            else
++            {
++                // Insert new upper->upper mapping
++                mapIt->second = aUpper;
++                mpImpl->maStrMap.emplace_hint(mapIt2, aUpperWithHash, aUpper);
++            }
++        }
++    }
++}
++#endif
++
+ void SharedStringPool::purge()
+ {
+     std::scoped_lock<std::mutex> aGuard(mpImpl->maMutex);

@@ -1,0 +1,79 @@
+diff --git a/sfx2/source/view/frmload.cxx b/sfx2/source/view/frmload.cxx
+index f100a94f463c..14cffe200e4f 100644
+--- a/sfx2/source/view/frmload.cxx
++++ b/sfx2/source/view/frmload.cxx
+@@ -19,6 +19,12 @@
+ 
+ #include <config_collab.h>
+ 
++#ifdef __EMSCRIPTEN__
++#include <iostream>
++#include <sfx2/sfxbasecontroller.hxx>
++#include <unotools/fcm.hxx>
++#endif
++
+ #include <sfx2/app.hxx>
+ #include <sfx2/bindings.hxx>
+ #include <sfx2/docfac.hxx>
+@@ -771,7 +777,13 @@ sal_Bool SAL_CALL SfxFrameLoader_Impl::load( const Sequence< PropertyValue >& rA
+             }
+             else
+             {
++#ifdef __EMSCRIPTEN__
++                std::cerr << "[FRMLOAD] About to call xLoadable->load()..." << std::endl;
++#endif
+                 xLoadable->load( aDescriptor.getPropertyValues() );
++#ifdef __EMSCRIPTEN__
++                std::cerr << "[FRMLOAD] xLoadable->load() returned" << std::endl;
++#endif
+             }
+         }
+         else
+@@ -781,6 +793,9 @@ sal_Bool SAL_CALL SfxFrameLoader_Impl::load( const Sequence< PropertyValue >& rA
+             xModel->attachResource( xModel->getURL(), aDescriptor.getPropertyValues() );
+         }
+ 
++#ifdef __EMSCRIPTEN__
++        std::cerr << "[FRMLOAD] Getting SolarMutexGuard..." << std::endl;
++#endif
+         SolarMutexGuard aGuard;
+ 
+         // get the SfxObjectShell (still needed at the moment)
+@@ -788,6 +803,9 @@ sal_Bool SAL_CALL SfxFrameLoader_Impl::load( const Sequence< PropertyValue >& rA
+         // SfxObjectShellLock would be even dangerous here, since the lifetime control should be done outside in case of success
+         const SfxObjectShellRef xDoc = impl_findObjectShell( xModel );
+         ENSURE_OR_THROW( xDoc.is(), "no SfxObjectShell for the given model" );
++#ifdef __EMSCRIPTEN__
++        std::cerr << "[FRMLOAD] Got SfxObjectShell" << std::endl;
++#endif
+ 
+         if (pEmptyURLFilter)
+         {
+@@ -803,6 +821,19 @@ sal_Bool SAL_CALL SfxFrameLoader_Impl::load( const Sequence< PropertyValue >& rA
+             xDoc->FinishedLoading();
+         }
+ 
++#ifdef __EMSCRIPTEN__
++        // WASM: Skip full view/controller creation (ScTabViewShell crashes).
++        // Create a headless controller to connect model→frame so that
++        // getTargetComponent() can find the model through the controller chain.
++        {
++            std::cerr << "[FRMLOAD] WASM: creating headless controller..." << std::endl;
++            rtl::Reference<SfxBaseController> pCtrl(new SfxBaseController(nullptr));
++            Reference<XController2> xController(static_cast<XController2*>(pCtrl.get()));
++            utl::ConnectFrameControllerModel(_rTargetFrame, xController, xModel);
++            std::cerr << "[FRMLOAD] WASM: headless controller connected" << std::endl;
++        }
++        bLoadSuccess = true;
++#else
+         // ensure the ID of the to-be-created view is in the descriptor, if possible
+         const SfxInterfaceId nViewId = impl_determineEffectiveViewId_nothrow( *xDoc, aDescriptor );
+         const sal_Int16 nViewNo = xDoc->GetFactory().GetViewNo_Impl( nViewId, 0 );
+@@ -820,6 +851,7 @@ sal_Bool SAL_CALL SfxFrameLoader_Impl::load( const Sequence< PropertyValue >& rA
+         }
+ 
+         bLoadSuccess = true;
++#endif
+     }
+     catch ( Exception& )
+     {
