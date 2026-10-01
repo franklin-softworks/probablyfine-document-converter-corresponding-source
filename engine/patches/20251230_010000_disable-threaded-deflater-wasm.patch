@@ -1,0 +1,29 @@
+diff --git a/package/source/zippackage/ZipPackageStream.cxx b/package/source/zippackage/ZipPackageStream.cxx
+index abc123..def456 100644
+--- a/package/source/zippackage/ZipPackageStream.cxx
++++ b/package/source/zippackage/ZipPackageStream.cxx
+@@ -795,6 +795,16 @@ bool ZipPackageStream::saveChild(
+                 // the full size, but it appears that at this point it usually is.
+                 sal_Int64 estimatedSize = xSeek.is() ? xSeek->getLength() : xStream->available();
+
++#ifdef __EMSCRIPTEN__
++                // WASM: Always use synchronous deflation.
++                // ThreadedDeflater and ZipOutputEntryInThread use comphelper::ThreadPool
++                // which can deadlock in WebAssembly's pthread implementation.
++                bBackgroundThreadDeflate = false;
++                rZipOut.writeLOC(std::move(pAutoTempEntry), bToBeEncrypted);
++                ZipOutputEntry aZipEntry(rZipOut.getStream(), m_xContext, pTempEntry, this, bToBeEncrypted);
++                aZipEntry.writeStream(xStream);
++                rZipOut.rawCloseEntry(bToBeEncrypted);
++#else
+                 if (estimatedSize > 1000000)
+                 {
+                     // Use ThreadDeflater which will split the stream into blocks and compress
+@@ -829,6 +839,7 @@ bool ZipPackageStream::saveChild(
+                     aZipEntry.writeStream(xStream);
+                     rZipOut.rawCloseEntry(bToBeEncrypted);
+                 }
++#endif
+             }
+         }
+         catch ( ZipException& )
