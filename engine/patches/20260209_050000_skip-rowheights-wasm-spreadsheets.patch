@@ -1,0 +1,100 @@
+diff --git a/sc/source/filter/oox/workbookhelper.cxx b/sc/source/filter/oox/workbookhelper.cxx
+index 5f7210c86a68..1b70fe4f7bdf 100644
+--- a/sc/source/filter/oox/workbookhelper.cxx
++++ b/sc/source/filter/oox/workbookhelper.cxx
+@@ -18,6 +18,9 @@
+  */
+ 
+ #include <workbookhelper.hxx>
++#ifdef __EMSCRIPTEN__
++#include <iostream>
++#endif
+ 
+ #include <com/sun/star/container/XIndexAccess.hpp>
+ #include <com/sun/star/container/XNameContainer.hpp>
+@@ -323,12 +326,50 @@ WorkbookGlobals::WorkbookGlobals( ExcelFilter& rFilter ) :
+ void WorkbookGlobals::ImplDestroy()
+ {
+     finalize();
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[WBGLOB] ImplDestroy: finalize done, unregistering..." << std::endl;
++#endif
+     mrExcelFilter.unregisterWorkbookGlobals();
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[WBGLOB] ImplDestroy complete" << std::endl;
++#endif
+ }
+ 
+ WorkbookGlobals::~WorkbookGlobals()
+ {
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[WBGLOB] ~WorkbookGlobals() destructor called" << std::endl;
++#endif
+     suppress_fun_call_w_exception(ImplDestroy());
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[WBGLOB] ~WorkbookGlobals() ImplDestroy done, resetting members..." << std::endl;
++    // Explicitly destroy members to find which one crashes
++    mxEditEngine.reset(); std::cerr << "[WBGLOB] editEngine done" << std::endl;
++    mxPageSettConverter.reset(); std::cerr << "[WBGLOB] pageSettConv done" << std::endl;
++    mxChartConverter.reset(); std::cerr << "[WBGLOB] chartConv done" << std::endl;
++    mxAddrConverter.reset(); std::cerr << "[WBGLOB] addrConv done" << std::endl;
++    mxUnitConverter.reset(); std::cerr << "[WBGLOB] unitConv done" << std::endl;
++    mxFmlaParser.reset(); std::cerr << "[WBGLOB] fmlaParser done" << std::endl;
++    mxPivotTables.reset(); std::cerr << "[WBGLOB] pivotTables done" << std::endl;
++    mxPivotCaches.reset(); std::cerr << "[WBGLOB] pivotCaches done" << std::endl;
++    mxConnections.reset(); std::cerr << "[WBGLOB] connections done" << std::endl;
++    mxScenarios.reset(); std::cerr << "[WBGLOB] scenarios done" << std::endl;
++    mxTables.reset(); std::cerr << "[WBGLOB] tables done" << std::endl;
++    mxDefNames.reset(); std::cerr << "[WBGLOB] defNames done" << std::endl;
++    mxExtLinks.reset(); std::cerr << "[WBGLOB] extLinks done" << std::endl;
++    mxSharedStrings.reset(); std::cerr << "[WBGLOB] sharedStrings done" << std::endl;
++    mxStyles.reset(); std::cerr << "[WBGLOB] styles done" << std::endl;
++    mxTheme.reset(); std::cerr << "[WBGLOB] theme done" << std::endl;
++    mxWorksheets.reset(); std::cerr << "[WBGLOB] worksheets done" << std::endl;
++    mxViewSettings.reset(); std::cerr << "[WBGLOB] viewSettings done" << std::endl;
++    mxWorkbookSettings.reset(); std::cerr << "[WBGLOB] wbSettings done" << std::endl;
++    mxFormulaBuffer.reset(); std::cerr << "[WBGLOB] formulaBuffer done" << std::endl;
++    mxProgressBar.reset(); std::cerr << "[WBGLOB] progressBar done" << std::endl;
++    mxDocImport.reset(); std::cerr << "[WBGLOB] docImport done" << std::endl;
++    mxVbaPrjStrg.reset(); std::cerr << "[WBGLOB] vbaPrjStrg done" << std::endl;
++    mxDoc.clear(); std::cerr << "[WBGLOB] doc done" << std::endl;
++    std::cerr << "[WBGLOB] all members reset — implicit destruction next" << std::endl;
++#endif
+ }
+ 
+ ScDocumentImport& WorkbookGlobals::getDocImport()
+@@ -654,15 +695,24 @@ void WorkbookGlobals::finalize()
+     if( !mrBaseFilter.isImportFilter() )
+         return;
+ 
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[WBGLOB_FIN] WorkbookGlobals::finalize() start" << std::endl;
++#endif
+     // #i74668# do not insert default sheets
+     mpDocShell->SetEmpty(false);
+     // enable automatic update of linked sheets and DDE links
+     mpDoc->EnableExecuteLink(true);
+     // #i79826# enable updating automatic row height after loading the document
+     mpDoc->UnlockAdjustHeight();
++#ifdef __EMSCRIPTEN__
++    // WASM: Skip UpdateAllRowHeights — triggers VCL text measuring which
++    // crashes in WASM. Cached row heights from the XLSX file are used instead.
++    std::cerr << "[WBGLOB_FIN] WASM: skipping UpdateAllRowHeights" << std::endl;
++#else
+     // check settings (potentially asking the user if optimal row height should be run now)
+     if (mpDocShell->GetRecalcRowHeightsMode()) // default is to always update
+         mpDocShell->UpdateAllRowHeights(/*bOnlyUsedRows=*/true);
++#endif
+ 
+     // #i76026# enable Undo after loading the document
+     mpDoc->EnableUndo(true);
+@@ -673,6 +723,9 @@ void WorkbookGlobals::finalize()
+     ScDrawLayer* pModel = mpDoc->GetDrawLayer();
+     if (pModel)
+         pModel->SetOpenInDesignMode(false);
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[WBGLOB_FIN] WorkbookGlobals::finalize() complete" << std::endl;
++#endif
+ }
+ 
+ 
