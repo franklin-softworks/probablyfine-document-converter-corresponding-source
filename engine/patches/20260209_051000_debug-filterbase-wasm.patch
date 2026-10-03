@@ -1,0 +1,39 @@
+diff --git a/oox/source/core/filterbase.cxx b/oox/source/core/filterbase.cxx
+index 9c8cc11596e4..cd5f536ca87f 100644
+--- a/oox/source/core/filterbase.cxx
++++ b/oox/source/core/filterbase.cxx
+@@ -19,6 +19,10 @@
+ 
+ #include <sal/config.h>
+ 
++#ifdef __EMSCRIPTEN__
++#include <iostream>
++#endif
++
+ #include <com/sun/star/container/XNameAccess.hpp>
+ #include <com/sun/star/drawing/XShape.hpp>
+ #include <com/sun/star/frame/XModel.hpp>
+@@ -483,7 +487,13 @@ sal_Bool SAL_CALL FilterBase::filter( const Sequence< PropertyValue >& rMediaDes
+                 if( mxImpl->mxInStream.is() )
+                 {
+                     mxImpl->mxStorage = implCreateStorage( mxImpl->mxInStream );
++#ifdef __EMSCRIPTEN__
++                    std::cerr << "[FILTERBASE] About to call importDocument()..." << std::endl;
++#endif
+                     bRet = mxImpl->mxStorage && importDocument();
++#ifdef __EMSCRIPTEN__
++                    std::cerr << "[FILTERBASE] importDocument() returned " << bRet << std::endl;
++#endif
+                 }
+             break;
+             case FILTERDIRECTION_EXPORT:
+@@ -495,6 +505,9 @@ sal_Bool SAL_CALL FilterBase::filter( const Sequence< PropertyValue >& rMediaDes
+             break;
+         }
+     }
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[FILTERBASE] filter() about to return " << bRet << " (unlockControllers + destructors will run)" << std::endl;
++#endif
+     return bRet;
+ }
+ 
