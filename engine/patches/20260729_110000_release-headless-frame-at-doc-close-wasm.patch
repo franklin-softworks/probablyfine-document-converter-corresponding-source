@@ -1,0 +1,153 @@
+From: Claude <claude@anthropic.com>
+Date: Wed, 29 Jul 2026 11:00:00 +0000
+Subject: [PATCH] WASM: release the LOK headless frame at document close (NTH-10)
+
+One LibreOffice frame leaked per conversion.
+
+Every LOK documentLoad goes through loadComponentFromURL(url, "_blank", ...)
+(desktop/source/lib/init.cxx), which registers a FRESH task frame in
+Desktop::m_aChildTaskContainer.  Natively that frame is closed on the way down
+through SfxBaseController::dispose() -> SfxFrame::DoClose_Impl().  Under WASM it
+never is, because of the two patches that make headless conversion possible:
+
+  * 20260209_054000_headless-controller-wasm.patch builds SfxBaseController with
+    a null SfxViewShell, so SfxBaseController::dispose() hits its early return
+    ("if (!m_pData->m_pViewShell) return;") BEFORE the model disconnect, the
+    attachFrame(empty) and the DoClose_Impl() that would close the frame;
+  * 20251221_203000_sfxbasemodel-lok-skip-viewframe.patch skips the SfxViewFrame
+    wiring in SfxBaseModel::connectController() for the same reason.
+
+Nothing was left that closes the frame.  `delete pDoc` in the bridge reaches
+LibLODocument_Impl::~LibLODocument_Impl -> mxComponent->dispose() ->
+SfxBaseModel::dispose() -> close(true), and SfxBaseModel::dispose() merely does
+m_seqControllers.clear() -- it never disposes a controller.  So the XFrame, the
+SfxBaseController it still references, and the closed model that controller
+holds in m_xHeadlessModel all survived every document close, and one zombie
+accumulated per conversion.  It went unnoticed only because the driver recycles
+the worker after every conversion, capping the count at one per LOK instance.
+
+Measured before the fix with tests/test_frame_leak.js, which drives ONE worker
+directly (bypassing the driver's per-conversion recycle) and counts the
+"[FRAME] LOK headless setComponent detach completed" lines emitted after
+"[SHUTDOWN] shutdown_office() called" -- i.e. the frames Desktop::terminate() ->
+impl_closeFrames() still finds alive:
+
+    5 conversions  -> 5 frames created, 0 released, 5 alive at teardown
+    10 conversions -> 10 frames created, 0 released, 10 alive at teardown
+
+Fix: close the frame from SfxBaseModel::close(), the symmetric counterpart of
+the connectController() skip.  It deliberately makes the SAME call that
+impl_closeFrames() has always made on these frames at shutdown --
+XCloseable::close(false), which routes into the BUG-20 headless detach fast path
+(20260727_210000) -- so this moves an already-proven teardown to the right
+moment rather than introducing a new one.  Frames are snapshotted before the
+loop because closing one disposes its controller, which can mutate
+m_seqControllers.  Re-entrancy is safe: m_bClosed is set true just above, so a
+re-entrant close() returns immediately, and the following dispose() is guarded
+by impl_isDisposed().  Any veto or DisposedException is swallowed and logged --
+worst case that one frame reverts to the old behaviour and impl_closeFrames()
+still collects it at shutdown, so a refusal can never block a document close.
+
+Guarded by __EMSCRIPTEN__ + comphelper::LibreOfficeKit::isActive(); native
+builds and non-LOK WASM paths are untouched.
+
+Ordering note: this lands BEFORE NTH-09 (in-instance worker reuse).  Raising the
+number of conversions per LOK instance is exactly what would turn this
+per-conversion leak into a real problem.
+
+diff --git a/sfx2/source/doc/sfxbasemodel.cxx b/sfx2/source/doc/sfxbasemodel.cxx
+--- a/sfx2/source/doc/sfxbasemodel.cxx
++++ b/sfx2/source/doc/sfxbasemodel.cxx
+@@ -23,6 +23,7 @@
+ #include <chrono>
+ #include <memory>
+ #include <optional>
++#include <vector>
+ #ifdef __EMSCRIPTEN__
+ #include <iostream>
+ #endif
+@@ -43,6 +44,8 @@
+ #include <com/sun/star/lang/NotInitializedException.hpp>
+ #include <com/sun/star/frame/Desktop.hpp>
+ #include <com/sun/star/frame/IllegalArgumentIOException.hpp>
++#include <com/sun/star/frame/XController.hpp>
++#include <com/sun/star/frame/XFrame.hpp>
+ #include <com/sun/star/frame/XUntitledNumbers.hpp>
+ #include <com/sun/star/frame/DoubleInitializationException.hpp>
+ #include <com/sun/star/embed/XStorage.hpp>
+@@ -1545,6 +1548,75 @@
+     m_pData->m_bClosed = true;
+     m_pData->m_bClosing = false;
+ 
++#ifdef __EMSCRIPTEN__
++    // WASM/LOK headless: release the frame this document was loaded into (NTH-10).
++    //
++    // Every LOK documentLoad goes through loadComponentFromURL(url, "_blank"),
++    // which registers a FRESH task frame in Desktop::m_aChildTaskContainer.
++    // Natively that frame is closed on the way down through
++    // SfxBaseController::dispose() -> SfxFrame::DoClose_Impl().  The WASM headless
++    // controller has no SfxViewShell, so dispose() takes its early return
++    // ("if (!m_pData->m_pViewShell) return;") long before that code, and
++    // connectController() above skips the SfxViewFrame wiring entirely for the
++    // same reason.  Nothing was left that closes the frame: SfxBaseModel::dispose()
++    // merely clears m_seqControllers without disposing anything, so the frame (and
++    // the controller it still references) survived every document close and one
++    // zombie accumulated per conversion.  Measured before this change with
++    // tests/test_frame_leak.js: 5 conversions in one LOK instance -> 5 frames still
++    // alive at teardown; 10 -> 10.
++    //
++    // Closing it here is the symmetric counterpart of the connectController() skip.
++    // It deliberately reuses the very call Desktop::terminate() -> impl_closeFrames()
++    // has always made on these frames at shutdown -- XCloseable::close(false), which
++    // routes into the BUG-20 headless detach fast path -- so this moves an
++    // already-proven teardown to the right moment instead of introducing a new one.
++    //
++    // Snapshot the frames first: closing one disposes its controller, which may
++    // mutate m_seqControllers.  Re-entrancy is safe -- m_bClosed is already true
++    // above, so a re-entrant close() returns immediately, and the dispose() below
++    // is guarded by impl_isDisposed().
++    if (comphelper::LibreOfficeKit::isActive())
++    {
++        std::vector< css::uno::Reference< css::frame::XFrame > > aFramesToClose;
++        for (const auto& rController : m_pData->m_seqControllers)
++        {
++            if (!rController.is())
++                continue;
++            try
++            {
++                css::uno::Reference< css::frame::XFrame > xFrame(rController->getFrame());
++                if (xFrame.is())
++                    aFramesToClose.push_back(xFrame);
++            }
++            catch (const css::uno::Exception&)
++            {
++            }
++        }
++        for (const auto& rFrame : aFramesToClose)
++        {
++            try
++            {
++                css::uno::Reference< css::util::XCloseable > xCloseFrame(rFrame, css::uno::UNO_QUERY);
++                if (xCloseFrame.is())
++                    xCloseFrame->close(false);
++                else
++                    rFrame->dispose();
++                std::cerr << "[SFXMODEL] LOK headless: frame released at document close"
++                          << std::endl << std::flush;
++            }
++            catch (const css::uno::Exception&)
++            {
++                // A frame that vetoes the close, or that is already gone, must never
++                // stop the document from closing.  Worst case we are back to the old
++                // behaviour for that one frame: impl_closeFrames() still catches it
++                // at shutdown.
++                std::cerr << "[SFXMODEL] LOK headless: frame close refused, leaving to teardown"
++                          << std::endl << std::flush;
++            }
++        }
++    }
++#endif
++
+     dispose();
+ }
+ 
