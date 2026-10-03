@@ -1,0 +1,25 @@
+diff --git a/svx/source/sdr/primitive2d/sdrgrafprimitive2d.cxx b/svx/source/sdr/primitive2d/sdrgrafprimitive2d.cxx
+index a6fc701da389..42be8d3f1abd 100644
+--- a/svx/source/sdr/primitive2d/sdrgrafprimitive2d.cxx
++++ b/svx/source/sdr/primitive2d/sdrgrafprimitive2d.cxx
+@@ -34,6 +34,20 @@ Primitive2DReference SdrGrafPrimitive2D::create2DDecomposition(
+ {
+     Primitive2DContainer aRetval;
+ 
++#ifdef __EMSCRIPTEN__
++    // WASM: Simplified decomposition - just create GraphicPrimitive2D without
++    // shadow/glow/soft-edge wrappers and without isTransparent() check.
++    // isTransparent() and the embedded effect primitives can trigger bitmap
++    // decompression which hangs in the WASM environment.
++    if (0 != getGraphicAttr().GetAlpha())
++    {
++        const Primitive2DReference xGraphicContentPrimitive(
++            new GraphicPrimitive2D(getTransform(), getGraphicObject(), getGraphicAttr()));
++        aRetval.push_back(xGraphicContentPrimitive);
++    }
++    return new GroupPrimitive2D(std::move(aRetval));
++#endif
++
+     // create unit outline polygon
+     const basegfx::B2DPolygon& aUnitOutline(basegfx::utils::createUnitPolygon());
+ 
