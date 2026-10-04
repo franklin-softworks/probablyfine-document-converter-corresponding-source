@@ -1,0 +1,38 @@
+--- a/oox/source/drawingml/shape.cxx
++++ b/oox/source/drawingml/shape.cxx
+@@ -989,8 +989,35 @@
+     else if (rServiceName == "com.sun.star.drawing.GraphicObjectShape" &&
+         mpGraphicPropertiesPtr && !mpGraphicPropertiesPtr->m_sMediaPackageURL.isEmpty())
+     {
++#ifdef __EMSCRIPTEN__
++        /*  WASM: keep the GRAPHIC rather than swapping in a MediaShape.
++
++            A <p:pic> carrying a video also carries a POSTER FRAME -- an ordinary
++            <a:blip> PNG, and in PowerPoint it is the still the audience sees
++            until the video plays. This branch replaces the graphic shape with a
++            MediaShape, which discards it.
++
++            That trade is right where the media can actually play. It cannot
++            here: NONE of the 90 libraries registered in the presentations VFS is
++            a media library (enumerated from the shipped soffice.data, not
++            guessed from a name). So the MediaShape renders nothing at all, and
++            the poster it replaced was the only thing on the slide that could
++            have drawn.
++
++            Measured on presentations/libreoffice_tests/video-loop.pptx: the
++            reference draws the poster at 16.65% non-white / 16.03% red; our page
++            was 0.0000% inked -- an ENTIRELY BLANK slide, from a document whose
++            poster is an ordinary PNG the engine renders every day.
++
++            A converter that cannot play a video should still show its still
++            frame, exactly as the reference does. Losing the video is expected
++            and fine; losing the picture is not.
++            bugs/video_poster_and_cell_annotations_not_rendered.md */
++        aServiceName = finalizeServiceName( rFilterBase, rServiceName, aShapeRectHmm );
++#else
+         aServiceName = finalizeServiceName( rFilterBase, u"com.sun.star.presentation.MediaShape"_ustr, aShapeRectHmm );
+         bIsEmbMedia = true;
++#endif
+     }
+     else
+     {
