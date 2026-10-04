@@ -1,0 +1,20 @@
+diff --git a/vcl/source/gdi/pdfwriter_impl2.cxx b/vcl/source/gdi/pdfwriter_impl2.cxx
+index 58fc31aafdf8..24f164692ffc 100644
+--- a/vcl/source/gdi/pdfwriter_impl2.cxx
++++ b/vcl/source/gdi/pdfwriter_impl2.cxx
+@@ -150,8 +150,15 @@ void PDFWriterImpl::implWriteBitmapEx( const Point& i_rPoint, const Size& i_rSiz
+ 
+             if( aNewBmpSize.Width() && aNewBmpSize.Height() )
+             {
++#ifdef __EMSCRIPTEN__
++                // WASM/LOK optimization: Use fast scaling for headless export.
++                // BestQuality is extremely slow for large images. Fast scaling
++                // provides acceptable quality for PDF output while being 10x faster.
++                aBitmapEx.Scale( aNewBmpSize, BmpScaleFlag::Fast );
++#else
+                 // #i121233# Use best quality for PDF exports
+                 aBitmapEx.Scale( aNewBmpSize, BmpScaleFlag::BestQuality );
++#endif
+             }
+             else
+             {
