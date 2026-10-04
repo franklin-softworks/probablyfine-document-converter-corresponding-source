@@ -1,0 +1,26 @@
+diff --git a/svx/source/table/viewcontactoftableobj.cxx b/svx/source/table/viewcontactoftableobj.cxx
+index ac7472c7126c..be07f341e415 100644
+--- a/svx/source/table/viewcontactoftableobj.cxx
++++ b/svx/source/table/viewcontactoftableobj.cxx
+@@ -351,6 +351,13 @@ namespace sdr::contact
+                                         cell.append(xCellReference);
+                                     }
+ 
++#ifdef __EMSCRIPTEN__
++                                    // WASM/LOK optimization: Skip shadow primitive creation.
++                                    // Shadow primitives are purely visual and not needed for
++                                    // headless PDF export. Skipping this eliminates ~50% of
++                                    // createNewSdrFillTextAttribute calls for table-heavy documents.
++                                    (void)aRetvalForShadow; // Suppress unused warning
++#else
+                                     // Create cell primitive without text.
+                                     aAttribute
+                                         = drawinglayer::primitive2d::createNewSdrFillTextAttribute(
+@@ -369,6 +376,7 @@ namespace sdr::contact
+                                     const drawinglayer::primitive2d::Primitive2DReference
+                                         xCellReference(pCellReference);
+                                     aRetvalForShadow.append(xCellReference);
++#endif
+                                 }
+                             }
+                             if (isTaggedPDF && pPage)
