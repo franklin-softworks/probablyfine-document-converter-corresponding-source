@@ -1,0 +1,11 @@
+diff --git a/static/CustomTarget_emscripten_fs_image.mk b/static/CustomTarget_emscripten_fs_image.mk
+--- a/static/CustomTarget_emscripten_fs_image.mk
++++ b/static/CustomTarget_emscripten_fs_image.mk
+@@ -1694,6 +1694,7 @@ gb_emscripten_fs_image_files += \
+ 	$(INSTROOT)/$(LIBO_SHARE_FOLDER)/registry/calc.xcd \
+     $(INSTROOT)/$(LIBO_SHARE_FOLDER)/registry/draw.xcd \
+     $(INSTROOT)/$(LIBO_SHARE_FOLDER)/registry/impress.xcd \
++    $(INSTROOT)/$(LIBO_SHARE_FOLDER)/registry/pdfimport.xcd \
+     $(INSTROOT)/$(LIBO_SHARE_FOLDER)/registry/math.xcd \
+     $(INSTROOT)/$(LIBO_SHARE_FOLDER)/registry/static.xcd \
+     $(INSTROOT)/$(LIBO_SHARE_FOLDER)/registry/xsltfilter.xcd \
