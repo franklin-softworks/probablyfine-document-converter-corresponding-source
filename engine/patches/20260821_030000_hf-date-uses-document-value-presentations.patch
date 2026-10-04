@@ -1,0 +1,34 @@
+--- a/sd/source/ui/app/sdmod2.cxx
++++ b/sd/source/ui/app/sdmod2.cxx
+@@ -430,6 +430,31 @@
+                 }
+                 else if( bDateTimeField )
+                 {
++#ifdef __EMSCRIPTEN__
++                    // Item 13, second path. The oox fix (datetime <a:fld> renders
++                    // its cached <a:t>) fixed 15 of 17 dates in sat15.pptx. The
++                    // remaining two come from HERE instead: Impress's header/footer
++                    // date, which is a different field class (SvxDateTimeField) and
++                    // never reaches the oox text-run path at all — measured, a probe
++                    // for SvxDateField fired ZERO times while these two still
++                    // printed today.
++                    //
++                    // When the setting is not "fixed" this formats DateTime::SYSTEM,
++                    // i.e. the CONVERSION date. Same three objections as the oox
++                    // path: it is not the document, it makes output
++                    // non-deterministic (so a dated deck can never be blessed and
++                    // re-flags every run), and it leaks when the conversion ran.
++                    //
++                    // Prefer the document's own text whenever the import captured
++                    // one. If it did not, fall through unchanged rather than render
++                    // an empty date — losing the placeholder entirely would be a
++                    // worse defect than a wrong value.
++                    if( !rSettings.mbDateTimeIsFixed && !rSettings.maDateTimeText.isEmpty() )
++                    {
++                        pInfo->SetRepresentation( rSettings.maDateTimeText );
++                        return;
++                    }
++#endif
+                     if( rSettings.mbDateTimeIsFixed )
+                     {
+                         aRepresentation = rSettings.maDateTimeText;
