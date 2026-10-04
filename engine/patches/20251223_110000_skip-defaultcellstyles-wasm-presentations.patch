@@ -1,0 +1,30 @@
+diff --git a/sd/source/core/drawdoc4.cxx b/sd/source/core/drawdoc4.cxx
+--- a/sd/source/core/drawdoc4.cxx	2026-01-29 12:35:46.757822699 +0000
++++ b/sd/source/core/drawdoc4.cxx	2026-01-29 12:35:46.758439226 +0000
+@@ -35,6 +35,7 @@
+ #include <DrawDocShell.hxx>
+ #include <editeng/eeitem.hxx>
+ #include <comphelper/diagnose_ex.hxx>
++#include <comphelper/lok.hxx>
+ #include <comphelper/processfactory.hxx>
+ #include <comphelper/propertyvalue.hxx>
+ #include <rtl/bootstrap.hxx>
+@@ -629,6 +630,18 @@
+     if (comphelper::IsFuzzing())
+         return;
+ 
++#ifdef __EMSCRIPTEN__
++    // WASM/LOK mode: Skip loading styles.xml - not needed for PDF export
++    // The XMLOasisStylesImporter service may not be available and the
++    // styles.xml file may not exist in the VFS
++    if (comphelper::LibreOfficeKit::isActive())
++    {
++        SAL_INFO("sd.core", "WASM/LOK: Skipping CreateDefaultCellStyles");
++        return;
++    }
++#endif
++
++
+     const Reference<css::uno::XComponentContext>& xContext(comphelper::getProcessComponentContext());
+     Reference<css::document::XImporter> xImporter(xContext->getServiceManager()->createInstanceWithArgumentsAndContext(
+         u"com.sun.star.comp.Draw.XMLOasisStylesImporter"_ustr,

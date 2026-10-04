@@ -1,0 +1,202 @@
+THIRD-PARTY NOTICES
+====================
+
+This product embeds compiled builds of LibreOffice (as WebAssembly modules,
+`soffice.wasm` / `soffice.data`) to perform document conversion entirely in
+the user's browser. This file lists the third-party software embedded in
+those builds, its licensing, and where to find the licence texts and
+modifications.
+
+--------------------------------------------------------------------------
+1. LibreOffice
+--------------------------------------------------------------------------
+
+LibreOffice is Copyright (C) its contributors, coordinated by The Document
+Foundation, and by earlier contributors to OpenOffice.org / Apache
+OpenOffice under prior licensing terms carried forward into the
+LibreOffice source tree.
+
+Licence: Mozilla Public License v2.0 (MPL-2.0), OR, at the recipient's
+option, GNU Lesser General Public License v3 or any later version
+(LGPLv3+), per LibreOffice's standard dual-licensing terms.
+
+Full licence texts: see "Licence texts" below.
+
+Upstream source (also recorded in `engine/upstream.json`):
+
+    Project:      LibreOffice core
+    Repository:   https://github.com/LibreOffice/core.git
+    Mirror:       https://git.libreoffice.org/core
+    Commit:       806d09e511ad82dc6c4b801b9ce9ee83cd201ed2
+    Version:      25.8.6.0.0+
+    Branch:       libreoffice-25-8
+    Describe:     libreoffice-25-8-branch-point-973-g806d09e511ad
+    Commit date:  2026-01-28T23:06:32+01:00
+
+Modifications: this project applies a series of first-party patches under
+`engine/patches/` to the above LibreOffice commit to make it build and run
+as WebAssembly (threading removal, inlined PDF import, VFS slimming
+support, and related changes). The patches are LibreOffice-derived works.
+
+The modifications are the files `engine/patches/*.patch`, applied in
+filename order by `engine/scripts/apply_patches.sh`, and are published as
+Corresponding Source (see below).
+
+Corresponding Source: MPL-2.0 and LGPLv3+ require that recipients of the
+compiled `soffice.wasm` / `soffice.data` be able to obtain the
+Corresponding Source — the above LibreOffice commit plus this project's
+patches plus the build recipe used to produce the shipped binaries.
+
+    Corresponding Source location:
+    https://github.com/franklin-softworks/probablyfine-document-converter-corresponding-source
+
+The README there maps each release to the tag holding its source.
+
+--------------------------------------------------------------------------
+2. Poppler (bundled inside the pdf-docx and pdf-pptx WASM modules)
+--------------------------------------------------------------------------
+
+The `pdf-docx` and `pdf-pptx` conversion modules (the modules that import
+PDF files) are built with LibreOffice's `--enable-poppler` option
+(`engine/modules/pdf-docx/autogen.input`, `engine/modules/pdf-pptx/autogen.input`)
+and additional first-party patches that inline Poppler's PDF parsing into
+the WebAssembly build in place of LibreOffice's normal subprocess-based
+PDF import (`engine/patches/*-pdfimport-inline-wasm-pdf-docx.patch`,
+`engine/patches/*-poppler-emscripten-no-fontconfig-pdf-docx.patch`).
+Poppler is therefore bundled inside those two shipped modules.
+
+Poppler is distributed under the GNU General Public License, version 2 or
+(at the distributor's option) any later version (GPL-2.0-or-later), per
+its own `COPYING` (GPLv2) and `COPYING3` (GPLv3) files. This project does
+not modify Poppler's own source beyond the build-configuration/Emscripten
+compatibility patches named above.
+
+--------------------------------------------------------------------------
+2a. Conveyance terms of the pdf-docx and pdf-pptx modules
+--------------------------------------------------------------------------
+
+Upstream LibreOffice deliberately isolates Poppler in a SEPARATE executable
+(`sdext/Executable_xpdfimport.mk`); the core libraries do not link it, and
+invoke it as a subprocess over pipes and exit codes. WebAssembly cannot
+spawn processes, so this project's patch links Poppler directly into the
+`pdfimport` library — the patch says so itself:
+
+    # On Emscripten, we need to link poppler directly since we can't spawn
+    # xpdfimport
+
+Poppler and LibreOffice therefore occupy one linear memory space in a single
+binary, communicating by direct in-process C++ calls rather than pipes. That
+is a combined work, not mere aggregation.
+
+ACCORDINGLY, `soffice.wasm` / `soffice.data` FOR THE `pdf-docx` AND
+`pdf-pptx` MODULES ARE CONVEYED UNDER THE GNU GENERAL PUBLIC LICENSE,
+VERSION 3 (GPLv3) — full text at `web/licenses/COPYING.GPL3`.
+
+These terms are available because:
+
+  - Poppler is GPL-2.0-**or-later**, so it may be taken under GPLv3.
+  - LibreOffice's MPL-2.0 §3.3 ("Distribution of a Larger Work") permits
+    additionally distributing Covered Software under a Secondary License,
+    which §1.12 defines to include the GPL. LibreOffice is not marked
+    "Incompatible With Secondary Licenses" (MPL Exhibit B).
+  - Independently, LGPLv3 §2 permits conveying a modified library under the
+    plain GNU GPL.
+
+The `documents`, `spreadsheets` and `presentations` modules do NOT contain
+Poppler and remain under MPL-2.0 / LGPLv3+.
+
+Poppler's own Corresponding Source is covered by the same LibreOffice
+upstream commit and patch set described in section 1 above (Poppler is
+vendored as a LibreOffice external module, unmodified apart from the
+build-configuration patches named above).
+
+--------------------------------------------------------------------------
+3. Bundled fonts
+--------------------------------------------------------------------------
+
+This product bundles third-party font files, fetched on demand by the
+browser only when a converted document names them. The font licences and
+their full texts are published with the site at
+https://docconverter.probablyfine.click/fonts/FONT_LICENSES.md.
+
+    - SIL Open Font Licence 1.1 — Liberation Mono, Liberation Sans and
+      Liberation Serif; the Noto family, including Noto Emoji; Carlito;
+      Caladea; NanumGothic; the BIZ UD family; Fira Sans; Jost; Lato;
+      Montserrat; Nunito; PT Sans; Poppins; Raleway; Source Sans 3; and
+      Work Sans.
+
+    - Bitstream Vera Licence, with the DejaVu changes in the public
+      domain — DejaVu Sans, DejaVu Sans Mono and DejaVu Serif.
+
+    - GNU GPL v2 with the Liberation font exception — Liberation Sans
+      Narrow, distributed unmodified as built in the Ubuntu package
+      fonts-liberation-sans-narrow 1:1.07.6-4. Its source
+      (fonts-liberation-sans-narrow_1.07.6.orig.tar.gz,
+      fonts-liberation-sans-narrow_1.07.6-4.debian.tar.xz and the signed
+      .dsc) is at
+      http://archive.ubuntu.com/ubuntu/pool/main/f/fonts-liberation-sans-narrow/
+
+    - Apache Licence 2.0 — Droid Sans Fallback.
+
+    - Ubuntu Font Licence 1.0 — Ubuntu, Ubuntu Mono, Ubuntu Sans and
+      Ubuntu Sans Mono.
+
+Modified fonts. The following files are modified by Franklin Softworks
+LLC; every other font file is distributed unmodified.
+
+    - `DroidSansFallback-GB2312.ttf` — a subset of
+      `DroidSansFallbackFull.ttf` (Apache Licence 2.0). The file's own name
+      records state that it was modified and how.
+
+    - `NotoSerifSC-GB2312.ttf` and `NotoSerifSC-Regular.ttf` — subsets of
+      Noto Serif SC (SIL Open Font Licence 1.1).
+
+    - `Ubuntu-B`, `Ubuntu-BI`, `Ubuntu-C`, `Ubuntu-L`, `Ubuntu-LI`,
+      `Ubuntu-M`, `Ubuntu-MI`, `Ubuntu-Th`, `UbuntuMono-B` and
+      `UbuntuMono-BI` — static instances of the Ubuntu variable fonts
+      (Ubuntu Font Licence 1.0), renamed as clause 2(c) of that licence
+      requires to the families "Ubuntu derivative Probably Fine" and
+      "Ubuntu Mono derivative Probably Fine". Their copyright, licence and
+      trademark name records are unchanged.
+
+--------------------------------------------------------------------------
+4. Franklin Softworks LLC
+--------------------------------------------------------------------------
+
+The bridge source (engine/bridge/) and the build-recipe files published in
+the Corresponding Source repository (the files under engine/build/,
+engine/scripts/, engine/tools/, engine/modules/ and pipeline/, together with
+docker/Dockerfile.builder and engine/upstream.json, that appear in that
+repository) are Copyright (c) 2025-2026 Franklin Softworks LLC and are
+licensed under the Mozilla Public License v2.0 (MPL-2.0) — full text at
+web/licenses/COPYING.MPL.
+
+The web application — its HTML, CSS and JavaScript — is Copyright (c)
+2025-2026 Franklin Softworks LLC. All rights reserved.
+
+--------------------------------------------------------------------------
+Licence texts
+--------------------------------------------------------------------------
+
+Full texts of the licences referenced above:
+
+  - GPLv3:               web/licenses/COPYING.GPL3          (the pdf-docx and
+                                                            pdf-pptx modules as
+                                                            combined works)
+  - MPL-2.0:            web/licenses/COPYING.MPL           (LibreOffice; section 4)
+  - LGPLv3+:             web/licenses/COPYING.LGPL          (LibreOffice)
+  - GPLv2 (Poppler):     web/licenses/COPYING.POPPLER-GPL2  (Poppler)
+  - GPLv3 (Poppler):     web/licenses/COPYING.POPPLER-GPL3  (Poppler)
+  - Emscripten (MIT / University of Illinois NCSA):
+                         web/licenses/COPYING.EMSCRIPTEN
+  - Font licences, published with the site under https://docconverter.probablyfine.click/fonts/:
+
+      Bitstream Vera (DejaVu):      LICENSE-DejaVu-BitstreamVera.txt
+      Ubuntu Font Licence 1.0:      LICENSE-Ubuntu-UFL-1.0.txt
+      GPLv2 + Liberation font exception (Liberation Sans Narrow; contains
+      the exception and the full GPLv2 text):
+                                    LICENSE-LiberationSansNarrow-GPLv2-with-font-exception.txt
+      Apache Licence 2.0 (Droid Sans Fallback):
+                                    LICENSE-DroidSansFallback-Apache-2.0.txt
+      SIL OFL 1.1:                  LICENSE-OFL-1.1.txt, and
+                                    LICENSE-<Family>-OFL.txt where a family ships its own

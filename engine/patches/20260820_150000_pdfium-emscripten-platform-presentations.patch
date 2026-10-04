@@ -1,0 +1,18 @@
+--- a/external/pdfium/Library_pdfium.mk
++++ b/external/pdfium/Library_pdfium.mk
+@@ -731,7 +731,14 @@
+ ))
+ endif
+ 
+-ifeq ($(OS),LINUX)
++# EMSCRIPTEN builds with pdfium link-fail on
++# CFX_GEModule::PlatformIface::Create(), which is defined per-platform. This is
++# a build-file SELECTION gap, not a missing port: emscripten is POSIX-like and
++# fx_linux_impl compiles for it unchanged. Without this, enabling --enable-pdfium
++# for a WASM module produces:
++#   wasm-ld: error: libpdfiumlo.a(cfx_gemodule.o):
++#            undefined symbol: CFX_GEModule::PlatformIface::Create()
++ifneq (,$(filter LINUX EMSCRIPTEN,$(OS)))
+ # fxge
+ $(eval $(call gb_Library_add_generated_exception_objects,pdfium,\
+     UnpackedTarball/pdfium/core/fxge/linux/fx_linux_impl \
