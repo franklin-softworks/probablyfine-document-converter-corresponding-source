@@ -1,0 +1,13 @@
+diff --git a/sdext/source/pdfimport/filterdet.cxx b/sdext/source/pdfimport/filterdet.cxx
+index 5f6392e18983..30dc79c65ffe 100644
+--- a/sdext/source/pdfimport/filterdet.cxx
++++ b/sdext/source/pdfimport/filterdet.cxx
+@@ -401,7 +401,7 @@ OUString SAL_CALL PDFDetector::detect( uno::Sequence< beans::PropertyValue >& rF
+         else
+             pFilterData = rFilterData.getArray();
+ 
+-        const sal_Int32 nDocumentType = 0; //const sal_Int32 nDocumentType = queryDocumentTypeDialog(m_xContext,aURL);
++        const sal_Int32 nDocumentType = 1; // Use impress_pdf_import for pdf-pptx module //const sal_Int32 nDocumentType = queryDocumentTypeDialog(m_xContext,aURL);
+         if( nDocumentType < 0 )
+         {
+             return OUString();
