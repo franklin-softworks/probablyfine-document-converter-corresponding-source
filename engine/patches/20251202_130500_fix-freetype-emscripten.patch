@@ -1,0 +1,20 @@
+diff --git a/external/freetype/ExternalProject_freetype.mk b/external/freetype/ExternalProject_freetype.mk
+index 548470d6a94b..04888e5a8104 100644
+--- a/external/freetype/ExternalProject_freetype.mk
++++ b/external/freetype/ExternalProject_freetype.mk
+@@ -16,6 +16,7 @@ $(eval $(call gb_ExternalProject_register_targets,freetype,\
+ $(call gb_ExternalProject_get_state_target,freetype,build) :
+ 	$(call gb_Trace_StartRange,freetype,EXTERNAL)
+ 	$(call gb_ExternalProject_run,build,\
++		$(if $(filter EMSCRIPTEN,$(OS)),AR=emar RANLIB=emranlib) \
+ 		$(gb_RUN_CONFIGURE) ./configure \
+ 			--disable-shared \
+ 			--with-pic \
+@@ -33,6 +34,7 @@ $(call gb_ExternalProject_get_state_target,freetype,build) :
+ 				$(gb_VISIBILITY_FLAGS) \
+ 				$(gb_EMSCRIPTEN_CPPFLAGS)" \
+ 		&& $(MAKE) install \
++		&& $(if $(filter EMSCRIPTEN,$(OS)),emranlib $(gb_UnpackedTarball_workdir)/freetype/instdir/lib/libfreetype.a) \
+ 		&& touch $@	)
+ 	$(call gb_Trace_EndRange,freetype,EXTERNAL)
+ 
