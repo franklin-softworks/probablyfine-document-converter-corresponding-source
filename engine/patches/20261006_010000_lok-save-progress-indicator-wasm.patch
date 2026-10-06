@@ -1,0 +1,71 @@
+diff --git a/desktop/source/lib/init.cxx b/desktop/source/lib/init.cxx
+--- a/desktop/source/lib/init.cxx
++++ b/desktop/source/lib/init.cxx
+@@ -83,6 +83,10 @@
+ #include <comphelper/base64.hxx>
+ #include <comphelper/dispatchcommand.hxx>
+ #include <comphelper/lok.hxx>
++#ifdef __EMSCRIPTEN__
++#include <com/sun/star/task/XStatusIndicator.hpp>
++#include <cppuhelper/implbase.hxx>
++#endif
+ #include <comphelper/processfactory.hxx>
+ #include <comphelper/string.hxx>
+ #include <comphelper/profilezone.hxx>
+@@ -3768,6 +3772,44 @@
+     return pBaseModel->GetObjectShell();
+ }
+ 
++#ifdef __EMSCRIPTEN__
++namespace {
++// FG-173: doc_saveAs gives the export filter no status indicator, so a long
++// PDF export (a large Calc sheet: one page per setValue in PDFExport) reports
++// nothing until it returns, and the web driver's no-progress watchdog stops it.
++// This forwards the filter's progress to the LOK status-indicator callback
++// (comphelper -> lo_status_indicator_callback -> the office callback), which
++// the WASM bridge relays to the page. Rate-limited to whole-percent changes.
++class LokSaveStatusIndicator : public cppu::WeakImplHelper<css::task::XStatusIndicator>
++{
++    sal_Int32 mnRange = 0;
++    int mnLastPercent = -1;
++
++public:
++    void SAL_CALL start(const OUString& rText, sal_Int32 nRange) override
++    {
++        mnRange = nRange;
++        mnLastPercent = -1;
++        comphelper::LibreOfficeKit::statusIndicatorStart(rText);
++    }
++    void SAL_CALL end() override { comphelper::LibreOfficeKit::statusIndicatorFinish(); }
++    void SAL_CALL setText(const OUString&) override {}
++    void SAL_CALL setValue(sal_Int32 nValue) override
++    {
++        if (mnRange <= 0)
++            return;
++        const int nPercent = static_cast<int>(
++            std::clamp<sal_Int64>(sal_Int64(nValue) * 100 / mnRange, 0, 100));
++        if (nPercent == mnLastPercent)
++            return;
++        mnLastPercent = nPercent;
++        comphelper::LibreOfficeKit::statusIndicatorSetValue(nPercent);
++    }
++    void SAL_CALL reset() override { mnLastPercent = -1; }
++};
++}
++#endif
++
+ static int doc_saveAs(LibreOfficeKitDocument* pThis, const char* sUrl, const char* pFormat, const char* pFilterOptions)
+ {
+     comphelper::ProfileZone aZone("doc_saveAs");
+@@ -3949,6 +3991,11 @@
+ 
+         aSaveMediaDescriptor[u"Overwrite"_ustr] <<= true;
+         aSaveMediaDescriptor[u"FilterName"_ustr] <<= aFilterName;
++#ifdef __EMSCRIPTEN__
++        // FG-173: let long exports report progress (see LokSaveStatusIndicator).
++        aSaveMediaDescriptor[u"StatusIndicator"_ustr]
++            <<= uno::Reference<task::XStatusIndicator>(new LokSaveStatusIndicator);
++#endif
+ 
+         auto aFilteredOptionSeq = comphelper::containerToSequence<OUString>(aFilteredOptionVec);
+         aFilterOptions = comphelper::string::convertCommaSeparated(aFilteredOptionSeq);
