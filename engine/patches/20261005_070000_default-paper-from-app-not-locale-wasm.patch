@@ -1,0 +1,35 @@
+diff --git a/i18nutil/source/utility/paper.cxx b/i18nutil/source/utility/paper.cxx
+index f774b1998554..38c8a14dd923 100644
+--- a/i18nutil/source/utility/paper.cxx
++++ b/i18nutil/source/utility/paper.cxx
+@@ -228,6 +228,30 @@ PaperInfo PaperInfo::getSystemDefaultPaper()
+     if (comphelper::IsFuzzing())
+         return PaperInfo(PAPER_A4);
+ 
++#ifdef __EMSCRIPTEN__
++    // FG-164: the web app decides the default paper (its `defaultPaperSize`
++    // flag and the browser languages) and writes "a4" or "letter" here before
++    // the runtime starts (conversion_worker.js, preRun). Reading it directly
++    // keeps paper separate from locale: the only other lever is the process
++    // LANG, and overriding that also replaced the user's date and number
++    // formats (en-GB dates rendered as ### in columns sized for US dates).
++    // No file, or anything else in it, falls through to the locale logic.
++    if (FILE* pPaperFile = fopen("/tmp/pf-default-paper", "r"))
++    {
++        char aBuf[16] = {};
++        const bool bRead = fgets(aBuf, sizeof(aBuf), pPaperFile) != nullptr;
++        fclose(pPaperFile);
++        if (bRead)
++        {
++            std::string_view aPaper = o3tl::trim(std::string_view(aBuf));
++            if (aPaper == "a4")
++                return PaperInfo(PAPER_A4);
++            if (aPaper == "letter")
++                return PaperInfo(PAPER_LETTER);
++        }
++    }
++#endif
++
+     OUString aLocaleStr = officecfg::Setup::L10N::ooSetupSystemLocale::get();
+ 
+ #ifdef UNX
