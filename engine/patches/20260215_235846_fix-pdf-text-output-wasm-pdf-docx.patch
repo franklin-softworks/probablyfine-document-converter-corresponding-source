@@ -1,0 +1,46 @@
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+@@ -48,9 +48,12 @@
+ #include <vector>
+
+ #ifdef EMSCRIPTEN_INLINE_PDFIMPORT
+-#include <unistd.h>  // for dup, dup2, close
+-// For WASM, g_binary_out is defined here instead of wrapper_gpl.cxx
++// For WASM, g_binary_out and g_text_out are defined here instead of wrapper_gpl.cxx
+ FILE* g_binary_out = stderr;
++FILE* g_text_out = stdout;
++// Redirect printf->fprintf(g_text_out,...) so text commands go to the FILE* directly,
++// bypassing unreliable dup2 stdout redirection in Emscripten
++#define printf(...) fprintf(g_text_out, __VA_ARGS__)
+ #endif
+
+ // sigh, UTF8.h was removed in poppler-0.21.0 and put back in 0.21.1, then renamed to UnicodeMapFuncs.h in 0.62.0
+@@ -1403,9 +1406,11 @@
+ {
+     fprintf(stderr, "[PDFIMPORT] pdfi_process_pdf_inline: Starting for %s\n", pdfPath);
+
+-    // Save original stdout and set up redirection
+-    int savedStdout = dup(fileno(stdout));
+-    dup2(fileno(textOutFile), fileno(stdout));
++    // Direct FILE* assignment - bypasses unreliable dup2 stdout redirection in Emscripten.
++    // The printf macro (defined above) redirects all printf() calls to fprintf(g_text_out, ...),
++    // so text commands go directly to textOutFile without needing dup2.
++    FILE* savedTextOut = g_text_out;
++    g_text_out = textOutFile;
+
+     // Set g_binary_out for PDFOutDev
+     FILE* savedBinaryOut = g_binary_out;
+@@ -1488,10 +1493,9 @@
+         fprintf(stderr, "[PDFIMPORT] EXCEPTION caught!\n");
+     }
+
+-    // Flush and restore stdout
+-    fflush(stdout);
+-    dup2(savedStdout, fileno(stdout));
+-    close(savedStdout);
++    // Flush and restore FILE* pointers
++    fflush(g_text_out);
++    g_text_out = savedTextOut;
+
+     // Restore g_binary_out
+     fflush(g_binary_out);
