@@ -1,0 +1,201 @@
+diff --git a/sdext/source/pdfimport/inc/contentsink.hxx b/sdext/source/pdfimport/inc/contentsink.hxx
+index 6275deb..8699399 100644
+--- a/sdext/source/pdfimport/inc/contentsink.hxx
++++ b/sdext/source/pdfimport/inc/contentsink.hxx
+@@ -112,4 +112,7 @@ namespace pdfi
+         /// page from a stuck one. Progress otherwise only moves per page.
+         virtual void parseHeartbeat() {}
++        /// FG-142: page nPage of nPages is being rendered by poppler (before
++        /// parsing). Called per page and every few seconds within a slow page.
++        virtual void renderHeartbeat( sal_Int32 /*nPage*/, sal_Int32 /*nPages*/ ) {}
+ #endif
+ 
+diff --git a/sdext/source/pdfimport/inc/pdfiprocessor.hxx b/sdext/source/pdfimport/inc/pdfiprocessor.hxx
+index fdb6078..3d13268 100644
+--- a/sdext/source/pdfimport/inc/pdfiprocessor.hxx
++++ b/sdext/source/pdfimport/inc/pdfiprocessor.hxx
+@@ -93,4 +93,6 @@ namespace pdfi
+ #ifdef __EMSCRIPTEN__
+         virtual void parseHeartbeat() override;
++        virtual void renderHeartbeat( sal_Int32 nPage, sal_Int32 nPages ) override;
++        bool m_bRenderIndicatorStarted = false;
+ #endif
+ 
+diff --git a/sdext/source/pdfimport/tree/pdfiprocessor.cxx b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+index c6e431a..59699fc 100644
+--- a/sdext/source/pdfimport/tree/pdfiprocessor.cxx
++++ b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+@@ -726,4 +726,19 @@ void PDFIProcessor::endPage()
+ 
+ #ifdef __EMSCRIPTEN__
++void PDFIProcessor::renderHeartbeat( sal_Int32 nPage, sal_Int32 nPages )
++{
++    // FG-142: progress for the render phase, which runs before any page
++    // element exists. The parse phase restarts the indicator at its first page.
++    if( !m_xStatusIndicator.is() || nPages <= 0 )
++        return;
++    if( !m_bRenderIndicatorStarted )
++    {
++        m_xStatusIndicator->start( u" "_ustr, nPages );
++        m_bRenderIndicatorStarted = true;
++    }
++    // A repeated value is forwarded too (LOK drops only a lower one).
++    m_xStatusIndicator->setValue( std::clamp<sal_Int32>( nPage - 1, 0, nPages ) );
++}
++
+ void PDFIProcessor::parseHeartbeat()
+ {
+diff --git a/sdext/source/pdfimport/wrapper/wrapper.cxx b/sdext/source/pdfimport/wrapper/wrapper.cxx
+index 270921f..e723b58 100644
+--- a/sdext/source/pdfimport/wrapper/wrapper.cxx
++++ b/sdext/source/pdfimport/wrapper/wrapper.cxx
+@@ -1291,5 +1291,14 @@ extern "C" bool pdfi_process_pdf_inline(
+     FILE* textOutFile,
+     FILE* binaryOutFile,
+-    bool skipImages);
++    bool skipImages,
++    void (*pHeartbeat)(void* pCtx, int nPage, int nPages),
++    void* pHeartbeatCtx);
++
++// FG-142: the render phase reports page progress (and a heartbeat on a slow
++// page) through the sink, which owns the load status indicator.
++static void lcl_renderHeartbeat(void* pCtx, int nPage, int nPages)
++{
++    static_cast<ContentSink*>(pCtx)->renderHeartbeat(nPage, nPages);
++}
+ 
+ bool xpdf_ImportFromFile(const OUString& rURL,
+@@ -1384,5 +1393,7 @@ bool xpdf_ImportFromFile(const OUString& rURL,
+         pTextFile,
+         pBinaryFile,
+-        bSkipImages);
++        bSkipImages,
++        &lcl_renderHeartbeat,
++        rSink.get());
+ 
+     // Close output files
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+index 0e1ad82..d7de182 100644
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+@@ -962,4 +962,23 @@ void PDFOutDev::updateRender(GfxState *state)
+ }
+ 
++void PDFOutDev::beginPage( int nPage )
++{
++    m_nBeatPage = nPage;
++    m_aLastBeat = std::chrono::steady_clock::now();
++    if (m_pBeatFn)
++        m_pBeatFn(m_pBeatCtx, m_nBeatPage, m_nBeatPages);
++}
++
++void PDFOutDev::beat()
++{
++    if (!m_pBeatFn)
++        return;
++    const auto aNow = std::chrono::steady_clock::now();
++    if (aNow - m_aLastBeat < std::chrono::seconds(2))
++        return;
++    m_aLastBeat = aNow;
++    m_pBeatFn(m_pBeatCtx, m_nBeatPage, m_nBeatPages);
++}
++
+ void PDFOutDev::stroke(GfxState *state)
+ {
+@@ -967,4 +986,6 @@ void PDFOutDev::stroke(GfxState *state)
+         return;
+     assert(state);
++    if ((++m_nBeatCalls & 63) == 0)
++        beat();
+ 
+     printf( "strokePath" );
+@@ -978,4 +999,6 @@ void PDFOutDev::fill(GfxState *state)
+         return;
+     assert(state);
++    if ((++m_nBeatCalls & 63) == 0)
++        beat();
+ 
+     printf( "fillPath" );
+@@ -989,4 +1012,6 @@ void PDFOutDev::eoFill(GfxState *state)
+         return;
+     assert(state);
++    if ((++m_nBeatCalls & 63) == 0)
++        beat();
+ 
+     printf( "eoFillPath" );
+@@ -1792,6 +1817,8 @@ poppler_bool PDFOutDev::shadedFillImpl( GfxState* state, GfxShading* shading,
+     aSplashOut.updateFillColorSpace(&aState);
+ 
++    beat();
+     if (!rPaint(aSplashOut, aState))
+         return false; // nothing written yet: poppler falls back to bands
++    beat();
+ 
+     std::unique_ptr<SplashBitmap> pSplashBitmap(aSplashOut.takeBitmap());
+@@ -1884,5 +1911,5 @@ poppler_bool PDFOutDev::patchMeshShadedFill(GfxState *state, GfxPatchMeshShading
+     // off so adjacent quads do not show seams.
+     return shadedFillImpl(state, shading,
+-        [shading](SplashOutputDev& rOut, GfxState& rState)
++        [this, shading](SplashOutputDev& rOut, GfxState& rState)
+         {
+             const int nPatches = shading->getNPatches();
+@@ -1911,4 +1938,5 @@ poppler_bool PDFOutDev::patchMeshShadedFill(GfxState *state, GfxPatchMeshShading
+                               shading->isParameterized() ? 1 : nColorComps,
+                               fRefineColorThreshold, nStart, shading);
++                beat();
+             }
+             return true;
+@@ -1950,5 +1978,7 @@ bool pdfi_process_pdf_inline(
+     FILE* textOutFile,
+     FILE* binaryOutFile,
+-    bool skipImages)
++    bool skipImages,
++    void (*pHeartbeat)(void* pCtx, int nPage, int nPages),
++    void* pHeartbeatCtx)
+ {
+     fprintf(stderr, "[PDFIMPORT] pdfi_process_pdf_inline: Starting for %s\n", pdfPath);
+@@ -2017,4 +2047,5 @@ bool pdfi_process_pdf_inline(
+             if (skipImages)
+                 aOutDev.setSkipImages(true);
++            aOutDev.setHeartbeat(pHeartbeat, pHeartbeatCtx, nPages);
+ 
+             // Output page count first
+@@ -2028,4 +2059,5 @@ bool pdfi_process_pdf_inline(
+             {
+                 fprintf(stderr, "[PDFIMPORT] Processing page %d/%d...\n", i, nPages);
++                aOutDev.beginPage(i);
+                 aDoc.displayPage(&aOutDev, i,
+                                 PDF_OUTDEV_RESOLUTION,
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
+index 384d613..76679ca 100644
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
+@@ -22,4 +22,5 @@
+ 
+ #include <sal/types.h>
++#include <chrono>
+ #include <config_poppler.h>
+ 
+@@ -153,4 +154,22 @@ namespace pdfi
+         bool                                    m_bSkipImages;
+ 
++        // FG-142: progress for the render phase. Rasterizing many shadings can
++        // keep one page busy for longer than the web driver's 45 s no-progress
++        // watchdog; beat() reports at most every 2 s, from the heavy paths.
++    public:
++        typedef void (*HeartbeatFn)( void* pCtx, int nPage, int nPages );
++        void setHeartbeat( HeartbeatFn pFn, void* pCtx, int nPages )
++        { m_pBeatFn = pFn; m_pBeatCtx = pCtx; m_nBeatPages = nPages; }
++        /// Called before each page is displayed; always reports.
++        void beginPage( int nPage );
++    private:
++        void beat();
++        HeartbeatFn                             m_pBeatFn = nullptr;
++        void*                                   m_pBeatCtx = nullptr;
++        int                                     m_nBeatPage = 0;
++        int                                     m_nBeatPages = 0;
++        unsigned                                m_nBeatCalls = 0;
++        std::chrono::steady_clock::time_point   m_aLastBeat;
++
+         // FG-142: tight device-space bounding box of the current clip path.
+         // GfxState::getClipBBox() is the hull of the clip's Bezier CONTROL
