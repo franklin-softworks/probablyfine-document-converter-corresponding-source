@@ -1,0 +1,25 @@
+diff --git a/desktop/source/lib/init.cxx b/desktop/source/lib/init.cxx
+index 0490c71ed9d4..026eeacf7aff 100644
+--- a/desktop/source/lib/init.cxx
++++ b/desktop/source/lib/init.cxx
+@@ -8256,6 +8256,20 @@ void setDeeplConfig()
+ 
+ static int lo_initialize(LibreOfficeKit* pThis, const char* pAppPath, const char* pUserProfileUrl)
+ {
++    // Desktop::Main() (desktop/source/app/app.cxx) installs this hook so that
++    // Translate::ExpandVariables() substitutes %PRODUCTNAME/%PRODUCTVERSION/...
++    // placeholders in translated resource strings read via unotools resmgr
++    // (e.g. STR_HTML_GENERATOR, sfx2/inc/strings.hxx -> every exported HTML
++    // file's <meta name="generator">). LOK entry points never run
++    // Desktop::Main(), so without this call the hook stays null and
++    // ExpandVariables() returns such strings unchanged -- BUG-27 Defect 1.
++    // ReplaceStringHookProc is declared in desktop/inc/app.hxx (already
++    // included above) and is already linked into this library: getGenerator()
++    // in this same file calls it directly a few hundred lines up. Idempotent,
++    // so setting it on every lo_initialize() call (PRE_INIT/SECOND_INIT/
++    // FULL_INIT, including WASM's proactive re-init) is harmless.
++    Translate::SetReadStringHook(ReplaceStringHookProc);
++
+     enum {
+         PRE_INIT,     // setup shared data in master process
+         SECOND_INIT,  // complete init. after fork
