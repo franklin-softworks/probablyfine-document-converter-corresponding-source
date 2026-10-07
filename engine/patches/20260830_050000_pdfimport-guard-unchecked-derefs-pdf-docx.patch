@@ -1,0 +1,89 @@
+--- a/sdext/source/pdfimport/wrapper/wrapper.cxx
++++ b/sdext/source/pdfimport/wrapper/wrapper.cxx
+@@ -863,6 +863,29 @@
+     const hash_entry* pEntry = PdfKeywordHash::in_word_set( rCmd.data(),
+                                                             rCmd.size() );
+     assert(pEntry);
++    // BUG-28 HARDENING. gperf's in_word_set() returns nullptr for ANY token that is
++    // not one of the 48 keywords -- including every token shorter than 7 or longer
++    // than 19 characters, and including the empty token readNextToken() yields on an
++    // exhausted line. The only guard was the assert() above, and this build has
++    // ENABLE_DEBUG= / ENABLE_DBGUTIL= empty, so it compiles to nothing.
++    //
++    // Unguarded, `pEntry->eKey` loads from address 4, which on Emscripten is readable
++    // zeroed memory: eKey == 0 == CLIPPATH. An unrecognised line therefore executes an
++    // ARBITRARY parser command rather than being rejected. That matters because the
++    // readImage/readMask/readFont arms drain the BINARY stream, which is a separate
++    // file kept in step with the text stream only by the command sequence -- so one
++    // misread line desynchronises them permanently and hands arbitrary bytes to
++    // vcl::Font::identifyFont.
++    //
++    // Skipping the line is the conservative choice: a command we cannot identify
++    // cannot be executed safely, and continuing preserves the rest of the document.
++    if (!pEntry)
++    {
++        fprintf(stderr, "[GUARD] unknown pdfimport keyword, line skipped: '%.*s'\n",
++                static_cast<int>(rCmd.size()), rCmd.data() ? rCmd.data() : "");
++        fflush(stderr);
++        return;
++    }
+     switch( pEntry->eKey )
+     {
+         case CLIPPATH:
+--- a/sdext/source/pdfimport/tree/pdfiprocessor.cxx
++++ b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+@@ -96,6 +96,18 @@
+ 
+ void PDFIProcessor::popState()
+ {
++    // BUG-28 HARDENING. On underflow, pop_back() runs ~GraphicsContext() over the
++    // memory BEFORE the vector's buffer, destroying a std::vector<double> and a
++    // ref-counted B2DPolyPolygon -- i.e. freeing two arbitrary pointers -- and every
++    // later getCurrentContext() then writes outside the allocation. That is the
++    // cleanest "stray write whose landing site depends on allocator state" in this
++    // file, which is exactly the layout-sensitivity BUG-28 exhibits. Poppler's
++    // Gfx::opRestore guards unbalanced Q, so reachability is rated low.
++    if (m_aGCStack.empty())
++    {
++        fprintf(stderr, "[GUARD] popState on empty graphics-context stack\n"); fflush(stderr);
++        return;
++    }
+     m_aGCStack.pop_back();
+ }
+ 
+@@ -330,6 +342,18 @@
+ 
+ void PDFIProcessor::endText()
+ {
++    // BUG-28 HARDENING. m_pCurElement is nullptr until startPage() sets it. A virtual
++    // dispatch through a null `this` loads the vptr from address 0 and then a
++    // function-table index from the null-guard region -- which is precisely how WASM
++    // produces `table index is out of bounds` / `function signature mismatch`, the
++    // error strings this bug reports. Reachability is NOT demonstrated (Poppler emits
++    // endTextObject only during page display, after startPage); this is a one-line
++    // guard on a perfect signature match, not a claimed fix.
++    if (!m_pCurElement)
++    {
++        fprintf(stderr, "[GUARD] endText with no current element\n"); fflush(stderr);
++        return;
++    }
+     TextElement* pText = m_pCurElement->dynCastAsTextElement();
+     if( pText )
+         m_pCurElement = pText->Parent;
+@@ -594,6 +618,16 @@
+ {
+     if( !rURI.isEmpty() )
+     {
++        // BUG-28 HARDENING. Element::Element does pParent->Children.emplace_back(this),
++        // so a null m_pCurPage makes std::list::_M_hook read link pointers from
++        // near-zero memory and WRITE THROUGH THEM -- an arbitrary-address store.
++        // PDFDoc::displayPage and PDFDoc::processLinks carry the same if(getPage(page))
++        // guard, so this is not demonstrated reachable; the guard costs nothing.
++        if (!m_pCurPage)
++        {
++            fprintf(stderr, "[GUARD] hyperlink with no current page\n"); fflush(stderr);
++            return;
++        }
+         HyperlinkElement* pLink = ElementFactory::createHyperlinkElement(
+             &m_pCurPage->Hyperlinks,
+             rURI );

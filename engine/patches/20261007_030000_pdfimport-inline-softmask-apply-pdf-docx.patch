@@ -1,0 +1,1510 @@
+diff --git a/sdext/Executable_xpdfimport.mk b/sdext/Executable_xpdfimport.mk
+--- a/sdext/Executable_xpdfimport.mk
++++ b/sdext/Executable_xpdfimport.mk
+@@ -22,4 +22,5 @@
+ $(eval $(call gb_Executable_add_exception_objects,xpdfimport,\
+     sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl \
++    sdext/source/pdfimport/xpdfwrapper/pdfisoftmask \
+     sdext/source/pdfimport/xpdfwrapper/pnghelper \
+     sdext/source/pdfimport/xpdfwrapper/wrapper_gpl \
+diff --git a/sdext/Library_pdfimport.mk b/sdext/Library_pdfimport.mk
+--- a/sdext/Library_pdfimport.mk
++++ b/sdext/Library_pdfimport.mk
+@@ -95,4 +95,5 @@
+ $(eval $(call gb_Library_add_exception_objects,pdfimport,\
+     sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl \
++    sdext/source/pdfimport/xpdfwrapper/pdfisoftmask \
+     sdext/source/pdfimport/xpdfwrapper/pnghelper \
+ ))
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+@@ -685,4 +685,10 @@
+     m_aGroupIsSoftMask.clear();
+     m_nSoftMaskDepth = 0;
++    // FG-175: spans are per page; the store set for this page is trusted
++    // until a span has no recorded layer.
++    m_aSpans.reset();
++    m_nStencilMaskOpen = 0;
++    m_bLayersUsable = m_pLayers && m_pLayers->bUsable;
++    m_nLayersEmitted = 0;
+     printf("startPage %f %f\n",
+            normalize(state->getPageWidth()),
+@@ -692,4 +698,8 @@
+ void PDFOutDev::endPage()
+ {
++    applySpanTransition(nullptr, m_aSpans.endPage());
++    if (m_pLayers && m_pLayers->bUsable && m_aSpans.spanCount() != m_pLayers->nSpans)
++        fprintf(stderr, "[SMASK] page %d: span count differs: this pass %d, recorder %d\n",
++                m_nBeatPage, m_aSpans.spanCount(), m_pLayers->nSpans);
+     printf("endPage\n");
+ }
+@@ -733,8 +743,10 @@
+ {
+     m_aTightClipStack.push_back(m_aTightClip);
++    if (spanTrackerActive())
++        m_aSpans.saveState();
+     printf( "saveState\n" );
+ }
+ 
+-void PDFOutDev::restoreState(GfxState*)
++void PDFOutDev::restoreState(GfxState* state)
+ {
+     if (!m_aTightClipStack.empty())
+@@ -744,4 +756,164 @@
+     }
+     printf( "restoreState\n" );
++    // After the record: a span resumed by Q emits its layer under the
++    // restored clip.
++    if (spanTrackerActive())
++        applySpanTransition(state, m_aSpans.restoreState());
++}
++
++// ---------------------------------------------------------------------------
++// FG-175: soft masks applied. The hooks below drive the span tracker; a span
++// that begins (outside a masked group or mask definition) is answered by
++// emitting the layer the pre-pass recorded for its ordinal, and suppressed()
++// then paints nothing of the span's own content. Ordinals agree with the
++// recorder because both run the same SoftMaskSpanTracker on the same hooks.
++// ---------------------------------------------------------------------------
++#if POPPLER_CHECK_VERSION(25, 9, 0)
++void PDFOutDev::setSoftMask(GfxState* state, const std::array<double, 4>&, bool, Function*, GfxColor*)
++#else
++void PDFOutDev::setSoftMask(GfxState* state, const double*, bool, Function*, GfxColor*)
++#endif
++{
++    if (spanTrackerActive())
++        applySpanTransition(state, m_aSpans.setSoftMask());
++}
++
++void PDFOutDev::clearSoftMask(GfxState* state)
++{
++    if (spanTrackerActive())
++        applySpanTransition(state, m_aSpans.clearSoftMask());
++}
++
++void PDFOutDev::applySpanTransition( GfxState* state, const SoftMaskSpanTracker::Transition& rT )
++{
++    if (rT.nEnded >= 0 && layersUsable())
++    {
++        // The span's layer went out at its begin and its content was
++        // suppressed since; if the recorder ended this span elsewhere, part
++        // of that content may not be in the layer. Not recoverable here —
++        // say so distinctly, and stop trusting the store for the page.
++        const SoftMaskLayer* pEnded = m_pLayers->get(rT.nEnded);
++        if (!pEnded || pEnded->aEndSignature != rT.aEndedSignature)
++        {
++            fprintf(stderr, "[SMASK] page %d: span %d ended out of step - content may be missing "
++                            "(hooks %ld/%ld, levels %d/%d, groups %d/%d)\n",
++                    m_nBeatPage, rT.nEnded,
++                    rT.aEndedSignature.nHooks, pEnded ? pEnded->aEndSignature.nHooks : -1L,
++                    rT.aEndedSignature.nLevels, pEnded ? pEnded->aEndSignature.nLevels : -1,
++                    rT.aEndedSignature.nGroups, pEnded ? pEnded->aEndSignature.nGroups : -1);
++            m_bLayersUsable = false;
++        }
++    }
++    if (rT.nBegan < 0 || !layersUsable())
++        return;
++    // Every span (nested ones too) must have begun at the same point of the
++    // hook sequence in the recorder, or the two sequences diverged and the
++    // ordinals would pair the wrong layers. Fall back for the rest of the
++    // page BEFORE anything is suppressed or emitted: unmasked, never lost.
++    const SoftMaskLayer* pLayer = m_pLayers->get(rT.nBegan);
++    if (!pLayer || pLayer->aSignature != rT.aBeganSignature)
++    {
++        fprintf(stderr, "[SMASK] page %d: span %d %s (recorder saw %d spans; hooks %ld/%ld, "
++                        "levels %d/%d, groups %d/%d); unmasked emission for the rest of the page\n",
++                m_nBeatPage, rT.nBegan, pLayer ? "began elsewhere in the recorder" : "has no recorded layer",
++                m_pLayers->nSpans,
++                rT.aBeganSignature.nHooks, pLayer ? pLayer->aSignature.nHooks : -1L,
++                rT.aBeganSignature.nLevels, pLayer ? pLayer->aSignature.nLevels : -1,
++                rT.aBeganSignature.nGroups, pLayer ? pLayer->aSignature.nGroups : -1);
++        m_bLayersUsable = false;
++        return;
++    }
++    if (!rT.bBeganNested)
++        emitSoftMaskLayer(state, rT.nBegan);
++}
++
++void PDFOutDev::emitSoftMaskLayer( GfxState* state, int nOrdinal )
++{
++    if (!layersUsable() || m_bSkipImages)
++        return;
++    const SoftMaskLayer* pLayer = m_pLayers->get(nOrdinal);
++    if (!pLayer)
++        return; // applySpanTransition already fell back
++    if (pLayer->bNested || pLayer->nW <= 0 || pLayer->nH <= 0)
++        return; // covered by the enclosing span, or the mask hid everything
++    const size_t nPixels = static_cast<size_t>(pLayer->nW) * pLayer->nH;
++    if (pLayer->aRGB.size() != nPixels * 3 || pLayer->aAlpha.size() != nPixels)
++        return;
++
++    // Same record and space as shadedFillImpl: a bitmap stretched over a
++    // device-space rectangle. Recorder px -> this device's units.
++    const double k = m_fLayerDevPerPx;
++    const double fX0 = pLayer->nX * k;
++    const double fY0 = pLayer->nY * k;
++    const double fX1 = (pLayer->nX + pLayer->nW) * k;
++    const double fY1 = (pLayer->nY + pLayer->nH) * k;
++
++    // MemStream does not write through its buffer; the store is read-only here.
++    char* pRgb = const_cast<char*>(reinterpret_cast<const char*>(pLayer->aRGB.data()));
++    char* pAlpha = const_cast<char*>(reinterpret_cast<const char*>(pLayer->aAlpha.data()));
++#if POPPLER_CHECK_VERSION(25, 5, 0)
++    std::unique_ptr<MemStream> pRgbStr(new MemStream(pRgb, 0, nPixels * 3, Object::null()));
++    std::unique_ptr<MemStream> pAlphaStr(new MemStream(pAlpha, 0, nPixels, Object::null()));
++    auto aDecode = Object::null();
++#else
++    std::unique_ptr<MemStream> pRgbStr(new MemStream(pRgb, 0, nPixels * 3, Object(objNull)));
++    std::unique_ptr<MemStream> pAlphaStr(new MemStream(pAlpha, 0, nPixels, Object(objNull)));
++    auto aDecode = Object(objNull);
++#endif
++#if POPPLER_CHECK_VERSION(24, 10, 0)
++    std::unique_ptr<GfxImageColorMap> pRgbIdentityColorMap(new GfxImageColorMap(8, &aDecode,
++        std::make_unique<GfxDeviceRGBColorSpace>()));
++    std::unique_ptr<GfxImageColorMap> pGrayIdentityColorMap(new GfxImageColorMap(8, &aDecode,
++        std::make_unique<GfxDeviceGrayColorSpace>()));
++#else
++    std::unique_ptr<GfxImageColorMap> pRgbIdentityColorMap(new GfxImageColorMap(8, &aDecode,
++        new GfxDeviceRGBColorSpace()));
++    std::unique_ptr<GfxImageColorMap> pGrayIdentityColorMap(new GfxImageColorMap(8, &aDecode,
++        new GfxDeviceGrayColorSpace()));
++#endif
++
++    // Splash applied the fill/stroke opacity (/ca, /CA) per operation while
++    // recording, and it may change within the span, so the layer already
++    // carries it. The LibreOffice side would apply the current fill alpha to
++    // the bitmap-filled polygon as well (draw:opacity): emit the layer at
++    // alpha 1 and restore the colour record afterwards.
++    const bool bAlpha = state && state->getFillOpacity() != 1.0;
++    GfxRGB aRGB = { 0, 0, 0 };
++    if (bAlpha)
++    {
++        state->getFillRGB( &aRGB );
++        printf( "updateFillColor %f %f %f %f\n",
++                normalize(colToDbl(aRGB.r)), normalize(colToDbl(aRGB.g)),
++                normalize(colToDbl(aRGB.b)), 1.0 );
++    }
++
++    printf( "shadedFill %f %f %f %f",
++            normalize(fX0), normalize(fY0), normalize(fX1), normalize(fY1) );
++    OutputBuffer aBuf; initBuf(aBuf);
++    writePng_(aBuf, pRgbStr.get(), pLayer->nW, pLayer->nH, pRgbIdentityColorMap.get(),
++        pAlphaStr.get(), pLayer->nW, pLayer->nH, pGrayIdentityColorMap.get());
++    writeBinaryBuffer(aBuf);
++
++    if (bAlpha)
++        printf( "updateFillColor %f %f %f %f\n",
++                normalize(colToDbl(aRGB.r)), normalize(colToDbl(aRGB.g)),
++                normalize(colToDbl(aRGB.b)), normalize(state->getFillOpacity()) );
++    ++m_nLayersEmitted;
++    beat();
++}
++
++// FG-175: an inline image whose data nobody read. Gfx::opBeginImage then
++// scans the undecoded stream for "EI" from wherever the stream was left, so
++// skip over the data exactly as Gfx's own disabled-drawing branch does.
++static void lcl_drainInlineImage( Stream* str, int width, int height, int nComps, int nBits )
++{
++    if (!str || width <= 0 || height <= 0)
++        return;
++    if (!str->reset())
++        return;
++    const long long n = static_cast<long long>(height) * ((static_cast<long long>(width) * nComps * nBits + 7) / 8);
++    for (long long i = 0; i < n; ++i)
++        str->getChar();
++    str->close();
+ }
+ 
+@@ -987,6 +1159,6 @@
+ void PDFOutDev::stroke(GfxState *state)
+ {
+-    if (m_nSoftMaskDepth > 0)
+-        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
++    if (suppressed())
++        return; // FG-174/175: mask group definition, or masked content replaced by a recorded layer
+     if (m_bSkipImages)
+         return;
+@@ -1002,6 +1174,6 @@
+ void PDFOutDev::fill(GfxState *state)
+ {
+-    if (m_nSoftMaskDepth > 0)
+-        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
++    if (suppressed())
++        return; // FG-174/175: see suppressed()
+     if (m_bSkipImages)
+         return;
+@@ -1017,6 +1189,6 @@
+ void PDFOutDev::eoFill(GfxState *state)
+ {
+-    if (m_nSoftMaskDepth > 0)
+-        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
++    if (suppressed())
++        return; // FG-174/175: see suppressed()
+     if (m_bSkipImages)
+         return;
+@@ -1195,10 +1367,12 @@
+                               int width, int height, poppler_bool invert,
+                               poppler_bool /*interpolate*/,
+-                              poppler_bool /*inlineImg*/ )
++                              poppler_bool inlineImg )
+ {
+-    if (m_nSoftMaskDepth > 0)
+-        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
+-    if (m_bSkipImages)
++    if (suppressed() || m_bSkipImages) // FG-174/175: see suppressed()
++    {
++        if (inlineImg)
++            lcl_drainInlineImage(str, width, height, 1, 1);
+         return;
++    }
+     OutputBuffer aBuf; initBuf(aBuf);
+ 
+@@ -1232,19 +1406,19 @@
+                           int width, int height, GfxImageColorMap* colorMap,
+                           poppler_bool /*interpolate*/,
+-                          const int* maskColors, poppler_bool /*inlineImg*/ )
++                          const int* maskColors, poppler_bool inlineImg )
+ {
+-    if (m_nSoftMaskDepth > 0)
+-        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
+ #else
+ void PDFOutDev::drawImage(GfxState*, Object*, Stream* str,
+                           int width, int height, GfxImageColorMap* colorMap,
+                           poppler_bool /*interpolate*/,
+-                          int* maskColors, poppler_bool /*inlineImg*/ )
++                          int* maskColors, poppler_bool inlineImg )
+ {
+-    if (m_nSoftMaskDepth > 0)
+-        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
+ #endif
+-    if (m_bSkipImages)
++    if (suppressed() || m_bSkipImages) // FG-174/175: see suppressed()
++    {
++        if (inlineImg && colorMap)
++            lcl_drainInlineImage(str, width, height, colorMap->getNumPixelComps(), colorMap->getBits());
+         return;
++    }
+     OutputBuffer aBuf; initBuf(aBuf);
+     OutputBuffer aMaskBuf;
+@@ -1305,6 +1479,6 @@
+                                )
+ {
+-    if (m_nSoftMaskDepth > 0)
+-        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
++    if (suppressed())
++        return; // FG-174/175: see suppressed()
+     if (m_bSkipImages)
+         return;
+@@ -1325,6 +1499,6 @@
+                                    )
+ {
+-    if (m_nSoftMaskDepth > 0)
+-        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
++    if (suppressed())
++        return; // FG-174/175: see suppressed()
+     if (m_bSkipImages)
+         return;
+@@ -1356,6 +1530,6 @@
+                                           double xStep, double yStep)
+ {
+-    if (m_nSoftMaskDepth > 0)
+-        return true; // FG-174/175: claimed, nothing painted (inside a soft-mask group)
++    if (suppressed())
++        return true; // FG-174/175: claimed, nothing painted, see suppressed()
+ #if POPPLER_CHECK_VERSION(25, 9, 0)
+     const std::array<double, 4> pBbox = tPat->getBBox();
+@@ -1778,6 +1952,6 @@
+                                         const std::function<bool(SplashOutputDev&, GfxState&)>& rPaint )
+ {
+-    if (m_nSoftMaskDepth > 0)
+-        return true; // FG-174/175: claimed, nothing painted (inside a soft-mask group)
++    if (suppressed())
++        return true; // FG-174/175: claimed, nothing painted, see suppressed()
+     assert(state);
+     assert(shading);
+@@ -2083,4 +2257,7 @@
+             static const int PDF_OUTDEV_RESOLUTION = 7200;
+ 
++            // FG-175: layers recorded by the soft-mask pre-pass, per page.
++            pdfi::SoftMaskLayerStore aSoftMaskLayers;
++
+             // Process each page
+             for (int i = 1; i <= nPages; ++i)
+@@ -2088,4 +2265,32 @@
+                 fprintf(stderr, "[PDFIMPORT] Processing page %d/%d...\n", i, nPages);
+                 aOutDev.beginPage(i);
++                aSoftMaskLayers.clear();
++                aOutDev.setSoftMaskLayers(nullptr, 1.0);
++#ifdef PDFI_SOFTMASK_RECORDER
++                if (!skipImages && pdfi::pageDeclaresSoftMask(aDoc.getPage(i)))
++                {
++                    const auto aT0 = std::chrono::steady_clock::now();
++                    const double fDpi = pdfi::chooseSoftMaskRecorderDpi(
++                        aDoc.getPageMediaWidth(i), aDoc.getPageMediaHeight(i));
++                    const std::function<void()> aBeat = [&aOutDev]() { aOutDev.tickHeartbeat(); };
++                    pdfi::recordSoftMaskLayers(aDoc, i, fDpi, aSoftMaskLayers, aBeat);
++                    const long long nMs = std::chrono::duration_cast<std::chrono::milliseconds>(
++                        std::chrono::steady_clock::now() - aT0).count();
++                    if (aSoftMaskLayers.bUsable)
++                    {
++                        aOutDev.setSoftMaskLayers(&aSoftMaskLayers, PDF_OUTDEV_RESOLUTION / fDpi);
++                        fprintf(stderr, "[SMASK] page %d: pre-pass %lld ms, %.0f dpi, %dx%d px, "
++                                        "spans=%d layers=%d bytes=%zu\n",
++                                i, nMs, fDpi, aSoftMaskLayers.nPageW, aSoftMaskLayers.nPageH,
++                                aSoftMaskLayers.nSpans, aSoftMaskLayers.nLayersWithPixels,
++                                aSoftMaskLayers.nBytes);
++                    }
++                    else
++                        fprintf(stderr, "[SMASK] page %d: pre-pass failed (%s) after %lld ms; "
++                                        "soft-masked content is emitted unmasked\n",
++                                i, aSoftMaskLayers.pFailure ? aSoftMaskLayers.pFailure : "unknown", nMs);
++                    aOutDev.tickHeartbeat();
++                }
++#endif
+                 aDoc.displayPage(&aOutDev, i,
+                                 PDF_OUTDEV_RESOLUTION,
+@@ -2093,5 +2298,10 @@
+                                 0, true, true, true);
+                 aDoc.processLinks(&aOutDev, i);
++                if (aSoftMaskLayers.bUsable)
++                    fprintf(stderr, "[SMASK] page %d: spans=%d layers emitted=%d\n",
++                            i, aOutDev.softMaskSpanCount(), aOutDev.softMaskLayersEmitted());
+             }
++            aOutDev.setSoftMaskLayers(nullptr, 1.0);
++            aSoftMaskLayers.clear();
+ 
+             fprintf(stderr, "[PDFIMPORT] All pages processed successfully\n");
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
+@@ -55,4 +55,6 @@
+ #include <functional>
+ 
++#include "pdfisoftmask.hxx"
++
+ class GfxPath;
+ class GfxFont;
+@@ -156,4 +158,40 @@
+         int                                     m_nSoftMaskDepth = 0;
+ 
++        // FG-175: soft masks APPLIED. The span tracker is driven by the same
++        // hooks as MaskLayerRecorder's (pdfisoftmask.hxx); when a span begins
++        // the pre-pass layer with its ordinal is emitted and the span's own
++        // content (except text) is suppressed. With no usable store the
++        // content is emitted unmasked, exactly as before.
++        SoftMaskSpanTracker                     m_aSpans;
++        const SoftMaskLayerStore*               m_pLayers = nullptr;
++        double                                  m_fLayerDevPerPx = 1.0; ///< device units per recorder px
++        bool                                    m_bLayersUsable = false;
++        int                                     m_nLayersEmitted = 0;
++        int                                     m_nStencilMaskOpen = 0; ///< inside set..unsetSoftMaskFromImageMask
++        /// The recorder pauses its tracker for the same hooks (see pdfisoftmask.hxx).
++        bool spanTrackerActive() const { return m_nStencilMaskOpen == 0; }
++        bool layersUsable() const { return m_bLayersUsable && m_pLayers && m_pLayers->bUsable; }
++        /// Masked content is replaced by a recorded layer: paint nothing.
++        bool suppressed() const
++        {
++            if (m_nSoftMaskDepth > 0)
++                return true; // FG-174: inside a soft-mask group definition
++            return layersUsable() && m_aSpans.effectivelyMasked();
++        }
++        void applySpanTransition( GfxState* state, const SoftMaskSpanTracker::Transition& rT );
++        void emitSoftMaskLayer( GfxState* state, int nOrdinal );
++    public:
++        /// Layers recorded for the page about to be displayed (or nullptr).
++        void setSoftMaskLayers( const SoftMaskLayerStore* pLayers, double fDevPerPx )
++        {
++            m_pLayers = pLayers;
++            m_fLayerDevPerPx = fDevPerPx;
++        }
++        int softMaskSpanCount() const { return m_aSpans.spanCount(); }
++        int softMaskLayersEmitted() const { return m_nLayersEmitted; }
++        /// Progress heartbeat for work done on this page outside this device.
++        void tickHeartbeat() { beat(); }
++    private:
++
+         // FG-142: progress for the render phase. Rasterizing many shadings can
+         // keep one page busy for longer than the web driver's 45 s no-progress
+@@ -350,8 +388,8 @@
+         // content then draws unmasked.
+ #if POPPLER_CHECK_VERSION(25, 9, 0)
+-        virtual void beginTransparencyGroup(GfxState*, const std::array<double, 4>&,
++        virtual void beginTransparencyGroup(GfxState* state, const std::array<double, 4>&,
+                                             GfxColorSpace*, bool, bool, bool forSoftMask) override
+ #else
+-        virtual void beginTransparencyGroup(GfxState*, const double*,
++        virtual void beginTransparencyGroup(GfxState* state, const double*,
+                                             GfxColorSpace*, bool, bool, bool forSoftMask) override
+ #endif
+@@ -360,7 +398,11 @@
+             if (forSoftMask)
+                 ++m_nSoftMaskDepth;
++            if (spanTrackerActive())
++                applySpanTransition(state, m_aSpans.beginGroup(forSoftMask));
+         }
+-        virtual void endTransparencyGroup(GfxState*) override
++        virtual void endTransparencyGroup(GfxState* state) override
+         {
++            if (spanTrackerActive())
++                applySpanTransition(state, m_aSpans.endGroup());
+             if (m_aGroupIsSoftMask.empty())
+                 return;
+@@ -369,4 +411,22 @@
+             m_aGroupIsSoftMask.pop_back();
+         }
++        // FG-175: the mask set by "/GSx gs" (poppler calls this after the
++        // mask group was drawn) and "/SMask /None".
++#if POPPLER_CHECK_VERSION(25, 9, 0)
++        virtual void setSoftMask(GfxState*, const std::array<double, 4>&, bool,
++                                 Function*, GfxColor*) override;
++#else
++        virtual void setSoftMask(GfxState*, const double*, bool,
++                                 Function*, GfxColor*) override;
++#endif
++        virtual void clearSoftMask(GfxState*) override;
++        // FG-175: pattern-filled stencil mask (Gfx::doPatternImageMask). The
++        // tracked hooks of the pattern fill in between are ignored on both
++        // devices alike; the records themselves are unchanged.
++        virtual void setSoftMaskFromImageMask(GfxState*, Object*, Stream*, int, int,
++                                              bool, bool, double*) override
++        { ++m_nStencilMaskOpen; }
++        virtual void unsetSoftMaskFromImageMask(GfxState*, double*) override
++        { if (m_nStencilMaskOpen > 0) --m_nStencilMaskOpen; }
+ 
+         poppler_bool useTilingPatternFill() override { return true; };
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfisoftmask.cxx b/sdext/source/pdfimport/xpdfwrapper/pdfisoftmask.cxx
+new file mode 100644
+--- /dev/null
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfisoftmask.cxx
+@@ -0,0 +1,658 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++// FG-175: soft-mask pre-pass. See pdfisoftmask.hxx for the design.
++
++#include "pdfisoftmask.hxx"
++
++#ifdef PDFI_SOFTMASK_RECORDER
++
++#if defined __GNUC__ || defined __clang__
++# pragma GCC diagnostic push
++# pragma GCC diagnostic ignored "-Wundef"
++# pragma GCC diagnostic ignored "-Wunused-parameter"
++#endif
++
++#include <Object.h>
++#include <Dict.h>
++#include <Page.h>
++#include <PDFDoc.h>
++#include <GfxState.h>
++#include <OutputDev.h>
++#include <SplashOutputDev.h>
++#include <splash/Splash.h>
++#include <splash/SplashBitmap.h>
++#include <splash/SplashTypes.h>
++
++#if defined __GNUC__ || defined __clang__
++# pragma GCC diagnostic pop
++#endif
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <set>
++
++#if defined __GNUC__ || defined __clang__
++# pragma GCC diagnostic push
++# pragma GCC diagnostic ignored "-Wundef"
++#endif
++#include <Gfx.h>
++#include <Stream.h>
++#if defined __GNUC__ || defined __clang__
++# pragma GCC diagnostic pop
++#endif
++
++namespace pdfi
++{
++namespace
++{
++    const double kRecorderPixelsPerPoint = 2.0;   ///< ~144 dpi, like the shading rasters
++    const double kRecorderMaxSide        = 4096.0; ///< px; a 4096^2 RGBA page is 64 MB
++    const double kRecorderMinDpi         = 18.0;
++    const size_t kRecorderByteBudget     = static_cast<size_t>(96) << 20; ///< raw layer bytes per page (4 GiB WASM heap shared with LibreOffice)
++
++    typedef SoftMaskSpanTracker::Transition Transition;
++
++    /// Skip an inline image's data the way Gfx's disabled-drawing branch does,
++    /// so Gfx::opBeginImage finds the EI tag where it expects it.
++    void lcl_drainInlineImage( Stream* str, int width, int height, int nComps, int nBits )
++    {
++        if (!str || width <= 0 || height <= 0)
++            return;
++        if (!str->reset())
++            return;
++        const long long n = static_cast<long long>( height )
++                            * ((static_cast<long long>( width ) * nComps * nBits + 7) / 8);
++        for (long long i = 0; i < n; ++i)
++            str->getChar();
++        str->close();
++    }
++
++    /// A SplashOutputDev that paints only soft-masked content and cuts it
++    /// into one RGBA layer per span.
++    class MaskLayerRecorder : public SplashOutputDev
++    {
++    public:
++        MaskLayerRecorder( SoftMaskLayerStore& rStore, const std::function<void()>& rBeat )
++            : SplashOutputDev( splashModeRGB8, 1 /* rowPad */, false /* reverseVideo */, nullptr /* paper */ )
++            , m_rStore( rStore )
++            , m_rBeat( rBeat )
++        {
++            setEnableFreeType( false ); // the bundled poppler has no FreeType
++            setVectorAntialias( true );
++        }
++
++        int spanCount() const { return m_aSpans.spanCount(); }
++
++        //----- capability answers mirror PDFOutDev so that Gfx issues the
++        //      same hook sequence (and therefore the same spans) to both.
++        bool interpretType3Chars() override { return false; }
++        bool useShadedFills( int type ) override { return type >= 1 && type <= 7; }
++        bool needNonText() override { return true; }
++        bool useDrawChar() override { return true; }
++        bool useTilingPatternFill() override { return true; }
++        // Gfx::doForm draws a /Group form as a transparency group only if
++        // the device says so. OutputDev's default (PDFOutDev) is "always";
++        // Splash declines plain groups (opacity 1, Normal, no mask) as an
++        // optimisation, which would silently drop three tracked hooks per
++        // form on this side only (fahr page 14: 2,971 forms, 8,913 hooks).
++        bool checkTransparencyGroup( GfxState*, bool ) override { return true; }
++
++        //----- page / state
++        void startPage( int pageNum, GfxState* state, XRef* xref ) override
++        {
++            SplashOutputDev::startPage( pageNum, state, xref );
++            m_aSpans.reset();
++            m_aOffsets.clear();
++            m_nOffX = m_nOffY = 0;
++            m_rStore.nPageW = getBitmapWidth();
++            m_rStore.nPageH = getBitmapHeight();
++        }
++
++        void endPage() override
++        {
++            apply( m_aSpans.endPage() );
++            SplashOutputDev::endPage();
++        }
++
++        void saveState( GfxState* state ) override
++        {
++            SplashOutputDev::saveState( state );
++            if (trackerActive())
++                m_aSpans.saveState();
++        }
++
++        void restoreState( GfxState* state ) override
++        {
++            const Transition aT = trackerActive() ? m_aSpans.restoreState() : Transition();
++            onEnd( aT );
++            SplashOutputDev::restoreState( state );
++            onBegin( aT );
++        }
++
++        //----- soft masks
++        void setSoftMask( GfxState* state, const std::array<double, 4>& bbox, bool alpha,
++                          Function* transferFunc, GfxColor* backdropColor ) override
++        {
++            const Transition aT = trackerActive() ? m_aSpans.setSoftMask() : Transition();
++            onEnd( aT );
++            tick( true );
++            SplashOutputDev::setSoftMask( state, bbox, alpha, transferFunc, backdropColor );
++            onBegin( aT );
++        }
++
++        void clearSoftMask( GfxState* state ) override
++        {
++            if (trackerActive())
++                apply( m_aSpans.clearSoftMask() );
++            SplashOutputDev::clearSoftMask( state );
++        }
++
++        // A pattern-filled stencil mask (Gfx::doPatternImageMask): Splash
++        // keeps a private transparency group open from set... to unset...,
++        // and the pattern fill in between issues tracked hooks
++        // (doTilingPatternFill's saveStateStack/restoreStateStack, per-tile
++        // forms) while getBitmap() is that private group. The tracker is
++        // PAUSED from set to unset on BOTH devices (PDFOutDev does the same),
++        // so no span ends or begins in there and no cut/clear touches the
++        // private group; Gfx's own saveState/restoreState around the pair
++        // keep the levels balanced. The group-offset bookkeeping in the
++        // group overrides stays symmetric.
++        void setSoftMaskFromImageMask( GfxState* state, Object* ref, Stream* str, int width, int height,
++                                       bool invert, bool inlineImg, double* baseMatrix ) override
++        {
++            ++m_nSplashInternalGroups; // paused until unsetSoftMaskFromImageMask
++            SplashOutputDev::setSoftMaskFromImageMask( state, ref, str, width, height, invert, inlineImg, baseMatrix );
++        }
++        void unsetSoftMaskFromImageMask( GfxState* state, double* baseMatrix ) override
++        {
++            SplashOutputDev::unsetSoftMaskFromImageMask( state, baseMatrix );
++            if (m_nSplashInternalGroups > 0)
++                --m_nSplashInternalGroups;
++        }
++
++        //----- transparency groups. Splash shifts the GfxState CTM by the
++        //      group origin (shiftCTMAndClip); the shift is read back from
++        //      the CTM so that layers cut from a group bitmap land in page px.
++        void beginTransparencyGroup( GfxState* state, const std::array<double, 4>& bbox,
++                                     GfxColorSpace* blendingColorSpace, bool isolated,
++                                     bool knockout, bool forSoftMask ) override
++        {
++            if (trackerActive())
++                apply( m_aSpans.beginGroup( forSoftMask ) );
++            const double* pBefore = state->getCTM();
++            const double fX = pBefore[4], fY = pBefore[5];
++            SplashOutputDev::beginTransparencyGroup( state, bbox, blendingColorSpace,
++                                                     isolated, knockout, forSoftMask );
++            const double* pAfter = state->getCTM();
++            const int nTx = static_cast<int>( std::lround( fX - pAfter[4] ) );
++            const int nTy = static_cast<int>( std::lround( fY - pAfter[5] ) );
++            m_aOffsets.push_back( std::make_pair( nTx, nTy ) );
++            m_nOffX += nTx;
++            m_nOffY += nTy;
++        }
++
++        void endTransparencyGroup( GfxState* state ) override
++        {
++            // A span still open here was set inside the group: cut its layer
++            // from the group bitmap before Splash discards it.
++            if (trackerActive())
++                apply( m_aSpans.endGroup() );
++            SplashOutputDev::endTransparencyGroup( state );
++            if (!m_aOffsets.empty())
++            {
++                m_nOffX -= m_aOffsets.back().first;
++                m_nOffY -= m_aOffsets.back().second;
++                m_aOffsets.pop_back();
++            }
++        }
++
++        //----- painting: only what a soft mask will apply to. Unmasked
++        //      content is PDFOutDev's business and is skipped here
++        //      (image streams are left unread).
++        void stroke( GfxState* state ) override
++        {
++            if (paintAllowed()) { tick(); SplashOutputDev::stroke( state ); }
++        }
++        void fill( GfxState* state ) override
++        {
++            if (paintAllowed()) { tick(); SplashOutputDev::fill( state ); }
++        }
++        void eoFill( GfxState* state ) override
++        {
++            if (paintAllowed()) { tick(); SplashOutputDev::eoFill( state ); }
++        }
++
++        // Text is exempt: it stays text in PDFOutDev (editable), and Splash
++        // has no glyph rasterizer in this build anyway.
++        void drawChar( GfxState*, double, double, double, double, double, double,
++                       CharCode, int, const Unicode*, int ) override {}
++
++        void drawImageMask( GfxState* state, Object* ref, Stream* str, int width, int height,
++                            bool invert, bool interpolate, bool inlineImg ) override
++        {
++            if (paintAllowed())
++            {
++                tick();
++                SplashOutputDev::drawImageMask( state, ref, str, width, height, invert, interpolate, inlineImg );
++            }
++            else if (inlineImg)
++                lcl_drainInlineImage( str, width, height, 1, 1 );
++        }
++        void drawImage( GfxState* state, Object* ref, Stream* str, int width, int height,
++                        GfxImageColorMap* colorMap, bool interpolate, const int* maskColors,
++                        bool inlineImg ) override
++        {
++            if (paintAllowed())
++            {
++                tick();
++                SplashOutputDev::drawImage( state, ref, str, width, height, colorMap, interpolate, maskColors, inlineImg );
++            }
++            else if (inlineImg && colorMap)
++                lcl_drainInlineImage( str, width, height, colorMap->getNumPixelComps(), colorMap->getBits() );
++        }
++        void drawMaskedImage( GfxState* state, Object* ref, Stream* str, int width, int height,
++                              GfxImageColorMap* colorMap, bool interpolate, Stream* maskStr,
++                              int maskWidth, int maskHeight, bool maskInvert, bool maskInterpolate ) override
++        {
++            if (paintAllowed())
++            {
++                tick();
++                SplashOutputDev::drawMaskedImage( state, ref, str, width, height, colorMap, interpolate,
++                                                  maskStr, maskWidth, maskHeight, maskInvert, maskInterpolate );
++            }
++        }
++        void drawSoftMaskedImage( GfxState* state, Object* ref, Stream* str, int width, int height,
++                                  GfxImageColorMap* colorMap, bool interpolate, Stream* maskStr,
++                                  int maskWidth, int maskHeight, GfxImageColorMap* maskColorMap,
++                                  bool maskInterpolate ) override
++        {
++            if (paintAllowed())
++            {
++                tick();
++                SplashOutputDev::drawSoftMaskedImage( state, ref, str, width, height, colorMap, interpolate,
++                                                      maskStr, maskWidth, maskHeight, maskColorMap, maskInterpolate );
++            }
++        }
++
++        bool tilingPatternFill( GfxState* state, Gfx* gfx, Catalog* cat, GfxTilingPattern* tPat,
++                                const std::array<double, 6>& mat, int x0, int y0, int x1, int y1,
++                                double xStep, double yStep ) override
++        {
++            const std::array<double, 4>& rBBox = tPat->getBBox();
++            if (!paintAllowed())
++            {
++                // Not painting: answer exactly as PDFOutDev::tilingPatternFill
++                // does for unmasked content, because a "false" makes Gfx run
++                // the per-tile drawForm fallback, whose save/restore hooks the
++                // tracker counts. PDFOutDev declines gapped patterns only.
++                const bool bGapped = xStep != rBBox[2] - rBBox[0] || yStep != rBBox[3] - rBBox[1];
++                return !bGapped;
++            }
++            tick();
++            // Painting (PDFOutDev is suppressed here and returned true): the
++            // tile must be rendered WITHOUT any tracked hook. Splash renders
++            // it with a nested Gfx on this device; if Splash declines
++            // (gapped, few repeats, odd CTM), run Gfx's own per-tile fallback
++            // here rather than let Gfx run it through the tracker.
++            ++m_nNestedRender;
++            try
++            {
++                const bool bDone = SplashOutputDev::tilingPatternFill( state, gfx, cat, tPat, mat,
++                                                                       x0, y0, x1, y1, xStep, yStep );
++                if (!bDone && !gfx)
++                    fail( "tile fallback without a Gfx" ); // nothing painted: page falls back
++                else if (!bDone)
++                {
++                    // Mirror of the fallback in Gfx::doTilingPatternFill.
++                    updatePatternOpacity( state );
++                    std::array<double, 6> aM1 = mat;
++                    for (int yi = y0; yi < y1; ++yi)
++                    {
++                        for (int xi = x0; xi < x1; ++xi)
++                        {
++                            const double x = xi * xStep;
++                            const double y = yi * yStep;
++                            aM1[4] = x * mat[0] + y * mat[2] + mat[4];
++                            aM1[5] = x * mat[1] + y * mat[3] + mat[5];
++                            gfx->drawForm( tPat->getContentStream(), tPat->getResDict(), aM1, rBBox );
++                        }
++                        tick();
++                    }
++                    clearPatternOpacity( state );
++                }
++            }
++            catch (...)
++            {
++                --m_nNestedRender;
++                throw;
++            }
++            --m_nNestedRender;
++            return true;
++        }
++        bool functionShadedFill( GfxState* state, GfxFunctionShading* shading ) override
++        {
++            if (!paintAllowed()) return true;
++            tick();
++            return SplashOutputDev::functionShadedFill( state, shading );
++        }
++        bool axialShadedFill( GfxState* state, GfxAxialShading* shading, double tMin, double tMax ) override
++        {
++            if (!paintAllowed()) return true;
++            tick();
++            return SplashOutputDev::axialShadedFill( state, shading, tMin, tMax );
++        }
++        bool radialShadedFill( GfxState* state, GfxRadialShading* shading, double tMin, double tMax ) override
++        {
++            if (!paintAllowed()) return true;
++            tick();
++            return SplashOutputDev::radialShadedFill( state, shading, tMin, tMax );
++        }
++        bool gouraudTriangleShadedFill( GfxState* state, GfxGouraudTriangleShading* shading ) override
++        {
++            if (!paintAllowed()) return true;
++            tick();
++            return SplashOutputDev::gouraudTriangleShadedFill( state, shading );
++        }
++        // patchMeshShadedFill: OutputDev's default (false) lets Gfx subdivide
++        // the mesh into fills, which fill() above gates.
++
++    private:
++        bool paintAllowed() const
++        {
++            if (m_nNestedRender > 0)
++                return true; // inside a tile Splash is rendering for an allowed fill
++            return m_aSpans.softMaskDepth() > 0 || m_aSpans.effectivelyMasked();
++        }
++
++        /// False while Splash drives hooks PDFOutDev will never see.
++        bool trackerActive() const
++        {
++            return m_nSplashInternalGroups == 0 && m_nNestedRender == 0;
++        }
++
++        void tick( bool bForce = false )
++        {
++            if (m_rBeat && (bForce || (++m_nTicks & 63) == 0))
++                m_rBeat();
++        }
++
++        void apply( const Transition& rT )
++        {
++            onEnd( rT );
++            onBegin( rT );
++        }
++
++        void onBegin( const Transition& rT )
++        {
++            if (rT.nBegan < 0 || m_rStore.pFailure)
++                return;
++            if (m_rStore.aLayers.size() <= static_cast<size_t>( rT.nBegan ))
++                m_rStore.aLayers.resize( rT.nBegan + 1 );
++            m_rStore.aLayers[rT.nBegan].bNested = rT.bBeganNested;
++            m_rStore.aLayers[rT.nBegan].aSignature = rT.aBeganSignature;
++            m_rStore.nSpans = m_aSpans.spanCount();
++            if (rT.bBeganNested)
++                return; // painted into the enclosing group / mask; nothing to isolate
++            // Start the span from a transparent bitmap. Everything painted so
++            // far on it belongs to earlier spans, already cut out.
++            Splash* pSplash = getSplash();
++            if (pSplash)
++            {
++                SplashColor aClear = { 0, 0, 0, 0 };
++                pSplash->clear( aClear, 0 );
++            }
++        }
++
++        void onEnd( const Transition& rT )
++        {
++            if (rT.nEnded < 0 || m_rStore.pFailure)
++                return;
++            if (m_rStore.aLayers.size() <= static_cast<size_t>( rT.nEnded ))
++                m_rStore.aLayers.resize( rT.nEnded + 1 );
++            m_rStore.aLayers[rT.nEnded].aEndSignature = rT.aEndedSignature;
++            if (rT.bEndedNested)
++                return;
++            cutLayer( m_rStore.aLayers[rT.nEnded] );
++        }
++
++        /// Crop the current bitmap to its painted pixels and store it as the
++        /// layer, converting the group's colour mode to RGB.
++        void cutLayer( SoftMaskLayer& rLayer )
++        {
++            tick( true );
++            SplashBitmap* pBmp = getBitmap();
++            if (!pBmp || !pBmp->getDataPtr() || !pBmp->getAlphaPtr())
++            {
++                fail( "bitmap without alpha" );
++                return;
++            }
++            const SplashColorMode eMode = pBmp->getMode();
++            int nComps = 0;
++            switch (eMode)
++            {
++                case splashModeMono8:  nComps = 1; break;
++                case splashModeRGB8:   nComps = 3; break;
++                case splashModeBGR8:   nComps = 3; break;
++                case splashModeXBGR8:  nComps = 4; break;
++                case splashModeCMYK8:  nComps = 4; break;
++                default:
++                    fail( "unsupported group colour mode" );
++                    return;
++            }
++            const int nW = pBmp->getWidth();
++            const int nH = pBmp->getHeight();
++            const unsigned char* pAlpha = pBmp->getAlphaPtr();
++            const int nAlphaRow = pBmp->getAlphaRowSize();
++
++            // Bounding box of the painted pixels.
++            int nX0 = nW, nY0 = nH, nX1 = -1, nY1 = -1;
++            for (int y = 0; y < nH; ++y)
++            {
++                const unsigned char* pRow = pAlpha + static_cast<size_t>( y ) * nAlphaRow;
++                int xFirst = -1, xLast = -1;
++                for (int x = 0; x < nW; ++x)
++                {
++                    if (pRow[x])
++                    {
++                        if (xFirst < 0) xFirst = x;
++                        xLast = x;
++                    }
++                }
++                if (xFirst >= 0)
++                {
++                    nX0 = std::min( nX0, xFirst );
++                    nX1 = std::max( nX1, xLast );
++                    nY0 = std::min( nY0, y );
++                    nY1 = y;
++                }
++            }
++            if (nX1 < 0)
++            {
++                rLayer.nW = rLayer.nH = 0; // the mask hid everything
++                return;
++            }
++
++            const int nLW = nX1 - nX0 + 1;
++            const int nLH = nY1 - nY0 + 1;
++            const size_t nBytes = static_cast<size_t>( nLW ) * nLH * 4;
++            if (m_rStore.nBytes + nBytes > kRecorderByteBudget)
++            {
++                fail( "layer byte budget exceeded" );
++                return;
++            }
++
++            rLayer.aRGB.resize( static_cast<size_t>( nLW ) * nLH * 3 );
++            rLayer.aAlpha.resize( static_cast<size_t>( nLW ) * nLH );
++            const unsigned char* pData = pBmp->getDataPtr();
++            const int nRow = pBmp->getRowSize();
++            for (int y = 0; y < nLH; ++y)
++            {
++                const unsigned char* pSrc = pData + static_cast<size_t>( nY0 + y ) * nRow
++                                            + static_cast<size_t>( nX0 ) * nComps;
++                const unsigned char* pSrcA = pAlpha + static_cast<size_t>( nY0 + y ) * nAlphaRow + nX0;
++                unsigned char* pDst = rLayer.aRGB.data() + static_cast<size_t>( y ) * nLW * 3;
++                unsigned char* pDstA = rLayer.aAlpha.data() + static_cast<size_t>( y ) * nLW;
++                for (int x = 0; x < nLW; ++x, pSrc += nComps, pDst += 3)
++                {
++                    switch (eMode)
++                    {
++                        case splashModeMono8:
++                            pDst[0] = pDst[1] = pDst[2] = pSrc[0];
++                            break;
++                        case splashModeRGB8:
++                            pDst[0] = pSrc[0]; pDst[1] = pSrc[1]; pDst[2] = pSrc[2];
++                            break;
++                        case splashModeBGR8:
++                            pDst[0] = pSrc[2]; pDst[1] = pSrc[1]; pDst[2] = pSrc[0];
++                            break;
++                        case splashModeXBGR8:
++                            pDst[0] = pSrc[2]; pDst[1] = pSrc[1]; pDst[2] = pSrc[0];
++                            break;
++                        case splashModeCMYK8:
++                        {
++                            const int k = pSrc[3];
++                            pDst[0] = static_cast<unsigned char>( 255 - std::min( 255, pSrc[0] + k ) );
++                            pDst[1] = static_cast<unsigned char>( 255 - std::min( 255, pSrc[1] + k ) );
++                            pDst[2] = static_cast<unsigned char>( 255 - std::min( 255, pSrc[2] + k ) );
++                            break;
++                        }
++                        default:
++                            break;
++                    }
++                    pDstA[x] = pSrcA[x];
++                }
++            }
++            // Group bitmaps are offset from the page; translate back.
++            rLayer.nX = nX0 + m_nOffX;
++            rLayer.nY = nY0 + m_nOffY;
++            rLayer.nW = nLW;
++            rLayer.nH = nLH;
++            m_rStore.nBytes += nBytes;
++            ++m_rStore.nLayersWithPixels;
++        }
++
++        void fail( const char* pWhy )
++        {
++            if (!m_rStore.pFailure)
++                m_rStore.pFailure = pWhy;
++        }
++
++        SoftMaskLayerStore&               m_rStore;
++        const std::function<void()>&      m_rBeat;
++        SoftMaskSpanTracker               m_aSpans;
++        std::vector<std::pair<int, int>>  m_aOffsets; ///< per open group: its origin in the parent bitmap
++        int                               m_nOffX = 0; ///< current bitmap origin in page px
++        int                               m_nOffY = 0;
++        unsigned                          m_nTicks = 0;
++        int                               m_nSplashInternalGroups = 0; ///< stencil-mask pattern fill open (set..unset)
++        int                               m_nNestedRender = 0;         ///< inside Splash's tilingPatternFill
++    };
++
++    bool lcl_resourcesDeclareSoftMask( Dict* pRes, int nDepth, std::set<int>& rVisited )
++    {
++        if (!pRes || nDepth > 8)
++            return false;
++
++        Object aExt = pRes->lookup( "ExtGState" );
++        if (aExt.isDict())
++        {
++            Dict* pExt = aExt.getDict();
++            for (int i = 0; i < pExt->getLength(); ++i)
++            {
++                Object aGS = pExt->getVal( i );
++                if (!aGS.isDict())
++                    continue;
++                Object aSMask = aGS.getDict()->lookup( "SMask" );
++                if (aSMask.isDict())
++                    return true;
++            }
++        }
++
++        static const char* const aNested[] = { "XObject", "Pattern" };
++        for (const char* pKey : aNested)
++        {
++            Object aDictObj = pRes->lookup( pKey );
++            if (!aDictObj.isDict())
++                continue;
++            Dict* pDict = aDictObj.getDict();
++            for (int i = 0; i < pDict->getLength(); ++i)
++            {
++                const Object& rRef = pDict->getValNF( i );
++                if (rRef.isRef() && !rVisited.insert( rRef.getRef().num ).second)
++                    continue;
++                Object aVal = pDict->getVal( i );
++                if (!aVal.isStream())
++                    continue;
++                Object aSub = aVal.streamGetDict()->lookup( "Resources" );
++                if (aSub.isDict() && lcl_resourcesDeclareSoftMask( aSub.getDict(), nDepth + 1, rVisited ))
++                    return true;
++            }
++        }
++        return false;
++    }
++}
++
++double chooseSoftMaskRecorderDpi( double fPageWidthPt, double fPageHeightPt )
++{
++    const double fLongest = std::max( std::max( fPageWidthPt, fPageHeightPt ), 1.0 );
++    double fDpi = kRecorderPixelsPerPoint * 72.0;
++    if (fLongest * fDpi / 72.0 > kRecorderMaxSide)
++        fDpi = kRecorderMaxSide * 72.0 / fLongest;
++    if (fDpi < kRecorderMinDpi)
++        fDpi = kRecorderMinDpi;
++    return fDpi;
++}
++
++bool pageDeclaresSoftMask( Page* pPage )
++{
++    if (!pPage)
++        return false;
++    std::set<int> aVisited;
++    return lcl_resourcesDeclareSoftMask( pPage->getResourceDict(), 0, aVisited );
++}
++
++void recordSoftMaskLayers( PDFDoc& rDoc, int nPage, double fDpi,
++                           SoftMaskLayerStore& rStore,
++                           const std::function<void()>& rBeat )
++{
++    rStore.clear();
++    rStore.fDpi = fDpi;
++    try
++    {
++        MaskLayerRecorder aRecorder( rStore, rBeat );
++        aRecorder.startDoc( &rDoc );
++        // Same page geometry as the main pass: rotate 0, media box, cropped.
++        rDoc.displayPage( &aRecorder, nPage, fDpi, fDpi, 0, true, true, true );
++        if (!rStore.pFailure)
++        {
++            rStore.nSpans = aRecorder.spanCount();
++            rStore.aLayers.resize( rStore.nSpans );
++            rStore.bUsable = true;
++        }
++    }
++    catch (...)
++    {
++        rStore.pFailure = "exception in pre-pass";
++    }
++    if (!rStore.bUsable)
++    {
++        rStore.aLayers.clear();
++        rStore.nBytes = 0;
++        if (!rStore.pFailure)
++            rStore.pFailure = "unknown";
++    }
++}
++
++} // namespace pdfi
++
++#endif // PDFI_SOFTMASK_RECORDER
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfisoftmask.hxx b/sdext/source/pdfimport/xpdfwrapper/pdfisoftmask.hxx
+new file mode 100644
+--- /dev/null
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfisoftmask.hxx
+@@ -0,0 +1,367 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++// FG-175: ExtGState soft masks (/SMask with a luminosity or alpha group).
++//
++// PDFOutDev emits editable draw shapes and has no transparency groups, so
++// content painted under a soft mask used to arrive unmasked: a bubble's
++// glow, which the source shows only through a circular luminosity mask,
++// became a large grey square over the bubble. poppler never hands the mask
++// group's stream to an OutputDev; the only correct renderer of it is
++// poppler's own Gfx driving a SplashOutputDev. So each page that declares a
++// soft mask is rendered twice:
++//
++//   1. pre-pass  MaskLayerRecorder (a SplashOutputDev) at ~2 px/pt. Splash
++//                applies every soft mask natively. The recorder paints ONLY
++//                content that is effectively masked, into a bitmap cleared at
++//                the start of each soft-mask SPAN, and crops the result into
++//                one RGBA layer per span (SoftMaskLayerStore).
++//   2. main pass PDFOutDev suppresses the masked content and, where the span
++//                begins, emits the recorded layer through the existing
++//                "shadedFill <x0> <y0> <x1> <y1> PNG <n>" record (a bitmap
++//                stretched over a device-space rectangle, FG-142).
++//
++// A SPAN is a maximal run of drawing during which a soft mask is in effect.
++// Both devices derive the span sequence from the same poppler hook events
++// (saveState / restoreState / setSoftMask / clearSoftMask / transparency
++// groups) through one shared state machine, SoftMaskSpanTracker, so span
++// ordinals agree by construction rather than by matching anything.
++//
++// Text is exempt: it stays text (editable) and is emitted unmasked. The
++// bundled poppler is built without FreeType, so Splash could not rasterize
++// glyphs anyway.
++//
++// Any failure of the pre-pass (exception, memory budget, span-count mismatch)
++// marks the page's store unusable, and PDFOutDev then behaves exactly as
++// before: masked content is emitted unmasked. Nothing is ever dropped.
++//
++// Known limits (documented, not silent):
++//  - Text as clip (Tr 7 / text clipping modes): the recorder draws no glyphs,
++//    so a text-shaped clip does not constrain what the recorder paints; the
++//    masked content inside such a clip is recorded unclipped by the text.
++//  - pageDeclaresSoftMask() scans the page resources (recursively through
++//    form XObjects and patterns) but not annotation appearance streams; a
++//    soft mask declared only there gets no pre-pass and is emitted unmasked.
++//  - Z-order: a layer is emitted when its span BEGINS (under the clip in
++//    effect at the "gs"), so text drawn later in the span lands above the
++//    masked content painted after it, which is the usual intent (labels over
++//    glows). A span is ended by every Q while it is active and resumed
++//    afterwards as a new span, so every layer is emitted under a clip that
++//    is at least as wide as any clip its pixels were painted under.
++//  - Capability answers: Gfx consults the device before deciding whether a
++//    /Group form is a transparency group (checkTransparencyGroup), whether
++//    to run a tiling pattern itself, etc. The recorder answers exactly as
++//    PDFOutDev does wherever the answer changes the hook sequence.
++//  - Pattern-filled stencil masks (doPatternImageMask): both devices pause
++//    the tracker between setSoftMaskFromImageMask and unsetSoftMaskFromImageMask.
++//  - Tiling patterns rendered privately (PDFOutDev) vs by Splash's nested
++//    Gfx (recorder) can make the two devices see different span sequences.
++//    Every span carries a begin AND an end signature (hook count, state
++//    depth, group depth); PDFOutDev compares the begin signature before
++//    emitting (fallback is lossless: unmasked emission for the rest of the
++//    page) and the end signature when its own span ends. An end mismatch is
++//    NOT recoverable — the layer was emitted at begin and the span's content
++//    suppressed — so it is logged distinctly ("ended out of step — content
++//    may be missing") for a gate to assert against, and the page falls back
++//    from there on. To keep the sequences identical the recorder returns
++//    PDFOutDev's own verdict from tilingPatternFill whenever it is not
++//    painting, and never lets Splash decline a tile it IS painting (it runs
++//    Gfx's per-tile fallback itself, outside the tracker).
++
++#ifndef INCLUDED_SDEXT_SOURCE_PDFIMPORT_XPDFWRAPPER_PDFISOFTMASK_HXX
++#define INCLUDED_SDEXT_SOURCE_PDFIMPORT_XPDFWRAPPER_PDFISOFTMASK_HXX
++
++#include <algorithm>
++#include <cstddef>
++#include <functional>
++#include <vector>
++
++namespace pdfi
++{
++    /// Where in the hook sequence a span began. Both devices compute it from
++    /// the same events, so a mismatch proves their sequences diverged.
++    struct SoftMaskSpanSignature
++    {
++        long nHooks  = 0; ///< tracker events seen before the span began
++        int  nLevels = 0; ///< GfxState levels
++        int  nGroups = 0; ///< open transparency groups
++        bool bNested = false;
++        bool operator==( const SoftMaskSpanSignature& r ) const
++        { return nHooks == r.nHooks && nLevels == r.nLevels && nGroups == r.nGroups && bNested == r.bNested; }
++        bool operator!=( const SoftMaskSpanSignature& r ) const { return !(*this == r); }
++    };
++
++    /// Span state machine shared by MaskLayerRecorder and PDFOutDev.
++    /// Drive it from the poppler hooks named after its methods; every method
++    /// returns which span (if any) ended and which began as a consequence.
++    class SoftMaskSpanTracker
++    {
++    public:
++        struct Transition
++        {
++            int  nEnded      = -1;    ///< ordinal of the span that ended, or -1
++            bool bEndedNested = false;
++            int  nBegan      = -1;    ///< ordinal of the span that began, or -1
++            bool bBeganNested = false; ///< began inside a masked group / mask definition
++            SoftMaskSpanSignature aBeganSignature;
++            SoftMaskSpanSignature aEndedSignature; ///< where the ended span ended
++        };
++
++        SoftMaskSpanTracker() { reset(); }
++
++        void reset()
++        {
++            m_aMask.assign(1, false);
++            m_aGroups.clear();
++            m_nActive = -1;
++            m_bActiveNested = false;
++            m_nNext = 0;
++            m_nSoftMaskDepth = 0;
++            m_nMaskedGroupDepth = 0;
++            m_nHooks = 0;
++        }
++
++        /// Gfx::saveState / saveStateStack: the new level inherits the mask.
++        Transition saveState()
++        {
++            ++m_nHooks;
++            m_aMask.push_back(m_aMask.back());
++            return Transition();
++        }
++
++        /// Gfx::restoreState: the popped level's mask dies; the mask of the
++        /// level below, if any, is in effect again (poppler's Splash keeps the
++        /// soft mask in its own state stack, which this mirrors). An active
++        /// span always ENDS here, even when the restored level is masked too:
++        /// the layer is emitted under the clip at span begin, and the clip
++        /// restored by Q may be wider than the one set inside, so content
++        /// painted after Q gets a span (and a layer) of its own.
++        Transition restoreState()
++        {
++            ++m_nHooks;
++            if (m_aMask.size() > 1)
++                m_aMask.pop_back();
++            Transition aT = endIfActive();
++            if (m_aMask.back())
++                begin(aT);
++            return aT;
++        }
++
++        /// OutputDev::setSoftMask: a (new) mask is in effect at this level.
++        /// A new mask always starts a new span, even if one was active.
++        Transition setSoftMask()
++        {
++            ++m_nHooks;
++            Transition aT = endIfActive();
++            m_aMask.back() = true;
++            begin(aT);
++            return aT;
++        }
++
++        /// OutputDev::clearSoftMask: "/SMask /None", or the top of every
++        /// Gfx::drawForm transparency group.
++        Transition clearSoftMask()
++        {
++            ++m_nHooks;
++            m_aMask.back() = false;
++            return sync();
++        }
++
++        /// OutputDev::beginTransparencyGroup. Gfx has already pushed a state
++        /// level and cleared the mask on it, so the mask that applies to the
++        /// group as a whole (through paintTransparencyGroup) is the one on the
++        /// level below.
++        Transition beginGroup(bool bForSoftMask)
++        {
++            ++m_nHooks;
++            Transition aT = endIfActive();
++            bool bMasked = false;
++            if (!bForSoftMask)
++            {
++                const size_t n = m_aMask.size();
++                bMasked = m_aMask.back() || (n >= 2 && m_aMask[n - 2]);
++            }
++            m_aGroups.push_back(Group{bForSoftMask, bMasked});
++            if (bForSoftMask)
++                ++m_nSoftMaskDepth;
++            else if (bMasked)
++                ++m_nMaskedGroupDepth;
++            return aT;
++        }
++
++        /// OutputDev::endTransparencyGroup. A mask set inside the group dies
++        /// with it (Splash discards the group's state).
++        Transition endGroup()
++        {
++            ++m_nHooks;
++            if (m_aGroups.empty())
++                return Transition();
++            const Group aG = m_aGroups.back();
++            m_aGroups.pop_back();
++            if (aG.bForSoftMask)
++                m_nSoftMaskDepth = std::max(0, m_nSoftMaskDepth - 1);
++            else if (aG.bMasked)
++                m_nMaskedGroupDepth = std::max(0, m_nMaskedGroupDepth - 1);
++            m_aMask.back() = false;
++            return endIfActive();
++        }
++
++        Transition endPage() { return endIfActive(); }
++
++        bool spanActive() const { return m_nActive >= 0; }
++        int  activeOrdinal() const { return m_nActive; }
++        bool activeNested() const { return m_bActiveNested; }
++        /// Ordinal the next span will get.
++        int  nextOrdinal() const { return m_nNext; }
++        /// Number of spans begun so far on this page.
++        int  spanCount() const { return m_nNext; }
++        /// Inside the definition of a soft mask (the mask group itself).
++        int  softMaskDepth() const { return m_nSoftMaskDepth; }
++        /// Inside a transparency group that will be composited through a mask.
++        int  maskedGroupDepth() const { return m_nMaskedGroupDepth; }
++        /// Content drawn now is composited through a soft mask.
++        bool effectivelyMasked() const { return spanActive() || m_nMaskedGroupDepth > 0; }
++
++    private:
++        struct Group { bool bForSoftMask; bool bMasked; };
++
++        Transition endIfActive()
++        {
++            Transition aT;
++            if (m_nActive >= 0)
++            {
++                aT.nEnded = m_nActive;
++                aT.bEndedNested = m_bActiveNested;
++                aT.aEndedSignature.nHooks  = m_nHooks;
++                aT.aEndedSignature.nLevels = static_cast<int>(m_aMask.size());
++                aT.aEndedSignature.nGroups = static_cast<int>(m_aGroups.size());
++                aT.aEndedSignature.bNested = m_bActiveNested;
++                m_nActive = -1;
++                m_bActiveNested = false;
++            }
++            return aT;
++        }
++
++        void begin(Transition& rT)
++        {
++            m_nActive = m_nNext++;
++            m_bActiveNested = m_nMaskedGroupDepth > 0 || m_nSoftMaskDepth > 0;
++            rT.nBegan = m_nActive;
++            rT.bBeganNested = m_bActiveNested;
++            rT.aBeganSignature.nHooks  = m_nHooks;
++            rT.aBeganSignature.nLevels = static_cast<int>(m_aMask.size());
++            rT.aBeganSignature.nGroups = static_cast<int>(m_aGroups.size());
++            rT.aBeganSignature.bNested = m_bActiveNested;
++        }
++
++        /// Make the span state agree with the mask flag of the current level.
++        Transition sync()
++        {
++            const bool bWant = m_aMask.back();
++            if (bWant && m_nActive < 0)
++            {
++                Transition aT;
++                begin(aT);
++                return aT;
++            }
++            if (!bWant && m_nActive >= 0)
++                return endIfActive();
++            return Transition();
++        }
++
++        std::vector<bool>  m_aMask;    ///< mask present, one entry per GfxState level
++        std::vector<Group> m_aGroups;  ///< open transparency groups
++        int  m_nActive;
++        bool m_bActiveNested;
++        int  m_nNext;
++        int  m_nSoftMaskDepth;
++        int  m_nMaskedGroupDepth;
++        long m_nHooks;
++    };
++
++    /// One recorded span: the masked content, composited, cropped to its
++    /// visible pixels, in recorder page pixels (top-down, origin at the
++    /// page's top-left, same device space as PDFOutDev at a different scale).
++    struct SoftMaskLayer
++    {
++        bool bNested = false; ///< inside a masked group: covered by the enclosing span
++        SoftMaskSpanSignature aSignature;    ///< where the recorder saw the span begin
++        SoftMaskSpanSignature aEndSignature; ///< where the recorder saw it end
++        int  nX = 0, nY = 0, nW = 0, nH = 0; ///< nW == 0: nothing visible
++        std::vector<unsigned char> aRGB;     ///< nW * nH * 3
++        std::vector<unsigned char> aAlpha;   ///< nW * nH
++    };
++
++    /// Everything the pre-pass learned about one page.
++    struct SoftMaskLayerStore
++    {
++        std::vector<SoftMaskLayer> aLayers;
++        bool   bUsable = false;   ///< false: PDFOutDev falls back to unmasked emission
++        double fDpi = 144.0;      ///< recorder resolution
++        int    nPageW = 0, nPageH = 0; ///< recorder bitmap size in px
++        size_t nBytes = 0;        ///< raw bytes held by aLayers
++        int    nSpans = 0;        ///< spans the recorder counted
++        int    nLayersWithPixels = 0;
++        const char* pFailure = nullptr; ///< why bUsable is false, for the log
++
++        void clear()
++        {
++            aLayers.clear();
++            bUsable = false;
++            nPageW = nPageH = 0;
++            nBytes = 0;
++            nSpans = 0;
++            nLayersWithPixels = 0;
++            pFailure = nullptr;
++        }
++        const SoftMaskLayer* get(int n) const
++        {
++            if (n < 0 || static_cast<size_t>(n) >= aLayers.size())
++                return nullptr;
++            return &aLayers[n];
++        }
++    };
++}
++
++#include <cpp/poppler-version.h>
++#ifndef POPPLER_CHECK_VERSION
++#define POPPLER_CHECK_VERSION(major,minor,micro) \
++  (POPPLER_VERSION_MAJOR > (major) || \
++   (POPPLER_VERSION_MAJOR == (major) && POPPLER_VERSION_MINOR > (minor)) || \
++   (POPPLER_VERSION_MAJOR == (major) && POPPLER_VERSION_MINOR == (minor) && POPPLER_VERSION_MICRO >= (micro)))
++#endif
++
++// The recorder needs the std::array hook signatures of poppler >= 25.9.
++#if POPPLER_CHECK_VERSION(25, 9, 0)
++#define PDFI_SOFTMASK_RECORDER 1
++
++class PDFDoc;
++class Page;
++
++namespace pdfi
++{
++    /// Resolution for the pre-pass of a page: 2 px/pt, longest side capped.
++    double chooseSoftMaskRecorderDpi( double fPageWidthPt, double fPageHeightPt );
++
++    /// True when the page's resources (recursively through form XObjects and
++    /// patterns) declare an ExtGState with an /SMask group.
++    bool pageDeclaresSoftMask( Page* pPage );
++
++    /// Runs the pre-pass for one page. Never throws; on failure rStore.bUsable
++    /// is false and rStore.pFailure says why. rBeat is called from the heavy
++    /// paths to keep the caller's progress heartbeat alive.
++    void recordSoftMaskLayers( PDFDoc& rDoc, int nPage, double fDpi,
++                               SoftMaskLayerStore& rStore,
++                               const std::function<void()>& rBeat );
++}
++#endif // POPPLER_CHECK_VERSION(25, 9, 0)
++
++#endif // INCLUDED_SDEXT_SOURCE_PDFIMPORT_XPDFWRAPPER_PDFISOFTMASK_HXX
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

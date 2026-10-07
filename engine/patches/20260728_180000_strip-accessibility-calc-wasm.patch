@@ -1,0 +1,704 @@
+diff --git a/configure.ac b/configure.ac
+index 7e6acf29ed7e..9ac84b884e61 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -4256,7 +4256,8 @@ if test "$cross_compiling" = "yes"; then
+         for i in $with_wasm_module; do
+             case "$i" in
+             calc)
+-                ENABLE_WASM_STRIP_ACCESSIBILITY=
++                # sc/ is now guarded with #if !ENABLE_WASM_STRIP_ACCESSIBILITY (mirroring sw/),
++                # so accessibility can be stripped for calc like it already is for writer.
+                 ENABLE_WASM_STRIP_CALC=
+                 ;;
+             writer)
+diff --git a/sc/Library_sc.mk b/sc/Library_sc.mk
+index 5a0aa6107562..16306dd5d805 100644
+--- a/sc/Library_sc.mk
++++ b/sc/Library_sc.mk
+@@ -361,6 +361,16 @@ $(eval $(call gb_Library_add_exception_objects,sc,\
+     sc/source/filter/xml/xmlwrap \
+     sc/source/filter/importfilterdata \
+     sc/source/ui/Accessibility/AccessibilityHints \
++))
++
++# Accessibility implementations, stripped when ENABLE_WASM_STRIP_ACCESSIBILITY is
++# set, matching what sw/ and svx/ already do.
++# NOTE: sc/source/ui/Accessibility/AccessibilityHints stays in the unconditional
++# list above on purpose - sc/source/ui/view/gridwin.cxx and
++# sc/source/ui/view/preview.cxx include AccessibilityHints.hxx from ordinary,
++# non-accessibility code paths, so stripping it would break the build.
++ifneq ($(ENABLE_WASM_STRIP_ACCESSIBILITY),TRUE)
++$(eval $(call gb_Library_add_exception_objects,sc,\
+     sc/source/ui/Accessibility/AccessibleCell \
+     sc/source/ui/Accessibility/AccessibleCellBase \
+     sc/source/ui/Accessibility/AccessibleContextBase \
+@@ -378,6 +388,10 @@ $(eval $(call gb_Library_add_exception_objects,sc,\
+     sc/source/ui/Accessibility/AccessibleTableBase \
+     sc/source/ui/Accessibility/AccessibleText \
+     sc/source/ui/Accessibility/DrawModelBroadcaster \
++))
++endif
++
++$(eval $(call gb_Library_add_exception_objects,sc,\
+     sc/source/ui/app/acctrl \
+     sc/source/ui/app/client \
+     sc/source/ui/app/drwtrans \
+diff --git a/sc/inc/editsrc.hxx b/sc/inc/editsrc.hxx
+index 166a18a28979..31eed0e6b5ed 100644
+--- a/sc/inc/editsrc.hxx
++++ b/sc/inc/editsrc.hxx
+@@ -19,6 +19,8 @@
+ 
+ #pragma once
+ 
++#include <config_wasm_strip.h>
++
+ #include "address.hxx"
+ #include <editeng/unoedsrc.hxx>
+ #include <svl/lstner.hxx>
+@@ -129,6 +131,7 @@ public:
+ 
+ };
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+ class ScAccessibilityEditSource final : public SvxEditSource
+ {
+ private:
+@@ -145,5 +148,6 @@ public:
+     virtual void                UpdateData() override;
+     virtual SfxBroadcaster&     GetBroadcaster() const override;
+ };
++#endif // !ENABLE_WASM_STRIP_ACCESSIBILITY
+ 
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/sc/source/ui/app/inputwin.cxx b/sc/source/ui/app/inputwin.cxx
+index 79f5f62e202d..554af77a4470 100644
+--- a/sc/source/ui/app/inputwin.cxx
++++ b/sc/source/ui/app/inputwin.cxx
+@@ -17,6 +17,8 @@
+  *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
+  */
+ 
++#include <config_wasm_strip.h>
++
+ #include <memory>
+ #include <algorithm>
+ #include <string_view>
+@@ -927,6 +929,7 @@ void ScInputBarGroup::dispose()
+     InterimItemWindow::dispose();
+ }
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+ void ScInputBarGroup::InsertAccessibleTextData( ScAccessibleEditLineTextData& rTextData )
+ {
+     mxTextWndGroup->InsertAccessibleTextData(rTextData);
+@@ -936,6 +939,7 @@ void ScInputBarGroup::RemoveAccessibleTextData( ScAccessibleEditLineTextData& rT
+ {
+     mxTextWndGroup->RemoveAccessibleTextData(rTextData);
+ }
++#endif
+ 
+ const OUString& ScInputBarGroup::GetTextString() const
+ {
+@@ -1198,10 +1202,12 @@ ScTextWndGroup::~ScTextWndGroup()
+ {
+ }
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+ void ScTextWndGroup::InsertAccessibleTextData(ScAccessibleEditLineTextData& rTextData)
+ {
+     mxTextWnd->InsertAccessibleTextData(rTextData);
+ }
++#endif
+ 
+ EditView* ScTextWndGroup::GetEditView() const
+ {
+@@ -1258,10 +1264,12 @@ void ScTextWndGroup::MakeDialogEditView()
+     mxTextWnd->MakeDialogEditView();
+ }
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+ void ScTextWndGroup::RemoveAccessibleTextData(ScAccessibleEditLineTextData& rTextData)
+ {
+     mxTextWnd->RemoveAccessibleTextData(rTextData);
+ }
++#endif
+ 
+ void ScTextWndGroup::SetScrollPolicy()
+ {
+@@ -1591,12 +1599,14 @@ void ScTextWnd::InitEditEngine()
+     Color aBgColor = rStyleSettings.GetFieldColor();
+     m_xEditView->SetBackgroundColor(aBgColor);
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     if (pAcc)
+     {
+         pAcc->InitAcc(nullptr, m_xEditView.get(),
+                       ScResId(STR_ACC_EDITLINE_NAME),
+                       ScResId(STR_ACC_EDITLINE_DESCR));
+     }
++#endif
+ 
+     if (comphelper::LibreOfficeKit::isActive())
+         m_xEditView->RegisterViewShell(mpViewShell);
+@@ -1615,8 +1625,10 @@ void ScTextWnd::InitEditEngine()
+     m_xEditEngine->SetModifyHdl(LINK(this, ScTextWnd, ModifyHdl));
+     m_xEditEngine->SetStatusEventHdl(LINK(this, ScTextWnd, EditStatusHdl));
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     if (!maAccTextDatas.empty())
+         maAccTextDatas.back()->StartEdit();
++#endif
+ 
+     // as long as EditEngine and DrawText sometimes differ for CTL text,
+     // repaint now to have the EditEngine's version visible
+@@ -1643,9 +1655,11 @@ ScTextWnd::ScTextWnd(ScTextWndGroup& rParent, ScTabViewShell* pViewSh) :
+ 
+ ScTextWnd::~ScTextWnd()
+ {
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     while (!maAccTextDatas.empty()) {
+         maAccTextDatas.back()->Dispose();
+     }
++#endif
+ }
+ 
+ bool ScTextWnd::MouseMove( const MouseEvent& rMEvt )
+@@ -1945,8 +1959,10 @@ void ScTextWnd::StopEditEngine( bool bAll )
+ 
+     if (m_xEditView)
+     {
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+         if (!maAccTextDatas.empty())
+             maAccTextDatas.back()->EndEdit();
++#endif
+ 
+         ScModule* pScMod = ScModule::get();
+ 
+@@ -2070,8 +2086,10 @@ void ScTextWnd::SetTextString( const OUString& rNewString, bool bKitUpdate )
+ 
+         aString = rNewString;
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+         if (!maAccTextDatas.empty())
+             maAccTextDatas.back()->TextChanged();
++#endif
+ 
+         bInputMode = false;
+     }
+@@ -2132,12 +2150,14 @@ void ScTextWnd::MakeDialogEditView()
+     Color aBgColor = rStyleSettings.GetFieldColor();
+     m_xEditView->SetBackgroundColor(aBgColor);
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     if (pAcc)
+     {
+         pAcc->InitAcc(nullptr, m_xEditView.get(),
+                       ScResId(STR_ACC_EDITLINE_NAME),
+                       ScResId(STR_ACC_EDITLINE_DESCR));
+     }
++#endif
+ 
+     if (comphelper::LibreOfficeKit::isActive())
+         m_xEditView->RegisterViewShell(mpViewShell);
+@@ -2148,8 +2168,10 @@ void ScTextWnd::MakeDialogEditView()
+     if ( bIsRTL )
+         lcl_ModifyRTLVisArea( m_xEditView.get() );
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     if (!maAccTextDatas.empty())
+         maAccTextDatas.back()->StartEdit();
++#endif
+ }
+ 
+ void ScTextWnd::ImplInitSettings()
+@@ -2219,10 +2241,15 @@ void ScTextWnd::SetDrawingArea(weld::DrawingArea* pDrawingArea)
+ 
+ css::uno::Reference< css::accessibility::XAccessible > ScTextWnd::CreateAccessible()
+ {
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     pAcc = new ScAccessibleEditLineObject(this);
+     return pAcc;
++#else
++    return nullptr;
++#endif
+ }
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+ void ScTextWnd::InsertAccessibleTextData( ScAccessibleEditLineTextData& rTextData )
+ {
+     OSL_ENSURE( ::std::find( maAccTextDatas.begin(), maAccTextDatas.end(), &rTextData ) == maAccTextDatas.end(),
+@@ -2238,6 +2265,7 @@ void ScTextWnd::RemoveAccessibleTextData( ScAccessibleEditLineTextData& rTextDat
+     if( aIt != aEnd )
+         maAccTextDatas.erase( aIt );
+ }
++#endif
+ 
+ void ScTextWnd::StyleUpdated()
+ {
+diff --git a/sc/source/ui/dbgui/csvcontrol.cxx b/sc/source/ui/dbgui/csvcontrol.cxx
+index 409e898b46a3..8fef8dbdcc91 100644
+--- a/sc/source/ui/dbgui/csvcontrol.cxx
++++ b/sc/source/ui/dbgui/csvcontrol.cxx
+@@ -17,6 +17,8 @@
+  *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
+  */
+ 
++#include <config_wasm_strip.h>
++
+ #include <csvcontrol.hxx>
+ #include <vcl/keycodes.hxx>
+ #include <vcl/outdev.hxx>
+@@ -64,9 +66,11 @@ ScCsvControl::ScCsvControl(const ScCsvLayoutData& rData)
+ 
+ ScCsvControl::~ScCsvControl()
+ {
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     if( mxAccessible.is() )
+         mxAccessible->dispose();
+     mxAccessible = nullptr; // lp#1566050: prevent cyclic reference zombies
++#endif
+ }
+ 
+ // event handling -------------------------------------------------------------
+@@ -85,44 +89,58 @@ void ScCsvControl::LoseFocus()
+ 
+ void ScCsvControl::AccSendFocusEvent( bool bFocused )
+ {
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     if( mxAccessible.is() )
+         mxAccessible->SendFocusEvent( bFocused );
++#endif
+ }
+ 
+ void ScCsvControl::AccSendCaretEvent()
+ {
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     if( mxAccessible.is() )
+         mxAccessible->SendCaretEvent();
++#endif
+ }
+ 
+ void ScCsvControl::AccSendVisibleEvent()
+ {
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     if( mxAccessible.is() )
+         mxAccessible->SendVisibleEvent();
++#endif
+ }
+ 
+ void ScCsvControl::AccSendSelectionEvent()
+ {
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     if( mxAccessible.is() )
+         mxAccessible->SendSelectionEvent();
++#endif
+ }
+ 
+ void ScCsvControl::AccSendTableUpdateEvent( sal_uInt32 nFirstColumn, sal_uInt32 nLastColumn, bool bAllRows )
+ {
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     if( mxAccessible.is() )
+         mxAccessible->SendTableUpdateEvent( nFirstColumn, nLastColumn, bAllRows );
++#endif
+ }
+ 
+ void ScCsvControl::AccSendInsertColumnEvent( sal_uInt32 nFirstColumn, sal_uInt32 nLastColumn )
+ {
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     if( mxAccessible.is() )
+         mxAccessible->SendInsertColumnEvent( nFirstColumn, nLastColumn );
++#endif
+ }
+ 
+ void ScCsvControl::AccSendRemoveColumnEvent( sal_uInt32 nFirstColumn, sal_uInt32 nLastColumn )
+ {
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     if( mxAccessible.is() )
+         mxAccessible->SendRemoveColumnEvent( nFirstColumn, nLastColumn );
++#endif
+ }
+ 
+ // repaint helpers ------------------------------------------------------------
+diff --git a/sc/source/ui/dbgui/csvgrid.cxx b/sc/source/ui/dbgui/csvgrid.cxx
+index 7e7375a964fc..47ac79ca572f 100644
+--- a/sc/source/ui/dbgui/csvgrid.cxx
++++ b/sc/source/ui/dbgui/csvgrid.cxx
+@@ -17,6 +17,8 @@
+  *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
+  */
+ 
++#include <config_wasm_strip.h>
++
+ #include <comphelper/lok.hxx>
+ #include <csvgrid.hxx>
+ #include <csvtablebox.hxx>
+@@ -1408,9 +1410,13 @@ tools::Rectangle ScCsvGrid::GetFocusRect()
+ 
+ css::uno::Reference<css::accessibility::XAccessible> ScCsvGrid::CreateAccessible()
+ {
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     rtl::Reference<ScAccessibleCsvGrid> xRef(new ScAccessibleCsvGrid(*this));
+     mxAccessible = xRef;
+     return xRef;
++#else
++    return nullptr;
++#endif
+ }
+ 
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/sc/source/ui/dbgui/csvruler.cxx b/sc/source/ui/dbgui/csvruler.cxx
+index b8be5c88bd99..55774609226f 100644
+--- a/sc/source/ui/dbgui/csvruler.cxx
++++ b/sc/source/ui/dbgui/csvruler.cxx
+@@ -17,6 +17,8 @@
+  *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
+  */
+ 
++#include <config_wasm_strip.h>
++
+ #include <csvruler.hxx>
+ #include <AccessibleCsvControl.hxx>
+ 
+@@ -657,9 +659,13 @@ void ScCsvRuler::ImplSetMousePointer( sal_Int32 nPos )
+ 
+ css::uno::Reference<css::accessibility::XAccessible> ScCsvRuler::CreateAccessible()
+ {
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     rtl::Reference<ScAccessibleCsvRuler> xRef(new ScAccessibleCsvRuler(*this));
+     mxAccessible = xRef;
+     return xRef;
++#else
++    return nullptr;
++#endif
+ }
+ 
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/sc/source/ui/inc/csvcontrol.hxx b/sc/source/ui/inc/csvcontrol.hxx
+index fd9201812316..b97d6a3ad5a8 100644
+--- a/sc/source/ui/inc/csvcontrol.hxx
++++ b/sc/source/ui/inc/csvcontrol.hxx
+@@ -19,6 +19,8 @@
+ 
+ #pragma once
+ 
++#include <config_wasm_strip.h>
++
+ #include <scdllapi.h>
+ #include <address.hxx>
+ #include "csvsplits.hxx"
+@@ -227,7 +229,9 @@ private:
+     bool                        mbValidGfx;         /// Content of virtual devices valid?
+ 
+ protected:
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     rtl::Reference<ScAccessibleCsvControl> mxAccessible; /// Reference to the accessible implementation object.
++#endif
+ 
+ public:
+     explicit                    ScCsvControl(const ScCsvLayoutData& rData);
+@@ -253,7 +257,9 @@ public:
+     /** Sends a table model changed event for a removed column to the accessibility object. */
+     void                        AccSendRemoveColumnEvent( sal_uInt32 nFirstColumn, sal_uInt32 nLastColumn );
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     rtl::Reference<ScAccessibleCsvControl> GetAccessible() { return mxAccessible; }
++#endif
+ 
+     // repaint helpers --------------------------------------------------------
+ 
+diff --git a/sc/source/ui/inc/inputwin.hxx b/sc/source/ui/inc/inputwin.hxx
+index 4f72230fad34..c32338b4422a 100644
+--- a/sc/source/ui/inc/inputwin.hxx
++++ b/sc/source/ui/inc/inputwin.hxx
+@@ -19,6 +19,8 @@
+ 
+ #pragma once
+ 
++#include <config_wasm_strip.h>
++
+ #include <set>
+ #include <vector>
+ #include <memory>
+@@ -43,8 +45,10 @@ class ScTabViewShell;
+ class ScTextWndBase
+ {
+ public:
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     virtual void            InsertAccessibleTextData( ScAccessibleEditLineTextData& rTextData ) = 0;
+     virtual void            RemoveAccessibleTextData( ScAccessibleEditLineTextData& rTextData ) = 0;
++#endif
+     virtual void            SetTextString( const OUString& rString, bool bKitUpdate ) = 0;
+     virtual const OUString& GetTextString() const = 0;
+     virtual void            StartEditEngine() = 0;
+@@ -93,8 +97,10 @@ public:
+ 
+     virtual css::uno::Reference< css::accessibility::XAccessible > CreateAccessible() override;
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     virtual void            InsertAccessibleTextData( ScAccessibleEditLineTextData& rTextData ) override;
+     virtual void            RemoveAccessibleTextData( ScAccessibleEditLineTextData& rTextData ) override;
++#endif
+ 
+     virtual void            Resize() override;
+ 
+@@ -136,13 +142,17 @@ private:
+ 
+     rtl::Reference<svt::OStringTransferable> m_xHelper;
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     typedef ::std::vector< ScAccessibleEditLineTextData* > AccTextDataVector;
+ 
+     rtl::Reference<ScAccessibleEditObject> pAcc;
++#endif
+ 
+     OUString    aString;
+     vcl::Font   aTextFont;
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     AccTextDataVector maAccTextDatas;   // #i105267# text data may be cloned, remember all copies
++#endif
+     bool        bIsRTL;
+     bool        bIsInsertMode;
+     bool        bFormulaMode;
+@@ -204,7 +214,9 @@ public:
+     ScTextWndGroup(ScInputBarGroup& pParent, ScTabViewShell* pViewSh);
+     virtual ~ScTextWndGroup() override;
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     virtual void            InsertAccessibleTextData(ScAccessibleEditLineTextData& rTextData) override;
++#endif
+     virtual EditView*       GetEditView() const override;
+     const OutputDevice&     GetEditViewDevice() const;
+     Point                   GetCursorScreenPixelPos(bool bBelowLine);
+@@ -217,7 +229,9 @@ public:
+     virtual bool            HasEditView() const override;
+     virtual bool            IsInputActive() override;
+     virtual void            MakeDialogEditView() override;
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     virtual void            RemoveAccessibleTextData(ScAccessibleEditLineTextData& rTextData) override;
++#endif
+     void                    SetScrollPolicy();
+     void                    SetNumLines(tools::Long nLines);
+     virtual void            SetFormulaMode(bool bSet) override;
+@@ -244,8 +258,10 @@ public:
+                             ScInputBarGroup(vcl::Window* Parent, ScTabViewShell* pViewSh);
+     virtual                 ~ScInputBarGroup() override;
+     virtual void            dispose() override;
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     virtual void            InsertAccessibleTextData(ScAccessibleEditLineTextData& rTextData) override;
+     virtual void            RemoveAccessibleTextData(ScAccessibleEditLineTextData& rTextData) override;
++#endif
+     void                    SetTextString(const OUString& rString, bool bKitUpdate) override;
+     void                    StartEditEngine() override;
+     virtual EditView*       GetEditView() const override;
+diff --git a/sc/source/ui/inc/tphfedit.hxx b/sc/source/ui/inc/tphfedit.hxx
+index 4685d0c3c8b1..1f771a3b641d 100644
+--- a/sc/source/ui/inc/tphfedit.hxx
++++ b/sc/source/ui/inc/tphfedit.hxx
+@@ -19,6 +19,8 @@
+ 
+ #pragma once
+ 
++#include <config_wasm_strip.h>
++
+ #include <scdllapi.h>
+ #include <editutil.hxx>
+ #include <svx/weldeditview.hxx>
+@@ -73,7 +75,9 @@ private:
+     bool mbRTL;
+     weld::Window* mpDialog;
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     unotools::WeakReference<ScAccessibleEditObject> mxAcc;
++#endif
+ 
+     Link<ScEditWindow&,void> aObjectSelectLink;
+     std::function<void (ScEditWindow&)> m_GetFocusLink;
+diff --git a/sc/source/ui/pagedlg/tphfedit.cxx b/sc/source/ui/pagedlg/tphfedit.cxx
+index 5a98e65dd3fd..68b407924e29 100644
+--- a/sc/source/ui/pagedlg/tphfedit.cxx
++++ b/sc/source/ui/pagedlg/tphfedit.cxx
+@@ -17,6 +17,8 @@
+  *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
+  */
+ 
++#include <config_wasm_strip.h>
++
+ #include <scitems.hxx>
+ #include <editeng/eeitem.hxx>
+ 
+@@ -92,6 +94,7 @@ void ScEditWindow::SetDrawingArea(weld::DrawingArea* pDrawingArea)
+     rDevice.SetBackground(aBgColor);
+     m_xEditView->SetBackgroundColor(aBgColor);
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     if (auto tmpAcc = mxAcc.get())
+     {
+         OUString sName;
+@@ -111,6 +114,7 @@ void ScEditWindow::SetDrawingArea(weld::DrawingArea* pDrawingArea)
+         tmpAcc->InitAcc(nullptr, m_xEditView.get(),
+                       sName, pDrawingArea->get_tooltip_text());
+     }
++#endif
+ 
+     SetCursor(m_xEditView->GetCursor());
+ }
+@@ -118,8 +122,10 @@ void ScEditWindow::SetDrawingArea(weld::DrawingArea* pDrawingArea)
+ ScEditWindow::~ScEditWindow()
+ {
+     // delete Accessible object before deleting EditEngine and EditView
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     if (auto tmp = mxAcc.get())
+         tmp->dispose();
++#endif
+ }
+ 
+ void ScEditWindow::SetNumType(SvxNumType eNumType)
+@@ -222,18 +228,22 @@ void ScEditWindow::GetFocus()
+     assert(m_GetFocusLink);
+     m_GetFocusLink(*this);
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     if (auto tmp = mxAcc.get())
+         tmp->GotFocus();
++#endif
+ 
+     WeldEditView::GetFocus();
+ }
+ 
+ void ScEditWindow::LoseFocus()
+ {
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     if (auto xTemp = mxAcc.get())
+         xTemp->LostFocus();
+     else
+         mxAcc = nullptr;
++#endif
+     WeldEditView::LoseFocus();
+ }
+ 
+@@ -251,9 +261,13 @@ bool ScEditWindow::MouseButtonDown(const MouseEvent& rMEvt)
+ 
+ css::uno::Reference< css::accessibility::XAccessible > ScEditWindow::CreateAccessible()
+ {
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     rtl::Reference<ScAccessibleEditControlObject> tmp = new ScAccessibleEditControlObject(this, ScAccessibleEditObject::EditControl);
+     mxAcc = tmp.get();
+     return tmp;
++#else
++    return nullptr;
++#endif
+ }
+ 
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/sc/source/ui/unoobj/editsrc.cxx b/sc/source/ui/unoobj/editsrc.cxx
+index 5bedf4ece637..602aaad884fb 100644
+--- a/sc/source/ui/unoobj/editsrc.cxx
++++ b/sc/source/ui/unoobj/editsrc.cxx
+@@ -20,10 +20,17 @@
+ #include <memory>
+ #include <sal/config.h>
+ 
++#include <config_wasm_strip.h>
++
+ #include <utility>
+ 
+ #include <editsrc.hxx>
+ 
++// SfxItemPool's complete type is needed by the rtl::Reference<SfxItemPool> at
++// ~line 148 (EditEngine::CreatePool()). It used to arrive TRANSITIVELY through
++// AccessibleText.hxx, which is now conditional -- so include it explicitly
++// rather than depend on an accessibility header to supply an unrelated type.
++#include <svl/itempool.hxx>
+ #include <editeng/unofored.hxx>
+ #include <vcl/svapp.hxx>
+ #include <svx/svdocapt.hxx>
+@@ -35,7 +42,9 @@
+ #include <docsh.hxx>
+ #include <hints.hxx>
+ #include <postit.hxx>
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+ #include <AccessibleText.hxx>
++#endif
+ 
+ ScHeaderFooterEditSource::ScHeaderFooterEditSource(ScHeaderFooterTextData& rData) :
+     mrTextData(rData) {}
+@@ -229,6 +238,8 @@ void ScSimpleEditSource::UpdateData()
+     //  nothing
+ }
+ 
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
++
+ ScAccessibilityEditSource::ScAccessibilityEditSource( ::std::unique_ptr < ScAccessibleTextData > && pAccessibleCellTextData )
+     : mpAccessibleTextData(std::move(pAccessibleCellTextData))
+ {
+@@ -268,4 +279,6 @@ SfxBroadcaster& ScAccessibilityEditSource::GetBroadcaster() const
+     return mpAccessibleTextData->GetBroadcaster();
+ }
+ 
++#endif // !ENABLE_WASM_STRIP_ACCESSIBILITY
++
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/sc/source/ui/view/gridwin5.cxx b/sc/source/ui/view/gridwin5.cxx
+index 4d028ea91e22..97e1b952b387 100644
+--- a/sc/source/ui/view/gridwin5.cxx
++++ b/sc/source/ui/view/gridwin5.cxx
+@@ -17,6 +17,8 @@
+  *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
+  */
+ 
++#include <config_wasm_strip.h>
++
+ #include <editeng/flditem.hxx>
+ 
+ #include <svx/fmpage.hxx>
+@@ -374,6 +376,7 @@ void ScGridWindow::HideNoteOverlay()
+ css::uno::Reference< css::accessibility::XAccessible >
+     ScGridWindow::CreateAccessible()
+ {
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     css::uno::Reference< css::accessibility::XAccessible > xAcc= GetAccessible(false);
+     if (xAcc.is())
+     {
+@@ -391,6 +394,9 @@ css::uno::Reference< css::accessibility::XAccessible >
+     pAccessibleDocument->Init();
+ 
+     return xAcc;
++#else
++    return nullptr;
++#endif
+ }
+ 
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/sc/source/ui/view/preview.cxx b/sc/source/ui/view/preview.cxx
+index 4b351c34a6f6..31938648b8de 100644
+--- a/sc/source/ui/view/preview.cxx
++++ b/sc/source/ui/view/preview.cxx
+@@ -17,6 +17,8 @@
+  *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
+  */
+ 
++#include <config_wasm_strip.h>
++
+ #include <scitems.hxx>
+ #include <editeng/eeitem.hxx>
+ 
+@@ -1517,6 +1519,7 @@ void ScPreview::LoseFocus()
+ 
+ css::uno::Reference<css::accessibility::XAccessible> ScPreview::CreateAccessible()
+ {
++#if !ENABLE_WASM_STRIP_ACCESSIBILITY
+     css::uno::Reference<css::accessibility::XAccessible> xAcc= GetAccessible(false);
+     if (xAcc.is())
+     {
+@@ -1530,6 +1533,9 @@ css::uno::Reference<css::accessibility::XAccessible> ScPreview::CreateAccessible
+     SetAccessible(xAcc);
+     pAccessible->Init();
+     return xAcc;
++#else
++    return nullptr;
++#endif
+ }
+ 
+ void ScPreview::DragMove( tools::Long nDragMovePos, PointerStyle nFlags )
