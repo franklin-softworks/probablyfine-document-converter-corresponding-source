@@ -1,0 +1,232 @@
+From: Claude <claude@anthropic.com>
+Date: Tue, 28 Jul 2026 15:02:00 +0000
+Subject: [PATCH] Stop linking the extension manager into WASM
+
+WHY IS THE EXTENSION MANAGER STILL LINKED, DESPITE --disable-extensions?
+
+Because --disable-extensions never removed anything. It sets exactly two things
+(configure.ac:3452-3458): the C++ macro HAVE_FEATURE_EXTENSIONS, and
+enable_extension_integration/update=no. There is no DISABLE_EXTENSIONS make
+variable anywhere in the tree -- `grep -rn DISABLE_EXTENSIONS --include=*.mk .`
+returns nothing -- and desktop/Module_desktop.mk:15-17 adds Library_deployment,
+Library_deploymentgui and Library_deploymentmisc unconditionally. So the flag
+only stubs a handful of #if blocks INSIDE libraries that are still compiled,
+still registered, and still linked in full. dp_gui::UpdateInstallDialog::Thread::
+downloadExtensions() is present in the shipped binary today.
+
+What actually pulls them in is solenv/gbuild/static.mk:66-67:
+
+    $(foreach lib,$(gb_Library_KNOWNLIBS),$(if $(call gb_Library__get_component,$(lib)), \
+        $(eval $(call gb_Library_use_libraries,components,$(lib)))))
+
+Every library that declares a .component file is force-linked into the static
+`components` library, which desktop/Executable_soffice_bin.mk links with
+-Wl,--whole-archive; and solenv/bin/native-code.py emits a static map naming
+each constructor by symbol (component_maps.cxx:152-161), so --gc-sections can
+never drop them. The decision is "does this library have a .component file",
+not "is this feature enabled". Confirmed empirically: all ten
+com_sun_star_comp_deployment_* constructors resolve to libdeployment.a, and
+libdeployment.a / libdeploymentgui.a appear on the soffice_bin link line
+(workdir/Dep/LinkTarget/Executable/soffice.js.d.libraries) while nothing in the
+tree references them via gb_Library_use_libraries.
+
+THE CUT
+
+Drop the .component registration for `deployment` and `deploymentgui` on
+EMSCRIPTEN. That removes them from gb_ComponentTarget__ALLCOMPONENTS, so the ten
+constructors leave services_constructors.list and component_maps.cxx
+automatically (native-code.py needs no edit -- static/CustomTarget_components.mk:23
+drives it with `-c` from the generated list), and it makes
+gb_Library__get_component empty so static.mk:66-67 stops adding them to
+`components`.
+
+Library_deploymentmisc is NOT touched. It is a real link dependency of
+sofficeapp (desktop/Library_sofficeapp.mk:66) and not because of extensions:
+DpResId (desktop/source/deployment/misc/dp_misc.cxx:560, declared in
+desktop/inc/dp_shared.hxx:25) is what produces every bootstrap error string in
+desktop/source/app/app.cxx (~20 unguarded call sites at :374, :710-750,
+:877-935, :1091, :2196), appinit.cxx:356 and lockfile2.cxx:41. Making it
+droppable would mean moving DpResId and the dkt .mo plumbing into sofficeapp for
+464 KB of archive -- not worth the surgery. Note also that deploymentmisc
+declares no UNO service at all (no gb_Library_set_componentfile in
+Library_deploymentmisc.mk), so it is not part of this mechanism.
+
+WHY IT IS SAFE
+
+Import/export never consults the deployment registry:
+
+  - filter/source/config/cache/ reads only configmgr TypeDetection nodes; it has
+    zero references to deployment/ExtensionManager/PackageInformationProvider.
+    (The many "Extension" hits there are FILE-extension matching.)
+  - configmgr does parse bundledext/sharedext/userext layers
+    (configmgr/source/components.cxx:540-560, named in instdir/program/
+    fundamentalrc:6), but that is plain file I/O of configmgr.ini files that a
+    deployment run would have written. With a read-only install and no
+    extensions those files do not exist and the layers are silently empty.
+    configmgr has no link or UNO dependency on deployment.
+  - desktop/source/app/app.cxx:185, :462, :1528 are all inside
+    #if HAVE_FEATURE_EXTENSIONS -- dead here.
+  - desktop/source/lib/init.cxx:8506 is inside #if HAVE_FEATURE_ANDROID_LOK.
+  - basic/source/uno/namecont.cxx:1175 is dead twice over
+    (HAVE_FEATURE_EXTENSIONS and HAVE_FEATURE_SCRIPTING are both 0).
+  - linguistic/source/lngsvcmgr.cxx:424 and
+    svx/source/smarttags/SmartTagMgr.cxx:446 both already catch the
+    DeploymentException ("no extension manager - should fire on mobile only").
+  - xmlhelp and extensions/source/update are not built (HAVE_FEATURE_XMLHELP=0,
+    ENABLE_EXTENSION_UPDATE=0).
+
+There is no undefined-symbol risk: every consumer reaches these through
+ExtensionManager::get(xContext), a generated header that calls
+createInstanceWithContext by service name. Dropping the registration turns those
+into a thrown css::uno::DeploymentException, not a link error and not a crash.
+
+THE TWO LATENT THROW SITES, AND WHY ONLY ONE IS PATCHED
+
+1. comphelper/source/misc/backupfilehelper.cxx:388 acquires the extension
+   manager OUTSIDE the try{} that catches DeploymentException on the very next
+   line. It is reached from Desktop::doShutdown() (app.cxx:1754) via
+   tryPushExtensionInfo(), which is gated on SecureUserConfig /
+   SecureUserConfigExtensions -- both `true` in instdir/program/sofficerc:15-19.
+   This is INERT on the WASM path today, because doShutdown() returns
+   EXIT_SUCCESS immediately when pExecGlobals is null (app.cxx:1692) and
+   pExecGlobals is only set by Desktop::Main(), which LOK never runs (see the
+   "shortcutting the invocation in Desktop::Main" comment at
+   desktop/source/lib/init.cxx:8596). It is patched anyway: it is a real bug --
+   the handler for "no extension manager" is right there and cannot be reached
+   -- and the fix is three lines of defence-in-depth.
+
+2. desktop/source/lib/init.cxx:7962 SynchronizeExtensionRepositories(true) in
+   preloadData() is NOT guarded by HAVE_FEATURE_EXTENSIONS, and
+   check_ext_deps.cxx:403-423 does not catch DeploymentException. It is NOT
+   patched because it is unreachable: preloadData() is called only from the
+   `eStage == PRE_INIT` branch (init.cxx:8548), and this project's bridge calls
+   lok_cpp_init -> libreofficekit_hook_2, which constructs gImpl before calling
+   lo_initialize, so eStage is never PRE_INIT. If this project ever adopts
+   lok_preinit, guard those two lines first.
+
+MEASURED SAVING
+
+Retained code attributed to libdeployment.a + libdeploymentgui.a +
+libdeploymentmisclo.a in the linked pre-wasm-opt soffice.wasm, by intersecting
+the binary's name section against each archive's WASM_SYMBOL_TABLE and counting
+only symbols defined in no other archive:
+
+    816 functions, 406,327 bytes exclusive (396.8 KiB)
+    + 1,383 functions / 192,077 B shared with other archives (excluded)
+    largest: dp_registry::backend::bundle::...::checkPrerequisites  9,736 B
+             dp_registry::backend::component::...::processPackage_  9,653 B
+             dp_misc::Dependencies::check                           7,463 B
+             dp_gui::ExtensionCmdQueue::Thread::execute             7,434 B
+             dp_manager::ExtensionManager::addExtension             7,112 B
+    plus up to 101 KiB of archive data segments (ESTIMATE of what is retained).
+
+Split per archive (deploymentmisc stays, so it is not part of the saving):
+
+    libdeployment.a        506 funcs  261,349 B  255.2 KiB
+    libdeploymentgui.a     242 funcs  116,208 B  113.5 KiB
+    libdeploymentmisclo.a   68 funcs   28,770 B   28.1 KiB  (KEPT)
+
+Realised saving = deployment + deploymentgui = 377,557 B (368.7 KiB) raw,
+~74.5 KiB brotli, using the module's own raw->wire factor of 0.202
+(117,190,355 B linked -> 95,893,393 B after wasm-opt -> 23,700,411 B brotli).
+The original brief estimated 106 KiB.
+
+OPTIONAL FOLLOW-UP (not in this patch)
+
+ucb/Library_ucpext.mk registers com.sun.star.ucb.ExtensionContentProvider, which
+calls PackageInformationProvider::get() (ucb/source/ucp/ext/ucpext_content.cxx:429).
+It only fires for vnd.sun.star.extension:// URLs, which appear nowhere in core
+config or in any document format, so it is harmless -- but dropping ucpext too
+would make such a URL fail cleanly instead of throwing.
+
+RISK / TEST
+
+Lower risk than the cui removal: the consumers that exist already handle the
+"no extension manager" case explicitly, and the two unhandled sites are both
+proven unreachable. A regression would appear as a DeploymentException in the
+[Wasm stderr] log at shutdown or during a conversion.
+
+Test: full pipeline (`./pipeline/build_and_deploy.sh`), with particular
+attention to Phase 7's page-refresh and module-stress tests -- those exercise
+repeated lo_destroy/re-init, which is the only place a shutdown-path throw could
+surface. `node tests/test_page_refresh.js` is the targeted one.
+
+diff --git a/desktop/Library_deployment.mk b/desktop/Library_deployment.mk
+--- a/desktop/Library_deployment.mk
++++ b/desktop/Library_deployment.mk
+@@ -37,7 +37,30 @@
+     i18nlangtag \
+ ))
+ 
++# WASM: do NOT register the component file. See the long note in
++# cui/Library_cui.mk -- solenv/gbuild/static.mk:66-67 force-links every library
++# that has one into the static `components` library, and native-code.py names
++# its constructors in a static map, so nothing can be dead-stripped.
++#
++# --disable-extensions does NOT do this. It only sets HAVE_FEATURE_EXTENSIONS=0,
++# which stubs a handful of #if blocks INSIDE these still-compiled-and-linked
++# sources; there is no DISABLE_EXTENSIONS make variable anywhere in the tree and
++# Library_deployment is in Module_desktop.mk unconditionally.
++#
++# All ten com_sun_star_comp_deployment_* constructors live here. A converter
++# with a read-only install and zero installed extensions never needs any of
++# them: configmgr's bundledext/sharedext/userext layers are plain file reads of
++# configmgr.ini files that do not exist, filter/source/config/cache/ never
++# consults the deployment registry, and every remaining consumer either catches
++# DeploymentException (linguistic/source/lngsvcmgr.cxx:424,
++# svx/source/smarttags/SmartTagMgr.cxx:446) or is compiled out.
++#
++# Library_deploymentmisc is deliberately NOT touched: sofficeapp hard-links it
++# for DpResId (desktop/source/deployment/misc/dp_misc.cxx:560), which every
++# bootstrap error string in desktop/source/app/app.cxx uses.
++ifneq ($(OS),EMSCRIPTEN)
+ $(eval $(call gb_Library_set_componentfile,deployment,desktop/source/deployment/deployment,services))
++endif
+ 
+ $(eval $(call gb_Library_add_exception_objects,deployment,\
+     desktop/source/deployment/dp_log \
+diff --git a/desktop/Library_deploymentgui.mk b/desktop/Library_deploymentgui.mk
+--- a/desktop/Library_deploymentgui.mk
++++ b/desktop/Library_deploymentgui.mk
+@@ -54,7 +54,16 @@
+ endif
+ 
+ 
++# WASM: do NOT register the component file -- same mechanism as
++# desktop/Library_deployment.mk. The three services here (LicenseDialog,
++# PackageManagerDialog, UpdateRequiredDialog) all require a real VCL window and
++# a user, which a headless converter has neither of. Their only in-tree callers
++# are desktop/source/app/check_ext_deps.cxx:140/:223, reached only when an
++# INSTALLED extension has unsatisfied dependencies, and
++# cui/source/factory/dlgfact.cxx:1553, which is #if HAVE_FEATURE_EXTENSIONS-dead.
++ifneq ($(OS),EMSCRIPTEN)
+ $(eval $(call gb_Library_set_componentfile,deploymentgui,desktop/source/deployment/gui/deploymentgui,services))
++endif
+ 
+ $(eval $(call gb_Library_add_exception_objects,deploymentgui,\
+     desktop/source/deployment/gui/dp_gui_dependencydialog \
+diff --git a/comphelper/source/misc/backupfilehelper.cxx b/comphelper/source/misc/backupfilehelper.cxx
+--- a/comphelper/source/misc/backupfilehelper.cxx
++++ b/comphelper/source/misc/backupfilehelper.cxx
+@@ -385,10 +385,20 @@
+             // create content from current extension configuration
+             uno::Sequence< uno::Sequence< uno::Reference< deployment::XPackage > > > xAllPackages;
+             const uno::Reference< uno::XComponentContext >& xContext = ::comphelper::getProcessComponentContext();
+-            uno::Reference< deployment::XExtensionManager > m_xExtensionManager = deployment::ExtensionManager::get(xContext);
+ 
+             try
+             {
++                // Acquiring the service must be inside the try: if the extension
++                // manager is not registered at all (a build without the
++                // deployment component -- e.g. WASM, see
++                // desktop/Library_deployment.mk) then ExtensionManager::get()
++                // throws DeploymentException, and this function is called from
++                // Desktop::doShutdown() via tryPushExtensionInfo() with nothing
++                // above it to catch. "No extension manager" means "no extension
++                // info to back up", which is exactly the existing
++                // DeploymentException handler below.
++                uno::Reference< deployment::XExtensionManager > m_xExtensionManager = deployment::ExtensionManager::get(xContext);
++
+                 xAllPackages = m_xExtensionManager->getAllExtensions(uno::Reference< task::XAbortChannel >(),
+                     uno::Reference< ucb::XCommandEnvironment >());
+             }
