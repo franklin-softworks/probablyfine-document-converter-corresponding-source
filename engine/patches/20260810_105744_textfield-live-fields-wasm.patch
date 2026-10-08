@@ -1,0 +1,366 @@
+diff --git a/oox/inc/drawingml/textfield.hxx b/oox/inc/drawingml/textfield.hxx
+index e4e1d50..2dd99e8 100644
+--- a/oox/inc/drawingml/textfield.hxx
++++ b/oox/inc/drawingml/textfield.hxx
+@@ -23,6 +23,12 @@
+ #include <drawingml/textrun.hxx>
+ #include <drawingml/textparagraphproperties.hxx>
+ 
++#ifdef __EMSCRIPTEN__
++#include <vector>
++#include <com/sun/star/text/XTextField.hpp>
++#include <com/sun/star/frame/XModel.hpp>
++#endif
++
+ enum class SvxTimeFormat;
+ enum class SvxDateFormat;
+ 
+@@ -49,6 +55,32 @@ public:
+                         const TextCharacterProperties& rTextCharacterStyle,
+                         float nDefaultCharHeight) const override;
+ 
++#ifdef __EMSCRIPTEN__
++    /** WASM: creates the live UNO field object(s) for this <a:fld>'s type
++     *  (datetime*, slidenum, slidecount, slidename, file*, author) WITHOUT
++     *  inserting or formatting them.
++     *
++     *  This exists so the WASM insert-then-format loop in shape.cxx
++     *  (shape-insert-then-format-wasm.patch) can create a real, live field
++     *  instead of pushing this run's cached getText() as a literal string.
++     *  That loop walks TextRunVector through the base TextRun pointer and
++     *  never calls the virtual insertAt() override above, so a TextField's
++     *  authoring-time text (e.g. a datetime field cached as "1/22/16") went
++     *  in as plain characters and never recomputed.
++     *
++     *  Delegates to the SAME private field-type-to-UNO-service mapping
++     *  insertAt() itself calls (lclCreateTextFields in textfield.cxx), so
++     *  the WASM path cannot silently diverge from native behaviour for
++     *  which field types exist or how they are configured (e.g. a datetime
++     *  field's IsFixed=false, which is what makes it live rather than
++     *  static). Returns an empty vector if the type maps to nothing, which
++     *  the caller must treat as "insert the cached text instead" -- the
++     *  same fallback insertAt()'s own else-branch takes.
++     */
++    std::vector<css::uno::Reference<css::text::XTextField>> createFieldsWasm(
++        const css::uno::Reference<css::frame::XModel>& xModel) const;
++#endif
++
+     /** Gets the corresponding LO Date format for given OOXML datetime field type
+      *
+      * @param rDateTimeType PPTX datetime field type e.g. datetime3
+diff --git a/oox/source/drawingml/shape.cxx b/oox/source/drawingml/shape.cxx
+index 15f9b7e..02d6a65 100644
+--- a/oox/source/drawingml/shape.cxx
++++ b/oox/source/drawingml/shape.cxx
+@@ -22,6 +22,7 @@
+ #ifdef __EMSCRIPTEN__
+ #include <iostream>
+ #include <drawingml/textrun.hxx>
++#include <drawingml/textfield.hxx>
+ #include <com/sun/star/awt/CharSet.hpp>
+ #include <com/sun/star/text/XTextCursor.hpp>
+ #include <com/sun/star/text/ControlCharacter.hpp>
+@@ -2173,9 +2174,20 @@ Reference< XShape > const & Shape::createAndInsert(
+                 {
+                     const TextParagraphVector& rParagraphs = getTextBody()->getParagraphs();
+ 
+-                    // Which runs went in as a com.sun.star.text.TextField.URL
+-                    // rather than as characters, recorded by the insertion pass
+-                    // and read by the formatting pass.
++                    // Which runs went in as a live UNO field -- either a
++                    // com.sun.star.text.TextField.URL (hyperlink) or one of
++                    // TextField's own field types (datetime*, slidenum,
++                    // slidecount, slidename, file*, author) -- rather than as
++                    // characters, recorded by the insertion pass and read by
++                    // the formatting pass.
++                    //
++                    // Kept as a KIND rather than a bool: the two field kinds
++                    // are formatted differently in step 2 below (a hyperlink
++                    // gets a forced colour/underline; a TextField does not,
++                    // matching upstream's TextField::insertAt, which is a
++                    // full override of TextRun::insertAt and never runs the
++                    // hyperlink branch at all), so collapsing them into one
++                    // bool would lose which formatting a given position needs.
+                     //
+                     // The two passes MUST agree, and a shared predicate would not
+                     // be enough to make them: a field occupies exactly ONE text
+@@ -2188,7 +2200,8 @@ Reference< XShape > const & Shape::createAndInsert(
+                     // and just as invisible. This also records the FALLBACK below,
+                     // which no predicate could: whether the field could actually
+                     // be created is not a property of the run.
+-                    std::vector<std::vector<bool>> aRunIsField(rParagraphs.size());
++                    enum class RunFieldKind { None, Hyperlink, TextField };
++                    std::vector<std::vector<RunFieldKind>> aRunFieldKind(rParagraphs.size());
+ 
+                     // Build the URL field for one run, mirroring
+                     // TextRun::insertAt (textrun.cxx:148-158).
+@@ -2246,6 +2259,93 @@ Reference< XShape > const & Shape::createAndInsert(
+                         }
+                     };
+ 
++                    // Build the live UNO field(s) for a <a:fld> run
++                    // (BUG-26 item 5), mirroring TextField::insertAt
++                    // (textfield.cxx:153-200 + lclCreateTextFields:59-149).
++                    //
++                    // This loop walks TextRunVector through the base
++                    // TextRunPtr and calls only TextRun members (getText(),
++                    // isLineBreak(), getTextCharacterProperties()) -- never
++                    // insertAt() -- so the virtual dispatch that would have
++                    // reached TextField::insertAt's override never happens,
++                    // and a <a:fld> run's cached <a:t> (the value PowerPoint
++                    // had at authoring time -- sat15.pptx's datetime1 caches
++                    // "1/22/16") went in as a literal string that can never
++                    // change again. dynamic_cast recovers which runs are
++                    // actually TextField objects so this loop can special-case
++                    // them, the same way it already special-cases hyperlink
++                    // runs above rather than calling TextRun::insertAt.
++                    //
++                    // Reuses TextField::createFieldsWasm(), which calls the
++                    // SAME private lclCreateTextFields() insertAt() itself
++                    // calls -- one mapping from <a:fld type="..."> to UNO
++                    // field service, so the WASM path cannot silently diverge
++                    // from native LibreOffice about which field types exist
++                    // or how they are configured (datetime's IsFixed=false is
++                    // what makes the value LIVE -- recomputed from the system
++                    // clock/slide position at render time -- rather than the
++                    // cached string; that flag is set inside
++                    // lclCreateTextFields and is not duplicated here).
++                    //
++                    // Restoring full virtual dispatch (calling run->insertAt()
++                    // for every run) was considered and rejected: insertAt()
++                    // interleaves insertion with the FULL TextCharacterProperties
++                    // ::pushToPropSet() (not the WASM safe-push variant), and
++                    // for a plain TextRun would re-enter exactly the mixed
++                    // insert+format sequence shape-insert-then-format-wasm.patch
++                    // exists to avoid -- the architecture this whole patch
++                    // established (insert everything in one pass with
++                    // insertString/insertControlCharacter/insertTextContent,
++                    // format it in a second pass with pushToPropSetWasm) would
++                    // apply to every OTHER run type but this one. Special-casing
++                    // TextField, exactly as the hyperlink field beside it is
++                    // special-cased, keeps one insertion strategy for the whole
++                    // loop and reuses the one-position bookkeeping that already
++                    // exists for hyperlink fields.
++                    //
++                    // Returns false if msType maps to nothing (unrecognised
++                    // field type) or the field could not be created, and the
++                    // caller then inserts run->getText() exactly as before --
++                    // the same fallback insertAt()'s own else-branch takes.
++                    auto insertTextField
++                        = [&](const TextRunPtr& rRun,
++                              const Reference<text::XTextCursor>& xInsertAt) -> bool
++                    {
++                        const TextField* pField = dynamic_cast<const TextField*>(rRun.get());
++                        if (!pField)
++                            return false;
++                        try
++                        {
++                            std::vector<Reference<text::XTextField>> aFields
++                                = pField->createFieldsWasm(rFilterBase.getModel());
++                            if (aFields.empty())
++                                return false;
++
++                            // A datetime field can yield TWO field objects
++                            // (date and time), joined by a space -- exactly
++                            // as lclCreateTextFields's own caller does it in
++                            // insertAt() (textfield.cxx:187-197).
++                            bool bFirst = true;
++                            for (auto const& xField : aFields)
++                            {
++                                if (!xField.is())
++                                    continue;
++                                if (!bFirst)
++                                    xText->insertString(xInsertAt, u" "_ustr, false);
++                                bFirst = false;
++                                Reference<text::XTextContent> xContent(xField, UNO_QUERY);
++                                xText->insertTextContent(xInsertAt, xContent, false);
++                            }
++                            return true;
++                        }
++                        catch (const Exception&)
++                        {
++                            TOOLS_WARN_EXCEPTION("oox.drawingml",
++                                                 "WASM: text field not created");
++                            return false;
++                        }
++                    };
++
+                     // Step 1: insert the text.
+                     //
+                     // NOT via setString(). A <a:br/> is a TextRun carrying
+@@ -2289,24 +2389,46 @@ Reference< XShape > const & Shape::createAndInsert(
+                                 xInsert->gotoEnd(false);
+                             }
+                             const TextRunVector& rInsertRuns = rParagraphs[i]->getRuns();
+-                            aRunIsField[i].reserve(rInsertRuns.size());
++                            aRunFieldKind[i].reserve(rInsertRuns.size());
+                             for (auto const& run : rInsertRuns)
+                             {
+-                                // A line break wins over a hyperlink, where
+-                                // upstream's ordering has the field win and drop
+-                                // the break entirely. Deliberate: dropping a break
+-                                // is content loss, and item 1 of this bug is that
+-                                // exact loss. <a:br> carrying <a:hlinkClick> does
+-                                // not occur anywhere in the 27-fixture corpus, so
+-                                // this divergence is unexercised either way.
+-                                const bool bField
+-                                    = !run->isLineBreak()
+-                                      && !run->getTextCharacterProperties()
+-                                              .maHyperlinkPropertyMap.empty()
+-                                      && insertHyperlinkField(run, xInsert);
+-                                aRunIsField[i].push_back(bField);
+-
+-                                if (bField)
++                                // A line break wins over the hyperlink field,
++                                // where upstream's ordering has the field win
++                                // and drop the break entirely. Deliberate:
++                                // dropping a break is content loss, and item 1
++                                // of this bug is that exact loss. <a:br>
++                                // carrying <a:hlinkClick> does not occur
++                                // anywhere in the 27-fixture corpus, so this
++                                // divergence is unexercised. (isLineBreak()
++                                // and "is a TextField" cannot both be true for
++                                // the same run -- <a:br> and <a:fld> are
++                                // different elements and textbodycontext.cxx
++                                // never sets both on one TextRunPtr -- so
++                                // insertTextField() below is only ever tried
++                                // on a run that is not a line break.)
++                                //
++                                // TextField is checked BEFORE the hyperlink
++                                // map, matching upstream's virtual dispatch:
++                                // TextField::insertAt is a full override of
++                                // TextRun::insertAt and never looks at
++                                // maHyperlinkPropertyMap at all, so if a run
++                                // is somehow both (not observed in the corpus;
++                                // <a:fld> does not carry <a:hlinkClick> in the
++                                // schema), the field wins exclusively, exactly
++                                // as it would with real virtual dispatch.
++                                RunFieldKind eKind = RunFieldKind::None;
++                                if (!run->isLineBreak())
++                                {
++                                    if (insertTextField(run, xInsert))
++                                        eKind = RunFieldKind::TextField;
++                                    else if (!run->getTextCharacterProperties()
++                                                  .maHyperlinkPropertyMap.empty()
++                                             && insertHyperlinkField(run, xInsert))
++                                        eKind = RunFieldKind::Hyperlink;
++                                }
++                                aRunFieldKind[i].push_back(eKind);
++
++                                if (eKind != RunFieldKind::None)
+                                 {
+                                     xInsert->gotoEnd(false);
+                                 }
+@@ -2529,6 +2651,11 @@ Reference< XShape > const & Shape::createAndInsert(
+                                 {
+                                     const auto& run = rRuns[iRun];
+ 
++                                    const RunFieldKind eFieldKind
++                                        = (iRun < aRunFieldKind[iPara].size())
++                                              ? aRunFieldKind[iPara][iRun]
++                                              : RunFieldKind::None;
++
+                                     // A hyperlink run went in as a text field, which
+                                     // occupies ONE position no matter how long its
+                                     // anchor text is. Select that one position and
+@@ -2546,8 +2673,7 @@ Reference< XShape > const & Shape::createAndInsert(
+                                     // them (textrun.cxx:162-170): an explicit colour
+                                     // in the <a:hlinkClick> extLst, or an explicit
+                                     // u="..." on the run, is honoured instead.
+-                                    if (iRun < aRunIsField[iPara].size()
+-                                        && aRunIsField[iPara][iRun])
++                                    if (eFieldKind == RunFieldKind::Hyperlink)
+                                     {
+                                         xCursor->goRight(1, true);
+                                         TextCharacterProperties aLinkProps(
+@@ -2567,6 +2693,64 @@ Reference< XShape > const & Shape::createAndInsert(
+                                         continue;
+                                     }
+ 
++                                    // A <a:fld> run went in as a live UNO field
++                                    // (BUG-26 item 5), which -- like the
++                                    // hyperlink field above -- occupies ONE
++                                    // position regardless of how long its
++                                    // cached anchor text was. Select that one
++                                    // position and format it.
++                                    //
++                                    // Unlike the hyperlink branch above, NO
++                                    // colour/underline is forced: upstream's
++                                    // TextField::insertAt (textfield.cxx:153-
++                                    // 174) never touches maHyperlinkPropertyMap
++                                    // at all, so this branch does not either.
++                                    // Forcing hlink styling onto a date or
++                                    // slide-number field would be a NEW defect,
++                                    // not a fix.
++                                    //
++                                    // aEffectiveRunProps(iRun) folds in the
++                                    // field's own <a:rPr> (TextFieldContext
++                                    // routes it to the same base
++                                    // getTextCharacterProperties() a plain run
++                                    // uses) exactly as upstream's aTextCharacterProps
++                                    // does. NOT folded in: a <a:pPr> nested
++                                    // INSIDE the <a:fld> itself
++                                    // (maTextParagraphProperties, textfield.cxx
++                                    // :167, :170) -- upstream merges that too,
++                                    // this branch does not.
++                                    //
++                                    // Checked, not assumed: across all 27 pptx
++                                    // fixtures, 145 <a:fld> total (128
++                                    // slidenum, 17 datetime1), of which 75
++                                    // carry a nested <a:pPr> -- so this gap IS
++                                    // exercised by the corpus, unlike the
++                                    // hyperlink branch's unexercised edge
++                                    // cases noted above. But every one of the
++                                    // 75 is either bare `<a:pPr/>` (72) or
++                                    // only `defTabSz="685800"` (3, a default
++                                    // tab stop, not a bullet/alignment/spacing
++                                    // property) -- no <a:fld> in the corpus
++                                    // uses this element to override anything
++                                    // TextParagraphProperties::pushToPropSet
++                                    // would render differently. The gap is
++                                    // real and unfixed, not verified absent.
++                                    // The paragraph's OWN <a:pPr> -- the
++                                    // common case, and where actual overrides
++                                    // live -- is already applied by the
++                                    // per-paragraph pass above, which every
++                                    // run in the paragraph shares.
++                                    if (eFieldKind == RunFieldKind::TextField)
++                                    {
++                                        xCursor->goRight(1, true);
++                                        TextCharacterProperties aFieldProps(
++                                            aEffectiveRunProps(iRun));
++                                        PropertySet aFieldPropSet(xCursor);
++                                        aFieldProps.pushToPropSetWasm(aFieldPropSet, rFilterBase);
++                                        xCursor->collapseToEnd();
++                                        continue;
++                                    }
++
+                                     // A line break occupies exactly one position.
+                                     // SELECT that position and format it — do not
+                                     // step over it.
+diff --git a/oox/source/drawingml/textfield.cxx b/oox/source/drawingml/textfield.cxx
+index 1c96419..c91327d 100644
+--- a/oox/source/drawingml/textfield.cxx
++++ b/oox/source/drawingml/textfield.cxx
+@@ -150,6 +150,21 @@ void lclCreateTextFields( std::vector< Reference< XTextField > > & aFields,
+ 
+ } // namespace
+ 
++#ifdef __EMSCRIPTEN__
++std::vector<Reference<XTextField>> TextField::createFieldsWasm(
++        const Reference<XModel>& xModel) const
++{
++    // Same mapping insertAt() uses below (msType -> UNO field service), so
++    // the WASM path is created from the identical field object native
++    // LibreOffice would have created -- including datetime's IsFixed=false,
++    // which is what makes the value recompute at render time instead of
++    // staying at the string PowerPoint cached in <a:t> at authoring time.
++    std::vector<Reference<XTextField>> aFields;
++    lclCreateTextFields(aFields, xModel, msType);
++    return aFields;
++}
++#endif
++
+ sal_Int32 TextField::insertAt(
+         const ::oox::core::XmlFilterBase& rFilterBase,
+         const Reference < XText > & xText,
