@@ -1,0 +1,27 @@
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+@@ -154,7 +154,12 @@
+ static void writeBinaryBuffer( const OutputBuffer& rBuffer )
+ {
+     // ---sync point--- see SYNC STREAMS above
+-    fflush(stdout);
++    // The WASM build redirects printf to g_text_out (see the #define above), so
++    // flushing `stdout` here flushes an UNRELATED stream and the sync point does
++    // nothing. g_text_out defaults to stdout, so this is identical natively and
++    // correct in both. Half-ported redirect: the patch moved the writes and left
++    // the paired flushes behind.
++    fflush(g_text_out);
+ 
+     // put buffer to stderr
+     if( !rBuffer.empty() )
+@@ -591,7 +596,9 @@
+ #endif
+ 
+     // ---sync point--- see SYNC STREAMS above
+-    fflush(stdout);
++    // ---sync point--- see SYNC STREAMS above. Same correction as in
++    // writeBinaryBuffer: flush the stream printf actually writes to.
++    fflush(g_text_out);
+ 
+ #if POPPLER_CHECK_VERSION(22, 6, 0)
+     if( fwrite(pBuf->data(), sizeof(*pBuf->data()), nSize, g_binary_out) != static_cast<size_t>(nSize) )
