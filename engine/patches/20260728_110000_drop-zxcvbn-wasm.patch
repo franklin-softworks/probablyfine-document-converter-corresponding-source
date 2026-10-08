@@ -1,0 +1,75 @@
+diff --git a/svl/Library_svl.mk b/svl/Library_svl.mk
+index afb64aca110d..693a1fe56f9d 100644
+--- a/svl/Library_svl.mk
++++ b/svl/Library_svl.mk
+@@ -29,8 +29,20 @@ $(eval $(call gb_Library_use_externals,svl,\
+     icuuc \
+     mdds_headers \
+     libxml2 \
++))
++
++# WASM: zxcvbn's ~1.1 MB word list costs 785 KiB brotli in the data section --
++# 6.06% of the module's compressed data payload -- to drive a password-strength
++# meter that only interactive dialogs read. Those are dead under --disable-gui
++# and a converter never sets a password. See
++# svl/source/misc/PasswordHelper.cxx, which compiles the sole call out for
++# EMSCRIPTEN; dropping the link here makes the intent explicit rather than
++# relying on the linker to notice the archive member is unreferenced.
++ifneq ($(OS),EMSCRIPTEN)
++$(eval $(call gb_Library_use_externals,svl,\
+     zxcvbn-c \
+ ))
++endif
+ 
+ $(eval $(call gb_Library_set_componentfile,svl,svl/util/svl,services))
+ 
+diff --git a/svl/source/misc/PasswordHelper.cxx b/svl/source/misc/PasswordHelper.cxx
+index c98a26eff4af..bf6747d2455a 100644
+--- a/svl/source/misc/PasswordHelper.cxx
++++ b/svl/source/misc/PasswordHelper.cxx
+@@ -25,7 +25,10 @@
+ #include <unicode/regex.h>
+ #include <unicode/unistr.h>
+ #include <unicode/errorcode.h>
++#ifndef __EMSCRIPTEN__
++// WASM: not linked -- see GetPasswordStrengthPercentage below.
+ #include <zxcvbn.h>
++#endif
+ #include <sal/log.hxx>
+ 
+ using namespace com::sun::star;
+@@ -141,8 +144,34 @@ double SvPasswordHelper::GetPasswordStrengthPercentage(const char* pPassword)
+     // corresponds to a strong password:
+     // <http://web.archive.org/web/20231128131604/https://keepass.info/help/kb/pw_quality_est.html>
+     static constexpr double fMaxPassStrengthEntropyBits = 112.0;
++#ifdef __EMSCRIPTEN__
++    // WASM/headless: zxcvbn is not linked, so report 0% and cost nothing.
++    //
++    // This function exists solely to drive a password-strength METER in
++    // interactive dialogs. Every caller in the tree is one:
++    //   sfx2/source/dialog/passwd.cxx        (password dialog)
++    //   cui/source/dialogs/passwdomdlg.cxx   (password dialog)
++    //   uui/source/masterpasscrtdlg.cxx      (master password dialog)
++    //   sc/source/ui/miscdlgs/protectiondlg.cxx (Calc sheet protection)
++    // All are dead under --disable-gui, and a document CONVERTER never sets a
++    // password. Nothing reads this return value on the WASM path.
++    //
++    // Why it is worth a patch: zxcvbn ships a ~1.1 MB English word list that
++    // lands in the wasm DATA section, and it barely compresses -- 785 KiB
++    // survives brotli, 71% of raw, because a dictionary of distinct words has
++    // little redundancy. That is 6.06% of the module's entire compressed data
++    // payload, and the SECOND largest single item in it after ICU, spent on a
++    // progress bar that cannot be drawn.
++    //
++    // Returning 0.0 rather than 100.0 is deliberate: if this ever does become
++    // reachable, "weakest possible" fails safe, whereas a fake 100% would
++    // silently assert a strong password.
++    (void)pPassword;
++    return 0.0;
++#else
+     return std::min(100.0,
+                     ZxcvbnMatch(pPassword, nullptr, nullptr) * 100.0 / fMaxPassStrengthEntropyBits);
++#endif
+ }
+ 
+ double SvPasswordHelper::GetPasswordStrengthPercentage(const OUString& aPassword)
