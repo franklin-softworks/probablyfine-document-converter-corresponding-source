@@ -1,0 +1,34 @@
+diff --git a/unotools/source/config/moduleoptions.cxx b/unotools/source/config/moduleoptions.cxx
+index 5918b749e647..3881af7583ff 100644
+--- a/unotools/source/config/moduleoptions.cxx
++++ b/unotools/source/config/moduleoptions.cxx
+@@ -394,6 +394,29 @@ void SvtModuleOptions_Impl::ImplCommit()
+ *//*-*****************************************************************************************************/
+ bool SvtModuleOptions_Impl::IsModuleInstalled( SvtModuleOptions::EModule eModule ) const
+ {
++#ifdef __EMSCRIPTEN__
++    // WASM: Force all document modules to be considered "installed".
++    // In WASM builds, the configuration may not properly indicate which modules
++    // are available, but all linked modules are actually usable.
++    // This fixes factory URL resolution for modules like Impress/Draw/Calc.
++    switch( eModule )
++    {
++        case SvtModuleOptions::EModule::WRITER:
++        case SvtModuleOptions::EModule::WEB:
++        case SvtModuleOptions::EModule::GLOBAL:
++        case SvtModuleOptions::EModule::CALC:
++        case SvtModuleOptions::EModule::DRAW:
++        case SvtModuleOptions::EModule::IMPRESS:
++        case SvtModuleOptions::EModule::CHART:
++        case SvtModuleOptions::EModule::BASIC:
++            return true;
++        case SvtModuleOptions::EModule::MATH:
++        case SvtModuleOptions::EModule::STARTMODULE:
++        case SvtModuleOptions::EModule::DATABASE:
++            // These modules may not be linked in WASM, check configuration
++            break;
++    }
++#endif
+     switch( eModule )
+     {
+         case SvtModuleOptions::EModule::WRITER:

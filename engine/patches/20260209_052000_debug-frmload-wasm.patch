@@ -1,0 +1,96 @@
+diff --git a/sfx2/source/view/frmload.cxx b/sfx2/source/view/frmload.cxx
+index f100a94f463c..71040aa30af8 100644
+--- a/sfx2/source/view/frmload.cxx
++++ b/sfx2/source/view/frmload.cxx
+@@ -19,6 +19,12 @@
+ 
+ #include <config_collab.h>
+ 
++#ifdef __EMSCRIPTEN__
++#include <iostream>
++#include <sfx2/sfxbasecontroller.hxx>
++#include <unotools/fcm.hxx>
++#endif
++
+ #include <sfx2/app.hxx>
+ #include <sfx2/bindings.hxx>
+ #include <sfx2/docfac.hxx>
+@@ -771,7 +777,13 @@ sal_Bool SAL_CALL SfxFrameLoader_Impl::load( const Sequence< PropertyValue >& rA
+             }
+             else
+             {
++#ifdef __EMSCRIPTEN__
++                std::cerr << "[FRMLOAD] About to call xLoadable->load()..." << std::endl;
++#endif
+                 xLoadable->load( aDescriptor.getPropertyValues() );
++#ifdef __EMSCRIPTEN__
++                std::cerr << "[FRMLOAD] xLoadable->load() returned" << std::endl;
++#endif
+             }
+         }
+         else
+@@ -781,6 +793,9 @@ sal_Bool SAL_CALL SfxFrameLoader_Impl::load( const Sequence< PropertyValue >& rA
+             xModel->attachResource( xModel->getURL(), aDescriptor.getPropertyValues() );
+         }
+ 
++#ifdef __EMSCRIPTEN__
++        std::cerr << "[FRMLOAD] Getting SolarMutexGuard..." << std::endl;
++#endif
+         SolarMutexGuard aGuard;
+ 
+         // get the SfxObjectShell (still needed at the moment)
+@@ -788,6 +803,9 @@ sal_Bool SAL_CALL SfxFrameLoader_Impl::load( const Sequence< PropertyValue >& rA
+         // SfxObjectShellLock would be even dangerous here, since the lifetime control should be done outside in case of success
+         const SfxObjectShellRef xDoc = impl_findObjectShell( xModel );
+         ENSURE_OR_THROW( xDoc.is(), "no SfxObjectShell for the given model" );
++#ifdef __EMSCRIPTEN__
++        std::cerr << "[FRMLOAD] Got SfxObjectShell" << std::endl;
++#endif
+ 
+         if (pEmptyURLFilter)
+         {
+@@ -803,6 +821,33 @@ sal_Bool SAL_CALL SfxFrameLoader_Impl::load( const Sequence< PropertyValue >& rA
+             xDoc->FinishedLoading();
+         }
+ 
++#ifdef __EMSCRIPTEN__
++        // WASM: Writer documents get their real document view, exactly as in stock
++        // headless LibreOffice and desktop LibreOfficeKit. Calc and Impress/Draw keep
++        // the headless controller below.
++        //
++        // History: until 2026-10 every document type took the headless branch
++        // ("ScTabViewShell crashes", 2026-02-09). Without a view, Writer's PDF export
++        // never constructs SwEnhancedPDFExportHelper, so every Writer PDF had no
++        // hyperlinks, no bookmarks and no footnote links (FG-096, docs/fidelity-gaps/).
++        // Measured 2026-10-04 with a real view for ALL types: Writer passed every gate,
++        // while Calc (XLSX/ODS conversions time out, "memory access out of bounds") and
++        // Impress (embedded_font.pptx fails to convert) still cannot take one in WASM.
++        // Gate writer_pdf_links holds the Writer behaviour; test_frame_leak.js counts
++        // both log lines below.
++        if ( !xDoc->GetFactory().GetDocumentServiceName().startsWith( "com.sun.star.text." ) )
++        {
++            std::cerr << "[FRMLOAD] WASM: creating headless controller..." << std::endl;
++            rtl::Reference<SfxBaseController> pCtrl(new SfxBaseController(nullptr));
++            Reference<XController2> xController(static_cast<XController2*>(pCtrl.get()));
++            utl::ConnectFrameControllerModel(_rTargetFrame, xController, xModel);
++            std::cerr << "[FRMLOAD] WASM: headless controller connected" << std::endl;
++            bLoadSuccess = true;
++        }
++        else
++        {
++        std::cerr << "[FRMLOAD] WASM: creating Writer document view..." << std::endl;
++#endif
+         // ensure the ID of the to-be-created view is in the descriptor, if possible
+         const SfxInterfaceId nViewId = impl_determineEffectiveViewId_nothrow( *xDoc, aDescriptor );
+         const sal_Int16 nViewNo = xDoc->GetFactory().GetViewNo_Impl( nViewId, 0 );
+@@ -820,6 +865,10 @@ sal_Bool SAL_CALL SfxFrameLoader_Impl::load( const Sequence< PropertyValue >& rA
+         }
+ 
+         bLoadSuccess = true;
++#ifdef __EMSCRIPTEN__
++        std::cerr << "[FRMLOAD] WASM: Writer document view connected" << std::endl;
++        }
++#endif
+     }
+     catch ( Exception& )
+     {
