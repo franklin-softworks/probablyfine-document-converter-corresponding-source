@@ -1,0 +1,134 @@
+diff --git a/sd/source/ui/app/sddll.cxx b/sd/source/ui/app/sddll.cxx
+index 07a043c0828e..e9e252408ac7 100644
+--- a/sd/source/ui/app/sddll.cxx
++++ b/sd/source/ui/app/sddll.cxx
+@@ -19,6 +19,10 @@
+ 
+ #include <config_features.h>
+ 
++#ifdef __EMSCRIPTEN__
++#include <iostream>
++#endif
++
+ #include <avmedia/mediaplayer.hxx>
+ #include <avmedia/mediatoolbox.hxx>
+ #include <comphelper/configuration.hxx>
+@@ -87,9 +91,38 @@ using namespace ::com::sun::star;
+ // Register all Factories
+ void SdDLL::RegisterFactorys()
+ {
++    std::cerr << "[SD_DLL] RegisterFactorys() called" << std::endl;
+     std::optional<SvtModuleOptions> oOpts;
+     if (!comphelper::IsFuzzing())
+         oOpts.emplace();
++    std::cerr << "[SD_DLL] SvtModuleOptions created" << std::endl;
++#ifdef __EMSCRIPTEN__
++    // WASM: Force register Impress and Draw factories regardless of
++    // SvtModuleOptions. XCD configuration merging is incomplete in WASM,
++    // so IsImpressInstalled()/IsDrawInstalled() may return false.
++    std::cerr << "[SD_DLL] WASM: Force registering Impress/Draw factories" << std::endl;
++    ::sd::ImpressViewShellBase::RegisterFactory (
++        ::sd::IMPRESS_FACTORY_ID);
++    if (comphelper::LibreOfficeKit::isActive())
++    {
++        ::sd::ImpressViewShellBase::RegisterFactory (
++            ::sd::SLIDE_SORTER_FACTORY_ID);
++        ::sd::ImpressViewShellBase::RegisterFactory (
++            ::sd::OUTLINE_FACTORY_ID);
++        ::sd::ImpressViewShellBase::RegisterFactory (
++            ::sd::PRESENTATION_FACTORY_ID);
++    }
++    else
++    {
++        ::sd::SlideSorterViewShellBase::RegisterFactory (
++            ::sd::SLIDE_SORTER_FACTORY_ID);
++        ::sd::OutlineViewShellBase::RegisterFactory (
++            ::sd::OUTLINE_FACTORY_ID);
++        ::sd::PresentationViewShellBase::RegisterFactory (
++            ::sd::PRESENTATION_FACTORY_ID);
++    }
++    ::sd::GraphicViewShellBase::RegisterFactory (::sd::DRAW_FACTORY_ID);
++#else
+     if (!oOpts || oOpts->IsImpressInstalled())
+     {
+         ::sd::ImpressViewShellBase::RegisterFactory (
+@@ -117,6 +150,8 @@ void SdDLL::RegisterFactorys()
+     {
+         ::sd::GraphicViewShellBase::RegisterFactory (::sd::DRAW_FACTORY_ID);
+     }
++#endif
++    std::cerr << "[SD_DLL] RegisterFactorys() done" << std::endl;
+ }
+ 
+ // Register all Interfaces
+@@ -228,16 +263,32 @@ void SdDLL::Init()
+     std::optional<SvtModuleOptions> oOptions;
+     if (!comphelper::IsFuzzing())
+         oOptions.emplace();
++#ifdef __EMSCRIPTEN__
++    // WASM: Force enable Impress and Draw regardless of SvtModuleOptions.
++    // XCD configuration merging is incomplete in WASM, so
++    // IsImpressInstalled()/IsDrawInstalled() may return false.
++    std::cerr << "[SD_DLL] WASM: Force enabling Impress and Draw factories" << std::endl;
++    pImpressFact = &::sd::DrawDocShell::Factory();
++    pDrawFact = &::sd::GraphicDocShell::Factory();
++#else
+     if (!oOptions || oOptions->IsImpressInstalled())
+         pImpressFact = &::sd::DrawDocShell::Factory();
+ 
+     if (oOptions && oOptions->IsDrawInstalled())
+         pDrawFact = &::sd::GraphicDocShell::Factory();
++#endif
+ 
+     auto pUniqueModule = std::make_unique<SdModule>(pImpressFact, pDrawFact);
+     SdModule* pModule = pUniqueModule.get();
+     SfxApplication::SetModule(SfxToolsModule::Draw, std::move(pUniqueModule));
+ 
++#ifdef __EMSCRIPTEN__
++    // WASM: Force register shape types and set document service names.
++    std::cerr << "[SD_DLL] WASM: Force registering Impress shape types and service names" << std::endl;
++    ::accessibility::RegisterImpressShapeTypes ();
++    ::sd::DrawDocShell::Factory().SetDocumentServiceName( u"com.sun.star.presentation.PresentationDocument"_ustr );
++    ::sd::GraphicDocShell::Factory().SetDocumentServiceName( u"com.sun.star.drawing.DrawingDocument"_ustr );
++#else
+     if (oOptions && oOptions->IsImpressInstalled())
+     {
+         // Register the Impress shape types in order to make the shapes accessible.
+@@ -249,21 +300,37 @@ void SdDLL::Init()
+     {
+         ::sd::GraphicDocShell::Factory().SetDocumentServiceName( u"com.sun.star.drawing.DrawingDocument"_ustr );
+     }
++#endif
+ 
+     // register your view-factories here
+     RegisterFactorys();
+ 
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[SD_DLL] About to call RegisterInterfaces..." << std::endl;
++#endif
+     // register your shell-interfaces here
+     RegisterInterfaces(pModule);
+ 
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[SD_DLL] About to call RegisterControllers..." << std::endl;
++#endif
+     // register your controllers here
+     RegisterControllers(pModule);
+ 
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[SD_DLL] About to call E3dObjFactory..." << std::endl;
++#endif
+     // register 3D-object-factory
+     E3dObjFactory();
+ 
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[SD_DLL] About to call FmFormObjFactory..." << std::endl;
++#endif
+     // register css::form::component::Form-Object-Factory
+     FmFormObjFactory();
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[SD_DLL] SdDLL::Init() complete" << std::endl;
++#endif
+ 
+     // register your exotic remote controls here
+ #ifdef ENABLE_SDREMOTE
