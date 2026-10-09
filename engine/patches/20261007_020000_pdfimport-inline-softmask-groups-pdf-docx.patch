@@ -1,0 +1,138 @@
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
+@@ -153,4 +153,6 @@
+         std::unique_ptr<UnicodeMap>             m_pUtf8Map;
+         bool                                    m_bSkipImages;
++        std::vector<bool>                       m_aGroupIsSoftMask;
++        int                                     m_nSoftMaskDepth = 0;
+ 
+         // FG-142: progress for the render phase. Rasterizing many shadings can
+@@ -341,4 +343,31 @@
+         void setSkipImages ( bool bSkipImages );
+ #if POPPLER_CHECK_VERSION(21, 3, 0)
++        // FG-174/175: poppler draws a soft mask's form (an ExtGState /SMask group)
++        // through the ordinary drawing calls. This device has no transparency
++        // groups, so that content used to land on the page as visible content:
++        // grey luminosity shadings, mask images as black boxes. Track which open
++        // groups are soft-mask groups and paint nothing inside them; the masked
++        // content then draws unmasked.
++#if POPPLER_CHECK_VERSION(25, 9, 0)
++        virtual void beginTransparencyGroup(GfxState*, const std::array<double, 4>&,
++                                            GfxColorSpace*, bool, bool, bool forSoftMask) override
++#else
++        virtual void beginTransparencyGroup(GfxState*, const double*,
++                                            GfxColorSpace*, bool, bool, bool forSoftMask) override
++#endif
++        {
++            m_aGroupIsSoftMask.push_back(forSoftMask);
++            if (forSoftMask)
++                ++m_nSoftMaskDepth;
++        }
++        virtual void endTransparencyGroup(GfxState*) override
++        {
++            if (m_aGroupIsSoftMask.empty())
++                return;
++            if (m_aGroupIsSoftMask.back())
++                --m_nSoftMaskDepth;
++            m_aGroupIsSoftMask.pop_back();
++        }
++
+         poppler_bool useTilingPatternFill() override { return true; };
+         poppler_bool tilingPatternFill(GfxState *state, Gfx *gfx, Catalog *cat,
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+@@ -671,4 +671,8 @@
+     m_aTightClip = ClipBox();
+     m_aTightClipStack.clear();
++    // FG-174: groups always close within the page (Gfx::drawForm pairs them),
++    // but a stuck soft-mask depth would blank every later page, so start clean.
++    m_aGroupIsSoftMask.clear();
++    m_nSoftMaskDepth = 0;
+     printf("startPage %f %f\n",
+            normalize(state->getPageWidth()),
+@@ -973,4 +977,6 @@
+ void PDFOutDev::stroke(GfxState *state)
+ {
++    if (m_nSoftMaskDepth > 0)
++        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
+     if (m_bSkipImages)
+         return;
+@@ -986,4 +992,6 @@
+ void PDFOutDev::fill(GfxState *state)
+ {
++    if (m_nSoftMaskDepth > 0)
++        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
+     if (m_bSkipImages)
+         return;
+@@ -999,4 +1007,6 @@
+ void PDFOutDev::eoFill(GfxState *state)
+ {
++    if (m_nSoftMaskDepth > 0)
++        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
+     if (m_bSkipImages)
+         return;
+@@ -1079,4 +1089,6 @@
+                          CharCode, int /*nBytes*/, const Unicode *u, int uLen)
+ {
++    if (m_nSoftMaskDepth > 0)
++        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
+ #else
+ void PDFOutDev::drawChar(GfxState *state, double x, double y,
+@@ -1085,4 +1097,6 @@
+                          CharCode, int /*nBytes*/, Unicode *u, int uLen)
+ {
++    if (m_nSoftMaskDepth > 0)
++        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
+ #endif
+     assert(state);
+@@ -1173,4 +1187,6 @@
+                               poppler_bool /*inlineImg*/ )
+ {
++    if (m_nSoftMaskDepth > 0)
++        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
+     if (m_bSkipImages)
+         return;
+@@ -1208,4 +1224,6 @@
+                           const int* maskColors, poppler_bool /*inlineImg*/ )
+ {
++    if (m_nSoftMaskDepth > 0)
++        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
+ #else
+ void PDFOutDev::drawImage(GfxState*, Object*, Stream* str,
+@@ -1214,4 +1232,6 @@
+                           int* maskColors, poppler_bool /*inlineImg*/ )
+ {
++    if (m_nSoftMaskDepth > 0)
++        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
+ #endif
+     if (m_bSkipImages)
+@@ -1275,4 +1295,6 @@
+                                )
+ {
++    if (m_nSoftMaskDepth > 0)
++        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
+     if (m_bSkipImages)
+         return;
+@@ -1293,4 +1315,6 @@
+                                    )
+ {
++    if (m_nSoftMaskDepth > 0)
++        return; // FG-174/175: inside a soft-mask group, see beginTransparencyGroup
+     if (m_bSkipImages)
+         return;
+@@ -1322,4 +1346,6 @@
+                                           double xStep, double yStep)
+ {
++    if (m_nSoftMaskDepth > 0)
++        return true; // FG-174/175: claimed, nothing painted (inside a soft-mask group)
+ #if POPPLER_CHECK_VERSION(25, 9, 0)
+     const std::array<double, 4> pBbox = tPat->getBBox();
+@@ -1742,4 +1768,6 @@
+                                         const std::function<bool(SplashOutputDev&, GfxState&)>& rPaint )
+ {
++    if (m_nSoftMaskDepth > 0)
++        return true; // FG-174/175: claimed, nothing painted (inside a soft-mask group)
+     assert(state);
+     assert(shading);
