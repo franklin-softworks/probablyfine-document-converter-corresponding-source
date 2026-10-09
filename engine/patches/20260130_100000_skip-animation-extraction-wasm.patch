@@ -1,0 +1,53 @@
+diff --git a/svx/source/sdr/contact/viewobjectcontact.cxx b/svx/source/sdr/contact/viewobjectcontact.cxx
+index cc025c885110..eea1662da7b7 100644
+--- a/svx/source/sdr/contact/viewobjectcontact.cxx
++++ b/svx/source/sdr/contact/viewobjectcontact.cxx
+@@ -296,6 +296,13 @@ void ViewObjectContact::checkForPrimitive2DAnimations()
+     // remove old one
+     mpPrimitiveAnimation.reset();
+ 
++#ifdef __EMSCRIPTEN__
++    // WASM: skip animation extraction entirely - not needed for PDF export
++    // and AnimatedExtractingProcessor2D::process() can hang on graphic
++    // primitives during bitmap decompression in the WASM environment
++    return;
++#endif
++
+     // check for animated primitives
+     if(mxPrimitive2DSequence.empty())
+         return;
+@@ -522,8 +529,14 @@ drawinglayer::primitive2d::Primitive2DContainer const & ViewObjectContact::getPr
+         const_cast< ViewObjectContact* >(this)->checkForPrimitive2DAnimations();
+ 
+         // always update object range when PrimitiveSequence changes
++#ifdef __EMSCRIPTEN__
++        // WASM: skip getB2DRange - can trigger bitmap decompression for
++        // graphic primitives causing hangs. Range is only needed for
++        // invalidation/visibility which is not relevant during PDF export.
++#else
+         const drawinglayer::geometry::ViewInformation2D& rViewInformation2D(GetObjectContact().getViewInformation2D());
+         const_cast< ViewObjectContact* >(this)->maObjectRange = mxPrimitive2DSequence.getB2DRange(rViewInformation2D);
++#endif
+     }
+ 
+     // return current Primitive2DContainer
+@@ -552,6 +565,11 @@ void ViewObjectContact::getPrimitive2DSequenceHierarchy(DisplayInfo& rDisplayInf
+     if(mxPrimitive2DSequence.empty())
+         return;
+ 
++#ifdef __EMSCRIPTEN__
++    // WASM: skip getB2DRange visibility check - for PDF export the view range
++    // is empty (recording metafile) so all objects are always visible.
++    // getB2DRange can hang on graphic primitives during bitmap decompression.
++#else
+     // get ranges
+     const drawinglayer::geometry::ViewInformation2D& rViewInformation2D(GetObjectContact().getViewInformation2D());
+     // tdf#147164 cannot use maObjectRange here, it is unreliable
+@@ -562,6 +580,7 @@ void ViewObjectContact::getPrimitive2DSequenceHierarchy(DisplayInfo& rDisplayInf
+     bool bVisible = aViewRange.isEmpty() || aViewRange.overlaps(aObjectRange);
+     if(!bVisible)
+         return;
++#endif
+ 
+     // temporarily take over the mxPrimitive2DSequence, in case it gets invalidated while we want to iterate over it
+     auto tmp = std::move(const_cast<ViewObjectContact*>(this)->mxPrimitive2DSequence);
