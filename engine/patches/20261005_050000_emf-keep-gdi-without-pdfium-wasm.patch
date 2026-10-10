@@ -1,0 +1,30 @@
+diff --git a/emfio/source/reader/emfreader.cxx b/emfio/source/reader/emfreader.cxx
+index fb216ab74bcb..72958f1c4846 100644
+--- a/emfio/source/reader/emfreader.cxx
++++ b/emfio/source/reader/emfreader.cxx
+@@ -29,6 +29,7 @@
+ #include <comphelper/configuration.hxx>
+ #include <vcl/graph.hxx>
+ #include <vcl/pdfread.hxx>
++#include <vcl/filter/PDFiumLibrary.hxx>
+ #include <rtl/bootstrap.hxx>
+ 
+ #ifdef DBG_UTIL
+@@ -476,6 +477,17 @@ namespace emfio
+ 
+     void EmfReader::ReadMultiformatsComment()
+     {
++#ifdef __EMSCRIPTEN__
++        // FG-125: a multiformats comment carrying a PDF makes the reader drop the
++        // EMF's own GDI records (mbReadOtherGraphicFormat) and show the PDF, but
++        // rendering that PDF needs pdfium, which the documents and spreadsheets
++        // modules are built without -- so the picture vanished entirely. Without
++        // pdfium, ignore the comment and keep drawing the GDI records: the vector
++        // fallback Office wrote alongside the PDF. Modules with pdfium
++        // (presentations) are unchanged.
++        if (!vcl::pdf::PDFiumLibrary::get())
++            return;
++#endif
+         tools::Rectangle aOutputRect = EmfReader::ReadRectangle();
+ 
+         sal_uInt32 nCountFormats(0);
