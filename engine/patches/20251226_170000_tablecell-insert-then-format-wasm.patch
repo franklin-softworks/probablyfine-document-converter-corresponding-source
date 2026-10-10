@@ -1,0 +1,507 @@
+diff --git a/oox/source/drawingml/table/tablecell.cxx b/oox/source/drawingml/table/tablecell.cxx
+index 0da7c2092eec..6816c5e32e87 100644
+--- a/oox/source/drawingml/table/tablecell.cxx
++++ b/oox/source/drawingml/table/tablecell.cxx
+@@ -38,6 +38,24 @@
+ #include <com/sun/star/text/WritingMode.hpp>
+ #include <comphelper/propertysequence.hxx>
+ #include <comphelper/propertyvalue.hxx>
++#ifdef __EMSCRIPTEN__
++#include <drawingml/textrun.hxx>
++#include <com/sun/star/awt/CharSet.hpp>
++#include <com/sun/star/text/XTextCursor.hpp>
++#include <com/sun/star/text/XTextField.hpp>
++#include <com/sun/star/text/ControlCharacter.hpp>
++#include <com/sun/star/lang/XMultiServiceFactory.hpp>
++// XmlFilterBase::getModel() returns Reference<XModel>, and the UNO_QUERY
++// constructor needs the COMPLETE type to decide whether the query is even
++// necessary; oleobjecthelper.hxx only forward-declares it.
++#include <com/sun/star/frame/XModel.hpp>
++#include <comphelper/diagnose_ex.hxx>
++// GetFontHeight(), for the paragraph-properties block's fCharacterSize.
++#include <oox/drawingml/drawingmltypes.hxx>
++#include <oox/helper/propertymap.hxx>
++#include <com/sun/star/beans/XPropertySet.hpp>
++#include <algorithm>
++#endif
+ 
+ using namespace ::oox::core;
+ using namespace ::com::sun::star;
+@@ -587,7 +605,465 @@ void TableCell::pushToXCell( const ::oox::core::XmlFilterBase& rFilterBase, cons
+         xPropSet->setPropertyValue(u"TextWritingMode"_ustr, Any(css::text::WritingMode_TB_RL));
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    // WASM: Insert-then-format approach to preserve text formatting.
++    // 1. Insert the text first (works reliably)
++    // 2. Navigate with cursor and apply formatting per-run using safe properties
++    //
++    // This is the sibling of the loop in shape.cxx
++    // (bugs/bug26_pptx_drawingml_content_loss.md item 10). Both halves of item 10
++    // are now closed: the character-property base below is seeded from the
++    // paragraph's merged character style, so table-style inheritance survives, and
++    // the paragraph-properties block that was absent entirely is present. Item 2's
++    // hyperlink loss and item 4's symbol split were closed earlier.
++    {
++        const TextParagraphVector& rParagraphs = getTextBody()->getParagraphs();
++
++        // Which runs went in as a com.sun.star.text.TextField.URL rather than as
++        // characters. Recorded by the insertion pass and read by the formatting
++        // pass, because a field occupies exactly ONE text position however long its
++        // anchor text is (SvxUnoTextBase::insertTextContent, unotext.cxx) while a
++        // string occupies getText().getLength(). Disagreement slides the selection
++        // and mis-formats every remaining run in the cell.
++        std::vector<std::vector<bool>> aRunIsField(rParagraphs.size());
++
++        // See the identical lambda in shape.cxx for why this can fail and why
++        // failing falls back to plain characters rather than throwing.
++        auto insertHyperlinkField
++            = [&](const TextRunPtr& rRun, const Reference<text::XTextCursor>& xInsertAt) -> bool
++        {
++            try
++            {
++                Reference<lang::XMultiServiceFactory> xFactory(rFilterBase.getModel(), UNO_QUERY);
++                if (!xFactory.is())
++                    return false;
++                Reference<text::XTextField> xField(
++                    xFactory->createInstance(u"com.sun.star.text.TextField.URL"_ustr), UNO_QUERY);
++                if (!xField.is())
++                    return false;
++
++                PropertySet aFieldProps(xField);
++                aFieldProps.setProperties(
++                    rRun->getTextCharacterProperties().maHyperlinkPropertyMap);
++                // Set LAST: without a Representation the field prints the href in
++                // place of the anchor text (unofield.cxx:427).
++                aFieldProps.setProperty(PROP_Representation, rRun->getText());
++                xText->insertTextContent(xInsertAt, xField, false);
++                return true;
++            }
++            catch (const Exception&)
++            {
++                TOOLS_WARN_EXCEPTION("oox.drawingml", "WASM: hyperlink field not created");
++                return false;
++            }
++        };
++
++        // Step 1: insert the text.
++        //
++        // NOT via setString(). A text field cannot be expressed as a character at
++        // all, and setString() additionally cannot express a soft <a:br/> break: it
++        // runs convertLineEnd(..., LINEEND_LF) (unotext.cxx:373) and ImpInsertText
++        // turns every LF into a PARAGRAPH break (impedit2.cxx:2897). Paragraph
++        // breaks therefore use APPEND_PARAGRAPH and soft breaks
++        // ControlCharacter::LINE_BREAK, matching TextParagraph::insertAt
++        // (textparagraph.cxx:101-104) and TextRun::insertAt (textrun.cxx:90-94) —
++        // and matching what shape.cxx already does, so the two loops land text at
++        // the same positions.
++        {
++            // setString() used to do this implicitly; the incremental insertion
++            // below appends, so the cell has to be cleared explicitly.
++            xText->setString(OUString());
++            Reference<text::XTextCursor> xInsert = xText->createTextCursor();
++            xInsert->gotoEnd(false);
++            for (size_t i = 0; i < rParagraphs.size(); ++i)
++            {
++                if (i > 0)
++                {
++                    xText->insertControlCharacter(xInsert, text::ControlCharacter::APPEND_PARAGRAPH,
++                                                  false);
++                    xInsert->gotoEnd(false);
++                }
++                const TextRunVector& rInsertRuns = rParagraphs[i]->getRuns();
++                aRunIsField[i].reserve(rInsertRuns.size());
++                for (auto const& run : rInsertRuns)
++                {
++                    const bool bField
++                        = !run->isLineBreak()
++                          && !run->getTextCharacterProperties().maHyperlinkPropertyMap.empty()
++                          && insertHyperlinkField(run, xInsert);
++                    aRunIsField[i].push_back(bField);
++
++                    if (bField)
++                    {
++                        xInsert->gotoEnd(false);
++                    }
++                    else if (run->isLineBreak())
++                    {
++                        xText->insertControlCharacter(xInsert, text::ControlCharacter::LINE_BREAK,
++                                                      false);
++                        xInsert->gotoEnd(false);
++                    }
++                    else if (!run->getText().isEmpty())
++                    {
++                        xText->insertString(xInsert, run->getText(), false);
++                        xInsert->gotoEnd(false);
++                    }
++                }
++            }
++        }
++
++        // Step 2: Apply formatting per-run using cursor.
++        //
++        // Guarded on there being a paragraph rather than on there being TEXT: the
++        // old `!sPlainText.isEmpty()` guard skipped a cell holding only breaks.
++        if (!rParagraphs.empty())
++        {
++            Reference<text::XTextCursor> xCursor = xText->createTextCursor();
++            if (xCursor.is())
++            {
++                xCursor->gotoStart(false);
++
++                for (size_t iPara = 0; iPara < rParagraphs.size(); ++iPara)
++                {
++                    const auto& paragraph = rParagraphs[iPara];
++                    const TextRunVector& rRuns = paragraph->getRuns();
++
++                    // The paragraph's MERGED character style, and the whole of what
++                    // BUG-26 item 10 was about.
++                    //
++                    // aTextStyleProps is what the several applyTableStylePart() calls
++                    // at the top of this function resolved for THIS cell — wholeTbl,
++                    // then the band, then first/last row and column, then the corner
++                    // overrides. It carries the table style's face, size and colour.
++                    // getCharacterStyle() folds it with the master list style and the
++                    // text body's own list style exactly as TextParagraph::insertAt
++                    // builds the same value (textparagraph.cxx:51-66, :96-97).
++                    //
++                    // The base here used to be a DEFAULT-CONSTRUCTED
++                    // TextCharacterProperties, so a table-cell run kept only what its
++                    // own <a:rPr> stated. A cell inheriting its face, size or colour
++                    // from the table style got nothing at all — not even the
++                    // shape-level base that shape.cxx has had since c66e593. It also
++                    // bounded item 4's <a:sym> fix below, which could not see a
++                    // symbol font inherited from the style rather than stated on the
++                    // run.
++                    //
++                    // The null check is not upstream's: TextBody::insertAt
++                    // dereferences the pointer unconditionally (textbody.cxx), but
++                    // nothing on THIS path guarantees a master list style, and the
++                    // tdf#144092 block at the end of this function dereferences it
++                    // only inside its own guard.
++                    const TextCharacterProperties aTextCharacterStyle(
++                        pMasterTextListStyle
++                            ? paragraph->getCharacterStyle(aTextStyleProps, *pMasterTextListStyle,
++                                                           getTextBody()->getTextListStyle())
++                            : aTextStyleProps);
++
++                    // The character properties a run actually renders with — the
++                    // style, then the run's own, then n#759180: a paragraph's LAST
++                    // run, if it carries no text, is force-merged with
++                    // <a:endParaRPr>, which therefore WINS over the run's own
++                    // properties (textparagraph.cxx:121-126). A trailing <a:br/> is
++                    // exactly such a run.
++                    //
++                    // Character-for-character the same lambda as shape.cxx's, so the
++                    // two loops cannot disagree about what a run renders with.
++                    auto aEffectiveRunProps = [&](size_t nRun) {
++                        TextCharacterProperties aProps(aTextCharacterStyle);
++                        aProps.assignUsed(rRuns[nRun]->getTextCharacterProperties());
++                        if (rRuns[nRun]->getText().isEmpty() && nRun + 1 == rRuns.size())
++                            aProps.assignUsed(paragraph->getEndProperties());
++                        return aProps;
++                    };
++
++                    // PARAGRAPH properties — alignment, indents, spacing, line
++                    // spacing, bullets. The other half of item 10: this loop walked
++                    // paragraphs ONLY to reach their runs, so a table cell's
++                    // paragraph attributes were never applied and every cell fell
++                    // back to the text object's defaults. The NATIVE path applies
++                    // them, because it goes through TextParagraph::insertAt; the WASM
++                    // path bypasses that function entirely, so it has to do it here.
++                    //
++                    // Lifted from shape.cxx, which has carried it since the same
++                    // defect was fixed there, with mpMasterTextListStyle ->
++                    // pMasterTextListStyle and aCharStyleProperties -> aTextStyleProps.
++                    // Guarded for the same reason it is guarded there:
++                    // TextParagraphProperties::pushToPropSet is documented as
++                    // "expected to fail for Writer" (textparagraphproperties.cxx:484)
++                    // and this patch is NOT module-scoped, so it also runs for DOCX
++                    // drawingml tables. An unguarded throw would abandon the rest of
++                    // pushToXCell — borders, fill, vertical adjust — leaving a
++                    // half-imported cell rather than one missing an alignment.
++                    try
++                    {
++                        // fCharacterSize below drives proportional line spacing
++                        // (spcPct) and bullet sizing, so it must be the paragraph's
++                        // ACTUAL largest character height. Upstream reads it off the
++                        // runs as it inserts them; this path inserted the text up
++                        // front, so derive it here.
++                        sal_Int32 nCharHeight = 0;
++                        if (rRuns.empty())
++                        {
++                            // A paragraph with NO runs takes its WHOLE character
++                            // style from <a:endParaRPr> (textparagraph.cxx:108-117).
++                            TextCharacterProperties aEndProps(aTextCharacterStyle);
++                            aEndProps.assignUsed(paragraph->getEndProperties());
++                            if (aEndProps.moHeight.has_value())
++                                nCharHeight = aEndProps.moHeight.value();
++                            PropertySet aEndPropSet(xCursor);
++                            aEndProps.pushToPropSetWasm(aEndPropSet, rFilterBase);
++                        }
++                        else
++                        {
++                            for (size_t iRun = 0; iRun < rRuns.size(); ++iRun)
++                            {
++                                const TextCharacterProperties aRunHeightProps(
++                                    aEffectiveRunProps(iRun));
++                                if (aRunHeightProps.moHeight.has_value())
++                                    nCharHeight
++                                        = std::max(nCharHeight, aRunHeightProps.moHeight.value());
++                            }
++                        }
++
++                        TextListStyle aCombinedTextStyle;
++                        if (pMasterTextListStyle)
++                            aCombinedTextStyle.apply(*pMasterTextListStyle);
++                        aCombinedTextStyle.apply(getTextBody()->getTextListStyle());
++
++                        TextParagraphProperties* pParaStyle
++                            = paragraph->getParagraphStyle(aCombinedTextStyle);
++                        if (pParaStyle)
++                        {
++                            TextParagraphProperties aParaProp;
++                            aParaProp.apply(*pParaStyle);
++                            aParaProp.apply(paragraph->getProperties());
++
++                            // Bullets take the colour of the text they introduce.
++                            // Upstream seeds this from the FIRST run's fill before
++                            // pushing, so it wins over pushToPropSet's own fallback
++                            // (textparagraph.cxx:150-154).
++                            PropertyMap aBulletList;
++                            if (!rRuns.empty())
++                            {
++                                const TextCharacterProperties& rFirst
++                                    = rRuns.front()->getTextCharacterProperties();
++                                if (rFirst.maFillProperties.moFillType.has_value())
++                                    aBulletList.setProperty(
++                                        PROP_BulletColor,
++                                        rFirst.maFillProperties.getBestSolidColor().getColor(
++                                            rFilterBase.getGraphicHelper()));
++                            }
++                            Reference<beans::XPropertySet> xParaProps(xCursor, UNO_QUERY);
++                            if (xParaProps.is())
++                            {
++                                const float fCharacterSize
++                                    = nCharHeight > 0 ? GetFontHeight(nCharHeight)
++                                                      : pParaStyle->getCharHeightPoints(12);
++                                aParaProp.pushToPropSet(&rFilterBase, xParaProps, aBulletList,
++                                                        &pParaStyle->getBulletList(), true,
++                                                        fCharacterSize, true);
++                            }
++                        }
++
++                        // An empty paragraph carries no bullet in ppt. Keyed on the
++                        // paragraph's TOTAL TEXT LENGTH, not on whether it has runs,
++                        // and applied OUTSIDE the paragraph-style guard — both as
++                        // upstream has it (textparagraph.cxx:131, 193-196). A
++                        // paragraph holding only <a:br/> HAS runs but no text.
++                        sal_Int32 nParagraphSize = 0;
++                        for (const auto& rRun : rRuns)
++                            nParagraphSize += rRun->getText().getLength();
++                        if (nParagraphSize == 0)
++                        {
++                            Reference<beans::XPropertySet> xEmptyParaProps(xCursor, UNO_QUERY);
++                            if (xEmptyParaProps.is())
++                                xEmptyParaProps->setPropertyValue(
++                                    u"NumberingLevel"_ustr, Any(static_cast<sal_Int16>(-1)));
++                        }
++                    }
++                    catch (const Exception&)
++                    {
++                        TOOLS_WARN_EXCEPTION("oox.drawingml",
++                                             "WASM: cell paragraph properties not applied");
++                    }
++
++                    for (size_t iRun = 0; iRun < rRuns.size(); ++iRun)
++                    {
++                        const auto& run = rRuns[iRun];
++
++                        // Style, then the run's own, then endParaRPr where n#759180
++                        // says it applies. Was default-constructed; see above.
++                        TextCharacterProperties aRunProps(aEffectiveRunProps(iRun));
++
++                        // A hyperlink run is one position, whatever its length.
++                        // Upstream forces the hlink scheme colour and a single
++                        // underline onto it (textrun.cxx:162-170); without them the
++                        // link is clickable but does not look like one.
++                        if (iRun < aRunIsField[iPara].size() && aRunIsField[iPara][iRun])
++                        {
++                            xCursor->goRight(1, true);
++                            if (!run->getTextCharacterProperties()
++                                     .maHyperlinkPropertyMap.hasProperty(PROP_CharColor))
++                                aRunProps.maFillProperties.maFillColor.setSchemeClr(XML_hlink);
++                            aRunProps.maFillProperties.moFillType = XML_solidFill;
++                            if (!run->getTextCharacterProperties().moUnderline.has_value())
++                                aRunProps.moUnderline = XML_sng;
++                            PropertySet aLinkPropSet(xCursor);
++                            aRunProps.pushToPropSetWasm(aLinkPropSet, rFilterBase);
++                            xCursor->collapseToEnd();
++                            continue;
++                        }
++
++                        if (run->isLineBreak())
++                        {
++                            // One position, and it carries the run's own character
++                            // properties — its height is the height of the blank
++                            // line the break creates.
++                            xCursor->goRight(1, true);
++                            PropertySet aBreakPropSet(xCursor);
++                            aRunProps.pushToPropSetWasm(aBreakPropSet, rFilterBase);
++                            xCursor->collapseToEnd();
++                            continue;
++                        }
++
++                        sal_Int32 nLen = run->getText().getLength();
++                        if (nLen > 0)
++                        {
++                            // <a:sym> — the symbol font, resolved ONCE for the
++                            // run. A character in U+F000-F8FF is a Microsoft
++                            // symbol-font code point and must be requested from
++                            // that face; asked of the Latin face, which has no PUA
++                            // glyph, it comes back a box.
++                            //
++                            // This is the half of BUG-26 item 4 that PR #71 did
++                            // NOT reach. #71 fixed the identical loop in shape.cxx
++                            // and item 8's fix reached this file for free, because
++                            // that one lives in the shared pushToPropSetWasm — but
++                            // the run split lives in the CALLER, and this file
++                            // keeps its own copy of the caller. So a symbol run
++                            // inside a PPTX table stayed tofu. Item 10.
++                            //
++                            // This USED to be bounded by item 10's other defect —
++                            // aRunProps was default-constructed, so an <a:sym>
++                            // inherited from the TABLE STYLE rather than stated on
++                            // the run was invisible to it. aRunProps is now seeded
++                            // from the paragraph's merged character style above, so
++                            // an inherited maSymbolFont reaches getFontData() here.
++                            const OUString aRunText(run->getText());
++                            OUString aSymbolName;
++                            sal_Int16 nSymbolPitch = 0, nSymbolFamily = 0;
++                            // nullptr, not &bSymbolEncoded — see the charset note
++                            // below: the out-parameter reports only
++                            // <a:sym charset="2">, and the decision here
++                            // deliberately does not depend on it.
++                            const bool bHaveSymbolFont = aRunProps.maSymbolFont.getFontData(
++                                aSymbolName, nSymbolPitch, nSymbolFamily, nullptr, rFilterBase);
++
++                            // Walk the run in maximal same-kind segments, as
++                            // upstream's TextRun::insertAt splits it
++                            // (textrun.cxx:97-142) — but in the FORMATTING pass
++                            // only. Step 1 inserted this run's characters
++                            // unchanged and the segment lengths below sum to
++                            // nLen, so the cursor travels exactly the distance it
++                            // travelled before. That is the invariant that keeps
++                            // the hyperlink and line-break handling above safe: a
++                            // field occupies ONE position and a string occupies
++                            // getText().getLength(), and neither total moves.
++                            // Splitting at INSERTION time, which is what upstream
++                            // does, would add a third quantity the two passes must
++                            // agree about.
++                            sal_Int32 nIndex = 0;
++                            while (nIndex < nLen)
++                            {
++                                const bool bSymbol = (aRunText[nIndex] & 0xff00) == 0xf000;
++                                sal_Int32 nCount = 1;
++                                while (nIndex + nCount < nLen
++                                       && (((aRunText[nIndex + nCount] & 0xff00) == 0xf000)
++                                           == bSymbol))
++                                    ++nCount;
++
++                                // Select this segment.
++                                //
++                                // goRight takes sal_Int16 (XTextCursor IDL) and the
++                                // count is sal_Int32, so a segment over 32767 UTF-16
++                                // units narrowed to a NEGATIVE count, walked the
++                                // selection backwards and mis-formatted every
++                                // remaining run in the cell. Step in bounded chunks,
++                                // as shape.cxx does since 33b18b7.
++                                sal_Int32 nRemaining = nCount;
++                                while (nRemaining > 0)
++                                {
++                                    const sal_Int16 nStep = static_cast<sal_Int16>(
++                                        std::min<sal_Int32>(nRemaining, SAL_MAX_INT16));
++                                    xCursor->goRight(nStep, true);
++                                    nRemaining -= nStep;
++                                }
++
++                                PropertySet aRunPropSet(xCursor);
++                                aRunProps.pushToPropSetWasm(aRunPropSet, rFilterBase);
++
++                                if (bSymbol && bHaveSymbolFont)
++                                {
++                                    // Overrides the Latin face pushToPropSetWasm
++                                    // just set, which is the order upstream uses.
++                                    // No "restore" step is needed: every segment
++                                    // re-selects and re-pushes from the run's
++                                    // merged properties, so a non-symbol segment
++                                    // gets the Latin face back on its own.
++                                    aRunPropSet.setAnyProperty(PROP_CharFontName, Any(aSymbolName));
++                                    aRunPropSet.setAnyProperty(PROP_CharFontPitch, Any(nSymbolPitch));
++                                    aRunPropSet.setAnyProperty(PROP_CharFontFamily,
++                                                              Any(nSymbolFamily));
++
++                                    // THE SAME DELIBERATE DIVERGENCE FROM UPSTREAM
++                                    // AS shape.cxx, and it is here because the two
++                                    // call sites must not disagree about what a
++                                    // symbol run is. Upstream writes
++                                    //     bSymbolEncoded ? SYMBOL : DONTKNOW
++                                    // where bSymbolEncoded is the OPTIONAL charset
++                                    // attribute of <a:sym> being 2. Nothing
++                                    // downstream works without SYMBOL: it is the
++                                    // only route into
++                                    // PhysicalFontCollection.cxx:1160's
++                                    // substitution to OpenSymbol and hence to
++                                    // ConvertChar::GetRecodeData(u"Wingdings", …).
++                                    // The corpus fixture writes charset="0" or
++                                    // omits it, and #71 verified by experiment that
++                                    // gating on the attribute reproduces upstream's
++                                    // own tofu: the native LibreOffice 25.8.7.3
++                                    // reference embeds no OpenSymbol and draws
++                                    // empty boxes where Microsoft Graph draws an
++                                    // arrow, while rewriting only the charset to
++                                    // "2" and reconverting with that same binary
++                                    // reproduces the Graph rendering exactly.
++                                    //
++                                    // U+F000-F8FF IS the Microsoft symbol range and
++                                    // PowerPoint honours it whatever the attribute
++                                    // says. The guard is the character being in
++                                    // that range AND the run declaring a non-empty
++                                    // <a:sym> typeface, and this block is
++                                    // __EMSCRIPTEN__-only.
++                                    aRunPropSet.setAnyProperty(
++                                        PROP_CharFontCharSet,
++                                        Any(sal_Int16(awt::CharSet::SYMBOL)));
++                                }
++
++                                // Collapse to end for the next segment.
++                                xCursor->collapseToEnd();
++                                nIndex += nCount;
++                            }
++                        }
++                    }
++                    // Skip the newline if not last paragraph
++                    if (iPara < rParagraphs.size() - 1)
++                        xCursor->goRight(1, false);
++                }
++            }
++        }
++    }
++#else
+     getTextBody()->insertAt( rFilterBase, xText, xAt, aTextStyleProps, pMasterTextListStyle );
++#endif
+ 
+     // tdf#144092 For empty cells push character styles & endParaRPr to the Cell's properties
+     const TextParagraphVector& rParagraphs = getTextBody()->getParagraphs();
+@@ -599,7 +1075,11 @@ void TableCell::pushToXCell( const ::oox::core::XmlFilterBase& rFilterBase, cons
+             TextCharacterProperties aTextCharacterProps{ pFirstParagraph->getCharacterStyle(
+                 aTextStyleProps, *pMasterTextListStyle, getTextBody()->getTextListStyle()) };
+             aTextCharacterProps.assignUsed(pFirstParagraph->getEndProperties());
++#ifdef __EMSCRIPTEN__
++            aTextCharacterProps.pushToPropSetWasm(aPropSet, rFilterBase);
++#else
+             aTextCharacterProps.pushToPropSet(aPropSet, rFilterBase);
++#endif
+         }
+     }
+ 

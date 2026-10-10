@@ -1,0 +1,97 @@
+diff --git a/sdext/source/pdfimport/inc/contentsink.hxx b/sdext/source/pdfimport/inc/contentsink.hxx
+--- a/sdext/source/pdfimport/inc/contentsink.hxx
++++ b/sdext/source/pdfimport/inc/contentsink.hxx
+@@ -106,6 +106,12 @@
+         virtual void setPageNum( sal_Int32 nNumPages ) = 0;
+         virtual void startPage( const css::geometry::RealSize2D& rSize ) = 0;
+         virtual void endPage() = 0;
++#ifdef __EMSCRIPTEN__
++        /// FG-142: called every few seconds while the inline import is still
++        /// parsing one page, so a caller watching progress can tell a slow
++        /// page from a stuck one. Progress otherwise only moves per page.
++        virtual void parseHeartbeat() {}
++#endif
+ 
+         virtual void hyperLink( const css::geometry::RealRectangle2D& rBounds,
+                                 const OUString&                             rURI ) = 0;
+diff --git a/sdext/source/pdfimport/inc/pdfiprocessor.hxx b/sdext/source/pdfimport/inc/pdfiprocessor.hxx
+--- a/sdext/source/pdfimport/inc/pdfiprocessor.hxx
++++ b/sdext/source/pdfimport/inc/pdfiprocessor.hxx
+@@ -90,6 +90,9 @@
+         virtual void setPageNum( sal_Int32 nNumPages ) override;
+         virtual void startPage( const css::geometry::RealSize2D& rSize ) override;
+         virtual void endPage() override;
++#ifdef __EMSCRIPTEN__
++        virtual void parseHeartbeat() override;
++#endif
+ 
+         virtual void hyperLink( const css::geometry::RealRectangle2D& rBounds,
+                                 const OUString&                             rURI ) override;
+diff --git a/sdext/source/pdfimport/tree/pdfiprocessor.cxx b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+--- a/sdext/source/pdfimport/tree/pdfiprocessor.cxx
++++ b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+@@ -649,6 +649,18 @@
+         m_xStatusIndicator->end();
+ }
+ 
++#ifdef __EMSCRIPTEN__
++void PDFIProcessor::parseHeartbeat()
++{
++    // FG-142: re-send the current page number. The LOK StatusIndicator
++    // forwards a value whose percent is unchanged (it only drops a lower one),
++    // so this reaches the web driver as a progress event and keeps its
++    // no-progress watchdog from stopping a page that is slow but advancing.
++    if( m_xStatusIndicator.is() && m_pCurPage )
++        m_xStatusIndicator->setValue( m_pCurPage->PageNumber );
++}
++#endif
++
+ void PDFIProcessor::startPage( const geometry::RealSize2D& rSize )
+ {
+     // initial clip is to page bounds
+diff --git a/sdext/source/pdfimport/wrapper/wrapper.cxx b/sdext/source/pdfimport/wrapper/wrapper.cxx
+--- a/sdext/source/pdfimport/wrapper/wrapper.cxx
++++ b/sdext/source/pdfimport/wrapper/wrapper.cxx
+@@ -65,6 +65,7 @@
+ 
+ #ifdef EMSCRIPTEN_INLINE_PDFIMPORT
+ #include <stdio.h>  // for FILE*
++#include <chrono>
+ #endif
+ 
+ using namespace com::sun::star;
+@@ -1377,6 +1378,12 @@
+                 Buffering aBuffering(hTextRead);
+                 OStringBuffer line;
+                 fprintf(stderr, "[PARSE] Beginning line parsing loop\n");
++                // FG-142: page progress alone goes quiet on a page with tens of
++                // thousands of vector paths (fillPath clips each one against the
++                // current clip), long enough for the web driver's watchdog to
++                // stop an import that is still advancing. Beat every 2 s.
++                auto aLastBeat = std::chrono::steady_clock::now();
++                int nBeats = 0;
+ 
+                 for (;;)
+                 {
+@@ -1421,9 +1428,20 @@
+                     }
+                     aParser.parseLine(line);
+                     line.setLength(0);
++
++                    if ((nLineCount & 63) == 0)
++                    {
++                        const auto aNow = std::chrono::steady_clock::now();
++                        if (aNow - aLastBeat >= std::chrono::seconds(2))
++                        {
++                            aLastBeat = aNow;
++                            ++nBeats;
++                            rSink->parseHeartbeat();
++                        }
++                    }
+                 }
+ 
+-                fprintf(stderr, "[PARSE] Loop ended, parsed %d lines\n", nLineCount);
++                fprintf(stderr, "[PARSE] Loop ended, parsed %d lines, %d heartbeats\n", nLineCount, nBeats);
+                 SAL_INFO("sdext.pdfimport", "WASM: Parser completed successfully");
+             }
+             catch (const uno::Exception& e)
