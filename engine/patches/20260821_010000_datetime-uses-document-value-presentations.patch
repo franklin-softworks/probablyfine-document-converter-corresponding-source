@@ -1,0 +1,41 @@
+--- a/oox/source/drawingml/textfield.cxx
++++ b/oox/source/drawingml/textfield.cxx
+@@ -160,6 +160,38 @@
+     // which is what makes the value recompute at render time instead of
+     // staying at the string PowerPoint cached in <a:t> at authoring time.
+     std::vector<Reference<XTextField>> aFields;
++
++    // EXCEPT datetime, which must NOT be live.
++    //
++    // A LIVE datetime field recomputes from the system clock at render time, so
++    // converting sat15.pptx stamped the CONVERSION date (08/21/2026) over the
++    // date the deck actually shows (1/22/16, cached by PowerPoint in <a:t>).
++    // Three consequences, and the first is the one that matters:
++    //
++    //  1. It is not the document. A converter reproduces what the file shows; a
++    //     user converting an archived deck does not expect today's date printed
++    //     on it.
++    //  2. Output stops being deterministic — the same input yields a different
++    //     PDF every day, which also means it can never match a stored reference.
++    //  3. It leaks WHEN the conversion happened into the output, which is a poor
++    //     fit for a converter whose whole premise is that nothing leaves the
++    //     device.
++    //
++    // Returning no field makes the caller fall back to inserting run->getText(),
++    // i.e. the cached <a:t> string — see the fallback documented at the
++    // insertTextField lambda in shape.cxx.
++    //
++    // NOTE this deliberately diverges from PowerPoint and from the Microsoft
++    // Graph reference, both of which treat datetime1 as auto-updating: the Graph
++    // reference for sat15.pptx renders 7/31/2026, the day it was generated.
++    // Matching them would mean reproducing a value that is in neither the
++    // document nor stable between runs.
++    //
++    // Every OTHER field type stays live — slide number in particular, which is
++    // computed from the slide being rendered and has no cached alternative.
++    if (o3tl::starts_with(msType, u"datetime"))
++        return aFields;
++
+     lclCreateTextFields(aFields, xModel, msType);
+     return aFields;
+ }
