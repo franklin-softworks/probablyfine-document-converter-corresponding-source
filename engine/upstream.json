@@ -1,0 +1,36 @@
+{
+  "_comment": [
+    "THE UPSTREAM LibreOffice THIS PROJECT PATCHES. This file is the DECLARATION;",
+    "libreoffice/ is a gitignored working tree and is not evidence of anything.",
+    "",
+    "Two things depend on this being correct and neither tolerates a guess:",
+    "  1. Reproducibility -- engine/patches/*.patch apply to THIS commit. A different",
+    "     upstream may apply cleanly and still produce different bytes.",
+    "  2. Licence compliance -- MPL-2.0 / LGPLv3+ require Corresponding Source for the",
+    "     soffice.wasm we convey. 'Corresponding' means THIS commit plus our patches;",
+    "     naming the wrong one does not discharge the obligation. See",
+    "     docs/deployment/02-legal-sequence.md 1b.",
+    "",
+    "To move to a new upstream: update commit/version/branch/describe/commit_date",
+    "together, re-apply the patch series, and rebuild. Do not edit one field alone."
+  ],
+
+  "project": "LibreOffice core",
+  "repository": "https://github.com/LibreOffice/core.git",
+  "mirror": "https://git.libreoffice.org/core",
+
+  "commit": "806d09e511ad82dc6c4b801b9ce9ee83cd201ed2",
+  "version": "25.8.6.0.0+",
+  "branch": "libreoffice-25-8",
+  "describe": "libreoffice-25-8-branch-point-973-g806d09e511ad",
+  "commit_date": "2026-01-28T23:06:32+01:00",
+
+  "declared_on": "2026-08-02",
+  "declared_from": "the libreoffice/ tree in the main checkout that produced the current web/modules/ artifacts",
+
+  "clone": [
+    "git clone https://github.com/LibreOffice/core.git libreoffice",
+    "git -C libreoffice checkout 806d09e511ad82dc6c4b801b9ce9ee83cd201ed2",
+    "./engine/scripts/apply_patches.sh"
+  ]
+}

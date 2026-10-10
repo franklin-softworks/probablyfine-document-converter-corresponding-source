@@ -1,0 +1,54 @@
+diff --git a/sw/source/filter/ww8/docxsdrexport.cxx b/sw/source/filter/ww8/docxsdrexport.cxx
+index 20432bb..39fcf34 100644
+--- a/sw/source/filter/ww8/docxsdrexport.cxx
++++ b/sw/source/filter/ww8/docxsdrexport.cxx
+@@ -39,6 +39,8 @@
+ #include <comphelper/sequenceashashmap.hxx>
+ #include <frmfmt.hxx>
+ #include <IDocumentDrawModelAccess.hxx>
++#include <svx/svdlayer.hxx>
++#include <svx/svdmodel.hxx>
+ 
+ #include <svx/svdtrans.hxx>
+ #include <basegfx/matrix/b2dhommatrixtools.hxx>
+@@ -1562,6 +1564,23 @@ void DocxSdrExport::Impl::textFrameShadow(const SwFrameFormat& rFrameFormat)
+                                    XML_offset, aOffset);
+ }
+ 
++#ifdef __EMSCRIPTEN__
++namespace
++{
++/// FG-178: is the object in one of Writer's background ("hell") layers -- the layers
++/// DOCX export marks behindDoc="1" (see the layer test in startDMLAnchorInline)?
++bool lcl_isInBackgroundLayer(const SdrObject& rObj)
++{
++    const SdrLayer* pLayer
++        = rObj.getSdrModelFromSdrObject().GetLayerAdmin().GetLayerPerID(rObj.GetLayer());
++    if (!pLayer)
++        return false;
++    const OUString& rName = pLayer->GetName();
++    return rName == u"Hell" || rName == u"HeaderFooterHell" || rName == u"InvisibleHell";
++}
++}
++#endif
++
+ bool DocxSdrExport::Impl::isSupportedDMLShape(const uno::Reference<drawing::XShape>& xShape,
+                                               const SdrObject* pSdrObject)
+ {
+@@ -1583,6 +1602,16 @@ bool DocxSdrExport::Impl::isSupportedDMLShape(const uno::Reference<drawing::XSha
+                 && eFillStyle == css::drawing::FillStyle_BITMAP)
+                 return true;
+         }
++        // FG-178: VML cannot say "behind the text". The VML writer has no z-index for
++        // Writer's background (hell) layers, so a polygon there went out as a standalone
++        // <w:pict> that Word draws IN FRONT of the text -- while the text frames, written
++        // as DrawingML anchors, got behindDoc="1". PDF import puts every object in the
++        // background layer and many PDFs begin each page with a white full-page fill, so
++        // every page of such a PDF -> DOCX came out blank in Word. In DML the shape gets
++        // behindDoc="1" and its real z-order (relativeHeight), below the text it was
++        // painted before.
++        if (pSdrObject && lcl_isInBackgroundLayer(*pSdrObject))
++            return true;
+ #endif
+         return false;
+     }
