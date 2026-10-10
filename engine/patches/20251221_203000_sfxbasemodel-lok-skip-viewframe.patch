@@ -1,0 +1,19 @@
+diff --git a/sfx2/source/doc/sfxbasemodel.cxx b/sfx2/source/doc/sfxbasemodel.cxx
+--- a/sfx2/source/doc/sfxbasemodel.cxx
++++ b/sfx2/source/doc/sfxbasemodel.cxx
+@@ -1216,6 +1216,15 @@ void SAL_CALL SfxBaseModel::connectController( const Reference< frame::XControll
+ 
+     if ( m_pData->m_seqControllers.size() == 1 )
+     {
++#ifdef __EMSCRIPTEN__
++        // WASM/LOK mode: Skip SfxViewFrame logic for headless controllers
++        // HeadlessController is used for headless document conversion and doesn't have an SfxViewFrame
++        if (comphelper::LibreOfficeKit::isActive())
++        {
++            // No view frame needed for headless conversion
++            return;
++        }
++#endif
+         SfxViewFrame* pViewFrame = SfxViewFrame::Get( xController, GetObjectShell() );
+         ENSURE_OR_THROW( pViewFrame, "SFX document without SFX view!?" );
+         pViewFrame->UpdateDocument_Impl();
