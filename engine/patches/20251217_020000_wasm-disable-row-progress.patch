@@ -1,0 +1,36 @@
+From: Claude <claude@anthropic.com>
+Date: Wed, 17 Dec 2025 02:00:00 +0000
+Subject: [PATCH] WASM: Disable per-row progress updates to reduce boundary crossings
+
+Progress bar updates cross the WASM/JS boundary. For large files with
+100K+ rows, updating progress on every row causes massive overhead.
+This patch disables row progress updates entirely for WASM builds
+since headless conversion doesn't need visual progress indicators.
+
+diff --git a/sc/source/filter/oox/worksheethelper.cxx b/sc/source/filter/oox/worksheethelper.cxx
+index 1234567890ab..0987654321cd 100644
+--- a/sc/source/filter/oox/worksheethelper.cxx
++++ b/sc/source/filter/oox/worksheethelper.cxx
+@@ -903,6 +903,13 @@ void WorksheetGlobals::extendUsedArea( const ScAddress& rAddress )
+ // This is called at a higher frequency inside the (threaded) inner loop.
+ void WorksheetGlobals::UpdateRowProgress( const ScRange& rUsedArea, SCROW nRow )
+ {
++#ifdef __EMSCRIPTEN__
++    // WASM optimization: Skip progress updates entirely.
++    // Each setPosition() call crosses the WASM/JS boundary via UNO.
++    // For files with 100K+ rows, this causes massive overhead.
++    // Headless conversion doesn't need visual progress anyway.
++    (void)rUsedArea; (void)nRow;
++#else
+     if (!mxRowProgress || nRow < rUsedArea.aStart.Row() || rUsedArea.aEnd.Row() < nRow)
+         return;
+
+@@ -915,6 +922,7 @@ void WorksheetGlobals::UpdateRowProgress( const ScRange& rUsedArea, SCROW nRow )
+         if (fCurPos < fNewPos && (fNewPos - fCurPos) > 0.3)
+             // Try not to re-draw progress bar too frequently.
+             mxRowProgress->setPosition(fNewPos);
+     }
++#endif
+ }
+
+ void WorksheetGlobals::initializeWorksheetImport()
