@@ -1,0 +1,19 @@
+From: Claude <claude@anthropic.com>
+Date: Sun, 29 Dec 2025 14:00:00 +0000
+Subject: [PATCH] Add option to preserve accessibility code in WASM builds
+
+The pdf-xlsx module needs accessibility code because PDF import uses
+accessible text handling. This patch documents the intent - upstream
+25.8 already preserves accessibility for the calc module.
+
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac	2026-01-29 12:37:42.674041208 +0000
++++ b/configure.ac	2026-01-29 12:37:42.674063400 +0000
+@@ -4256,6 +4256,7 @@
+         for i in $with_wasm_module; do
+             case "$i" in
+             calc)
++                # PDF import requires accessibility code for text handling
+                 ENABLE_WASM_STRIP_ACCESSIBILITY=
+                 ENABLE_WASM_STRIP_CALC=
+                 ;;
