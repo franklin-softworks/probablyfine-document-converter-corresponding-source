@@ -1,0 +1,34 @@
+diff --git a/sdext/source/pdfimport/tree/writertreevisiting.cxx b/sdext/source/pdfimport/tree/writertreevisiting.cxx
+--- a/sdext/source/pdfimport/tree/writertreevisiting.cxx
++++ b/sdext/source/pdfimport/tree/writertreevisiting.cxx
+@@ -1249,4 +1249,13 @@
+     const GraphicsContext& rGC = m_rProcessor.getGraphicsContext( elem.GCId );
+     aFontProps[ u"fo:color"_ustr ] = getColorString( rFont.isOutline ? rGC.LineColor : rGC.FillColor );
++    // FG-177: text under /ca (or inside a transparency group: FG-176 folds the group's
++    // alpha into the colour record) keeps its alpha. Read back by xmloff's text property
++    // map as CharTransparence (txtprmap.cxx: draw:opacity, import-only), so the import's
++    // namespace prolog needs nothing new. Opaque text is unchanged.
++    {
++        const double fTextAlpha = (rFont.isOutline ? rGC.LineColor : rGC.FillColor).Alpha;
++        if (fTextAlpha < 1.0)
++            aFontProps[ u"draw:opacity"_ustr ] = getPercentString(fTextAlpha * 100.0);
++    }
+ 
+     StyleContainer::Style aStyle( "style:style"_ostr, std::move(aProps) );
+diff --git a/sdext/source/pdfimport/tree/drawtreevisiting.cxx b/sdext/source/pdfimport/tree/drawtreevisiting.cxx
+--- a/sdext/source/pdfimport/tree/drawtreevisiting.cxx
++++ b/sdext/source/pdfimport/tree/drawtreevisiting.cxx
+@@ -1013,4 +1013,13 @@
+     const GraphicsContext& rGC = m_rProcessor.getGraphicsContext( elem.GCId );
+     aFontProps[ u"fo:color"_ustr ] = getColorString( rFont.isOutline ? rGC.LineColor : rGC.FillColor );
++    // FG-177: text under /ca (or inside a transparency group: FG-176 folds the group's
++    // alpha into the colour record) keeps its alpha. Read back by xmloff's text property
++    // map as CharTransparence (txtprmap.cxx: draw:opacity, import-only), so the import's
++    // namespace prolog needs nothing new. Opaque text is unchanged.
++    {
++        const double fTextAlpha = (rFont.isOutline ? rGC.LineColor : rGC.FillColor).Alpha;
++        if (fTextAlpha < 1.0)
++            aFontProps[ u"draw:opacity"_ustr ] = getPercentString(fTextAlpha * 100.0);
++    }
+ 
+     // scale
