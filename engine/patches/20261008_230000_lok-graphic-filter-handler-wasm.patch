@@ -1,0 +1,52 @@
+diff --git a/desktop/source/lib/init.cxx b/desktop/source/lib/init.cxx
+--- a/desktop/source/lib/init.cxx
++++ b/desktop/source/lib/init.cxx
+@@ -173,6 +173,7 @@
+ #include <vcl/vclevent.hxx>
+ #include <vcl/GestureEventPan.hxx>
+ #include <vcl/svapp.hxx>
++#include <vcl/graphicfilter.hxx>
+ #include <unotools/resmgr.hxx>
+ #include <tools/fract.hxx>
+ #include <tools/json_writer.hxx>
+@@ -8374,6 +8375,27 @@
+ 
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// CB-006: Desktop::Main() (desktop/source/app/app.cxx) installs GraphicConverter's
++// filter handler (Application::SetFilterHdl -> Desktop::ImplInitFilterHdl). The
++// unipoll path below calls InitVCL() directly and never runs Desktop::Main(), so
++// the handler stayed unset and GraphicConverter::Export() failed silently. OOXML
++// export calls it for every image with no native GfxLink -- every picture a PDF
++// import makes -- and oox ignores the result, so DOCX/PPTX/XLSX got 0-byte media.
++// Same body as Desktop::ImplInitFilterHdl (a private member there); deferred, so
++// the GraphicFilter (and its configuration) is only created on first use.
++namespace {
++struct LokGraphicFilter
++{
++    DECL_STATIC_LINK(LokGraphicFilter, FilterHdl, ConvertData&, bool);
++};
++}
++IMPL_STATIC_LINK(LokGraphicFilter, FilterHdl, ConvertData&, rData, bool)
++{
++    return GraphicFilter::GetGraphicFilter().GetFilterCallback().Call(rData);
++}
++#endif
++
+ static int lo_initialize(LibreOfficeKit* pThis, const char* pAppPath, const char* pUserProfileUrl)
+ {
+     // Desktop::Main() (desktop/source/app/app.cxx) installs this hook so that
+@@ -8755,6 +8777,12 @@
+                 std::cerr << "[LO_INIT] Unipoll mode: calling InitVCL()..." << std::endl;
+                 InitVCL();
+                 std::cerr << "[LO_INIT] InitVCL() completed" << std::endl;
++#ifdef __EMSCRIPTEN__
++                // CB-006: what Desktop::Main() would have installed (see above).
++                // Per lo_initialize(): DeInitVCL() drops the converter, so a re-init
++                // after lo_destroy() installs it on the new one.
++                Application::SetFilterHdl(LINK(nullptr, LokGraphicFilter, FilterHdl));
++#endif
+             }
+         }
+ 
