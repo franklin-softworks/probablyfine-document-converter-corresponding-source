@@ -1,0 +1,841 @@
+diff --git a/sdext/qa/unit/pdfimport.cxx b/sdext/qa/unit/pdfimport.cxx
+index 68a9b75..63245d2 100644
+--- a/sdext/qa/unit/pdfimport.cxx
++++ b/sdext/qa/unit/pdfimport.cxx
+@@ -443,4 +443,9 @@ namespace
+         }
+ 
++        virtual void shadedFill(const css::geometry::RealRectangle2D&,
++                                const css::uno::Sequence<css::beans::PropertyValue>&) override
++        {
++        }
++
+         typedef std::unordered_map<sal_Int32,FontAttributes> IdToFontMap;
+         typedef std::unordered_map<FontAttributes,sal_Int32,FontAttrHash> FontToIdMap;
+diff --git a/sdext/source/pdfimport/inc/contentsink.hxx b/sdext/source/pdfimport/inc/contentsink.hxx
+index 8121cc3..6275deb 100644
+--- a/sdext/source/pdfimport/inc/contentsink.hxx
++++ b/sdext/source/pdfimport/inc/contentsink.hxx
+@@ -185,4 +185,15 @@ namespace pdfi
+                                        css::geometry::AffineMatrix2D& rMat,
+                                        const css::uno::Sequence<css::beans::PropertyValue>& xTile) = 0;
++
++        /** FG-142: a shading (PDF `sh` operator or shading-pattern fill),
++            rasterized by the wrapper into an RGB+alpha image.
++
++            rRect is in the same coordinate space as a path AFTER the current
++            transformation (the wrapper's device space, where the current clip
++            is kept). The sink fills (current clip ∩ rRect) with xImage
++            stretched over rRect.
++         */
++        virtual void shadedFill(const css::geometry::RealRectangle2D& rRect,
++                                const css::uno::Sequence<css::beans::PropertyValue>& xImage) = 0;
+     };
+ 
+diff --git a/sdext/source/pdfimport/inc/genericelements.hxx b/sdext/source/pdfimport/inc/genericelements.hxx
+index 13350df..b691bea 100644
+--- a/sdext/source/pdfimport/inc/genericelements.hxx
++++ b/sdext/source/pdfimport/inc/genericelements.hxx
+@@ -229,4 +229,7 @@ namespace pdfi
+         double                  TileWidth;
+         double                  TileHeight;
++        /// FG-142: FillImage is stretched over the polygon's bounding box
++        /// (style:repeat="stretch") instead of tiled at TileWidth x TileHeight.
++        bool                    StretchFillImage = false;
+     };
+ 
+diff --git a/sdext/source/pdfimport/inc/pdfiprocessor.hxx b/sdext/source/pdfimport/inc/pdfiprocessor.hxx
+index f025fc3..fdb6078 100644
+--- a/sdext/source/pdfimport/inc/pdfiprocessor.hxx
++++ b/sdext/source/pdfimport/inc/pdfiprocessor.hxx
+@@ -162,4 +162,7 @@ namespace pdfi
+                                        const css::uno::Sequence<css::beans::PropertyValue>& xTile) override;
+ 
++        virtual void shadedFill(const css::geometry::RealRectangle2D& rRect,
++                                const css::uno::Sequence<css::beans::PropertyValue>& xImage) override;
++
+         void startIndicator( const OUString& rText );
+         void endIndicator();
+diff --git a/sdext/source/pdfimport/tree/drawtreevisiting.cxx b/sdext/source/pdfimport/tree/drawtreevisiting.cxx
+index 66303dd..721487c 100644
+--- a/sdext/source/pdfimport/tree/drawtreevisiting.cxx
++++ b/sdext/source/pdfimport/tree/drawtreevisiting.cxx
+@@ -914,6 +914,15 @@ void DrawXmlFinalizer::visit( PolyPolyElement& elem, const std::list< std::uniqu
+             m_rStyleContainer.getStyleName(
+             m_rStyleContainer.getStyleId(style));
+-        aGCProps[ u"draw:fill-image-width"_ustr ] = unitMMString(convPx2mm(elem.TileWidth));
+-        aGCProps[ u"draw:fill-image-height"_ustr ] = unitMMString(convPx2mm(elem.TileHeight));
++        if (elem.StretchFillImage)
++        {
++            // FG-142: a rasterized shading covers the shape's bounding box
++            // exactly; stretching keeps it aligned (exports as a:stretch).
++            aGCProps[ u"style:repeat"_ustr ] = "stretch";
++        }
++        else
++        {
++            aGCProps[ u"draw:fill-image-width"_ustr ] = unitMMString(convPx2mm(elem.TileWidth));
++            aGCProps[ u"draw:fill-image-height"_ustr ] = unitMMString(convPx2mm(elem.TileHeight));
++        }
+ 
+     }
+diff --git a/sdext/source/pdfimport/tree/pdfiprocessor.cxx b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+index 101975e..c6e431a 100644
+--- a/sdext/source/pdfimport/tree/pdfiprocessor.cxx
++++ b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+@@ -40,4 +40,5 @@
+ #include <i18nutil/unicode.hxx>
+ #include <o3tl/string_view.hxx>
++#include <algorithm>
+ 
+ #ifdef __EMSCRIPTEN__
+@@ -478,4 +479,44 @@ void PDFIProcessor::tilingPatternFill(int nX0, int nY0, int nX1, int nY1,
+ }
+ 
++// FG-142: one rasterized shading. rRect comes from the wrapper in device
++// space, which is where a path lands after getCurrentContext().Transformation
++// and where Clip is already kept (see intersectClip), so it is NOT
++// transformed here. The painted region is the clip, cut to the rectangle the
++// bitmap covers; the bitmap is stretched over the element's bounding box, so
++// the element's bounds must be exactly that rectangle's intersection with
++// the clip's tight bounds -- the wrapper sized the raster to the same tight
++// bounds (PDFOutDev::m_aTightClip).
++void PDFIProcessor::shadedFill(const geometry::RealRectangle2D& rRect,
++                               const uno::Sequence<beans::PropertyValue>& xImage)
++{
++    const basegfx::B2DRange aRect(
++        std::min(rRect.X1, rRect.X2), std::min(rRect.Y1, rRect.Y2),
++        std::max(rRect.X1, rRect.X2), std::max(rRect.Y1, rRect.Y2));
++    if (aRect.isEmpty())
++        return;
++
++    basegfx::B2DPolyPolygon aPoly;
++    const basegfx::B2DPolyPolygon& rClip = getCurrentContext().Clip;
++    if (rClip.count())
++        aPoly = basegfx::utils::clipPolyPolygonOnRange(rClip, aRect,
++                    true, /* bInside */
++                    false /* bStroke */);
++    else
++        aPoly = basegfx::B2DPolyPolygon(basegfx::utils::createPolygonFromRect(aRect));
++    if (!aPoly.count())
++        return;
++
++    PolyPolyElement* pPoly = ElementFactory::createPolyPolyElement(
++        m_pCurElement,
++        getGCId(getCurrentContext()),
++        aPoly,
++        PATH_FILL,
++        m_aImages.addImage(xImage),
++        0, 0);
++    pPoly->StretchFillImage = true;
++    pPoly->updateGeometry();
++    pPoly->ZOrder = m_nNextZOrder++;
++}
++
+ void PDFIProcessor::strokePath( const uno::Reference< rendering::XPolyPolygon2D >& rPath )
+ {
+diff --git a/sdext/source/pdfimport/tree/writertreevisiting.cxx b/sdext/source/pdfimport/tree/writertreevisiting.cxx
+index 114884d..58b4a59 100644
+--- a/sdext/source/pdfimport/tree/writertreevisiting.cxx
++++ b/sdext/source/pdfimport/tree/writertreevisiting.cxx
+@@ -1140,6 +1140,15 @@ void WriterXmlFinalizer::visit( PolyPolyElement& elem, const std::list< std::uni
+             m_rStyleContainer.getStyleName(
+             m_rStyleContainer.getStyleId(style));
+-        aGCProps[ u"draw:fill-image-width"_ustr ] = unitMMString(convPx2mm(elem.TileWidth));
+-        aGCProps[ u"draw:fill-image-height"_ustr ] = unitMMString(convPx2mm(elem.TileHeight));
++        if (elem.StretchFillImage)
++        {
++            // FG-142: a rasterized shading covers the shape's bounding box
++            // exactly; stretching keeps it aligned (exports as a:stretch).
++            aGCProps[ u"style:repeat"_ustr ] = "stretch";
++        }
++        else
++        {
++            aGCProps[ u"draw:fill-image-width"_ustr ] = unitMMString(convPx2mm(elem.TileWidth));
++            aGCProps[ u"draw:fill-image-height"_ustr ] = unitMMString(convPx2mm(elem.TileHeight));
++        }
+     }
+ 
+diff --git a/sdext/source/pdfimport/wrapper/keyword_list b/sdext/source/pdfimport/wrapper/keyword_list
+index 470a414..c11a405 100644
+--- a/sdext/source/pdfimport/wrapper/keyword_list
++++ b/sdext/source/pdfimport/wrapper/keyword_list
+@@ -38,4 +38,5 @@ setStrokeColor,SETSTROKECOLOR
+ setTextRenderMode,SETTEXTRENDERMODE
+ setTransformation,SETTRANSFORMATION
++shadedFill,SHADEDFILL
+ startPage,STARTPAGE
+ strokePath,STROKEPATH
+diff --git a/sdext/source/pdfimport/wrapper/wrapper.cxx b/sdext/source/pdfimport/wrapper/wrapper.cxx
+index 4342907..270921f 100644
+--- a/sdext/source/pdfimport/wrapper/wrapper.cxx
++++ b/sdext/source/pdfimport/wrapper/wrapper.cxx
+@@ -112,4 +112,5 @@ enum parseKey {
+     SETTEXTRENDERMODE,
+     SETTRANSFORMATION,
++    SHADEDFILL,
+     STARTPAGE,
+     STROKEPATH,
+@@ -204,4 +205,5 @@ public:
+     void                 readSoftMaskedImage();
+     void                 readTilingPatternFill();
++    void                 readShadedFill();
+ };
+ 
+@@ -854,4 +856,21 @@ void LineParser::readTilingPatternFill()
+ }
+ 
++// FG-142: "shadedFill x0 y0 x1 y1 PNG <size>" + PNG on the binary stream.
++// The rectangle is in device space (the space of a path after the current
++// transformation); the image covers it exactly.
++void LineParser::readShadedFill()
++{
++    double fX0, fY0, fX1, fY1;
++    readDouble(fX0);
++    readDouble(fY0);
++    readDouble(fX1);
++    readDouble(fY1);
++
++    // RGB + alpha PNG
++    const uno::Sequence<beans::PropertyValue> aImage( readImageImpl() );
++
++    m_parser.m_pSink->shadedFill( geometry::RealRectangle2D( fX0, fY0, fX1, fY1 ), aImage );
++}
++
+ void Parser::parseLine( std::string_view aLine )
+ {
+@@ -922,4 +941,6 @@ void Parser::parseLine( std::string_view aLine )
+         case SETPAGENUM:
+             m_pSink->setPageNum( lp.readInt32() ); break;
++        case SHADEDFILL:
++            lp.readShadedFill(); break;
+         case STARTPAGE:
+         {
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+index e844654..0e1ad82 100644
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+@@ -57,4 +57,7 @@
+ #include <memory>
+ #include <vector>
++#include <algorithm>
++#include <cmath>
++#include <limits>
+ 
+ #ifdef EMSCRIPTEN_INLINE_PDFIMPORT
+@@ -674,4 +677,8 @@ void PDFOutDev::startPage(int /*pageNum*/, GfxState* state
+ {
+     assert(state);
++    // FG-142: a new page starts with an unbounded tight clip; GfxState's own
++    // page clip is the fallback.
++    m_aTightClip = ClipBox();
++    m_aTightClipStack.clear();
+     printf("startPage %f %f\n",
+            normalize(state->getPageWidth()),
+@@ -721,4 +728,5 @@ void PDFOutDev::processLink(Link* link, Catalog*)
+ void PDFOutDev::saveState(GfxState*)
+ {
++    m_aTightClipStack.push_back(m_aTightClip);
+     printf( "saveState\n" );
+ }
+@@ -726,4 +734,9 @@ void PDFOutDev::saveState(GfxState*)
+ void PDFOutDev::restoreState(GfxState*)
+ {
++    if (!m_aTightClipStack.empty())
++    {
++        m_aTightClip = m_aTightClipStack.back();
++        m_aTightClipStack.pop_back();
++    }
+     printf( "restoreState\n" );
+ }
+@@ -984,7 +997,8 @@ void PDFOutDev::eoFill(GfxState *state)
+ void PDFOutDev::clip(GfxState *state)
+ {
++    assert(state);
++    intersectTightClipWithPath(state);
+     if (m_bSkipImages)
+         return;
+-    assert(state);
+ 
+     printf( "clipPath" );
+@@ -995,7 +1009,8 @@ void PDFOutDev::clip(GfxState *state)
+ void PDFOutDev::eoClip(GfxState *state)
+ {
++    assert(state);
++    intersectTightClipWithPath(state);
+     if (m_bSkipImages)
+         return;
+-    assert(state);
+ 
+     printf( "eoClipPath" );
+@@ -1006,7 +1021,15 @@ void PDFOutDev::eoClip(GfxState *state)
+ void PDFOutDev::clipToStrokePath(GfxState *state)
+ {
++    assert(state);
++    {
++        // GfxState::clipToStrokePath() has already run (Gfx calls it first),
++        // so its bbox accounts for the line width; a tighter answer would need
++        // the stroked outline, which is not worth it for a clip this rare.
++        double xMin, yMin, xMax, yMax;
++        state->getClipBBox(&xMin, &yMin, &xMax, &yMax);
++        m_aTightClip.intersect(xMin, yMin, xMax, yMax);
++    }
+     if (m_bSkipImages)
+         return;
+-    assert(state);
+ 
+     printf( "clipToStrokePath" );
+@@ -1405,4 +1428,491 @@ poppler_bool PDFOutDev::tilingPatternFill(GfxState *state, Gfx *, Catalog *,
+ // large patterns.
+ #endif
++
++// ---------------------------------------------------------------------------
++// FG-142: shaded fills.
++//
++// PDFOutDev had no shading support, so for every `sh` operator (and every
++// shading-pattern fill) poppler's Gfx decomposed the shading into flat fills:
++// up to 256 colour bands for axial/radial shadings (each radial band is two
++// 200-gons), and up to 4^6 flat quads per patch for mesh shadings. Each of
++// those fills then went through basegfx's general polygon clipper in
++// PDFIProcessor::fillPath and became its own draw:path in the output. One
++// InDesign page produced 56,000 fills for 335 shadings; the whole document
++// 282,000 draw elements, which the Writer layout could not finish.
++//
++// Instead, each shading is rasterized ONCE, in-process, into a nested
++// SplashOutputDev (already linked and used the same way by
++// tilingPatternFill above) covering the current clip's bounding box, which is
++// exactly the region a shading paints. It is emitted as
++//
++//     shadedFill <x0> <y0> <x1> <y1> PNG <size>\n   + <size> bytes of PNG
++//
++// where the rectangle is in device space, i.e. the space a path is in after
++// the current transformation on the LibreOffice side, which is also the space
++// PDFIProcessor keeps its clip in. The sink fills (clip ∩ rect) with the
++// image stretched over the rect. Axial, radial, function and Gouraud
++// shadings are painted by Splash itself; patch meshes (types 6/7) have no
++// Splash hook and are subdivided here, mirroring Gfx::fillPatch, into flat
++// quads painted into the nested device. Any failure returns false BEFORE
++// anything is written, so poppler falls back to its band decomposition and
++// nothing is lost silently.
++// ---------------------------------------------------------------------------
++namespace
++{
++    // ~144 dpi: smooth at print size, and a 300 pt gradient is a 600 px PNG.
++    const double kShadedFillPixelsPerPoint = 2.0;
++    const int    kShadedFillMaxSide        = 1024;
++    const int    kShadedFillMinSide        = 4;
++
++    // mirrors Gfx.cc: patchMaxDepth, patchColorDelta, gouraudParameterizedColorDelta
++    const int    kPatchMaxDepth                   = 6;
++    const double kGouraudParameterizedColorDelta  = 5e-3;
++
++    void lcl_cubicAxisExtrema( double p0, double p1, double p2, double p3,
++                               double& rMin, double& rMax )
++    {
++        // endpoints
++        rMin = std::min(rMin, std::min(p0, p3));
++        rMax = std::max(rMax, std::max(p0, p3));
++        // interior extrema: roots of dB/dt = 3(a t^2 + b t + c)
++        const double a = -p0 + 3.0 * p1 - 3.0 * p2 + p3;
++        const double b = 2.0 * (p0 - 2.0 * p1 + p2);
++        const double c = p1 - p0;
++        double aRoots[2];
++        int nRoots = 0;
++        if (std::fabs(a) < 1e-12)
++        {
++            if (std::fabs(b) > 1e-12)
++                aRoots[nRoots++] = -c / b;
++        }
++        else
++        {
++            const double fDisc = b * b - 4.0 * a * c;
++            if (fDisc >= 0.0)
++            {
++                const double fSq = std::sqrt(fDisc);
++                aRoots[nRoots++] = (-b + fSq) / (2.0 * a);
++                aRoots[nRoots++] = (-b - fSq) / (2.0 * a);
++            }
++        }
++        for (int i = 0; i < nRoots; ++i)
++        {
++            const double t = aRoots[i];
++            if (t <= 0.0 || t >= 1.0)
++                continue;
++            const double u = 1.0 - t;
++            const double v = u * u * u * p0 + 3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t * p3;
++            rMin = std::min(rMin, v);
++            rMax = std::max(rMax, v);
++        }
++    }
++
++    /// Tight device-space bounds of a path (Bezier curves bounded exactly,
++    /// not by their control points). Returns false for an empty path.
++    bool lcl_tightPathBounds( const GfxState* state, const GfxPath* pPath,
++                              double& rXMin, double& rYMin, double& rXMax, double& rYMax )
++    {
++        rXMin = rYMin = std::numeric_limits<double>::infinity();
++        rXMax = rYMax = -std::numeric_limits<double>::infinity();
++        bool bAny = false;
++        const int nSub = pPath ? pPath->getNumSubpaths() : 0;
++        for (int s = 0; s < nSub; ++s)
++        {
++            const GfxSubpath* pSub = pPath->getSubpath(s);
++            const int n = pSub->getNumPoints();
++            if (n <= 0)
++                continue;
++            double fPrevX, fPrevY;
++            state->transform(pSub->getX(0), pSub->getY(0), &fPrevX, &fPrevY);
++            rXMin = std::min(rXMin, fPrevX); rXMax = std::max(rXMax, fPrevX);
++            rYMin = std::min(rYMin, fPrevY); rYMax = std::max(rYMax, fPrevY);
++            bAny = true;
++            int i = 1;
++            while (i < n)
++            {
++                if (pSub->getCurve(i) && i + 2 < n)
++                {
++                    // curveTo: two control points flagged as curve, then the end point
++                    double x1, y1, x2, y2, x3, y3;
++                    state->transform(pSub->getX(i),     pSub->getY(i),     &x1, &y1);
++                    state->transform(pSub->getX(i + 1), pSub->getY(i + 1), &x2, &y2);
++                    state->transform(pSub->getX(i + 2), pSub->getY(i + 2), &x3, &y3);
++                    lcl_cubicAxisExtrema(fPrevX, x1, x2, x3, rXMin, rXMax);
++                    lcl_cubicAxisExtrema(fPrevY, y1, y2, y3, rYMin, rYMax);
++                    fPrevX = x3; fPrevY = y3;
++                    i += 3;
++                }
++                else
++                {
++                    state->transform(pSub->getX(i), pSub->getY(i), &fPrevX, &fPrevY);
++                    rXMin = std::min(rXMin, fPrevX); rXMax = std::max(rXMax, fPrevX);
++                    rYMin = std::min(rYMin, fPrevY); rYMax = std::max(rYMax, fPrevY);
++                    ++i;
++                }
++            }
++        }
++        return bAny;
++    }
++
++    GfxColor lcl_patchFlatColor( const GfxPatch* pPatch, int nColorComps,
++                                 const GfxPatchMeshShading* pShading )
++    {
++        GfxColor aColor = {};
++        if (pShading->isParameterized())
++        {
++            pShading->getParameterizedColor(pPatch->color[0][0].c[0], &aColor);
++        }
++        else
++        {
++            for (int i = 0; i < nColorComps; ++i)
++                aColor.c[i] = GfxColorComp(pPatch->color[0][0].c[i]);
++        }
++        return aColor;
++    }
++
++    /// Port of Gfx::fillPatch (poppler 25.10) painting into the nested device.
++    void lcl_fillPatch( SplashOutputDev& rOut, GfxState& rState,
++                        const GfxPatch* patch, int colorComps, int patchColorComps,
++                        double refineColorThreshold, int depth,
++                        const GfxPatchMeshShading* shading )
++    {
++        int i;
++        for (i = 0; i < patchColorComps; ++i)
++        {
++            if (std::fabs(patch->color[0][0].c[i] - patch->color[0][1].c[i]) > refineColorThreshold
++                || std::fabs(patch->color[0][1].c[i] - patch->color[1][1].c[i]) > refineColorThreshold
++                || std::fabs(patch->color[1][1].c[i] - patch->color[1][0].c[i]) > refineColorThreshold
++                || std::fabs(patch->color[1][0].c[i] - patch->color[0][0].c[i]) > refineColorThreshold)
++            {
++                break;
++            }
++        }
++        if (i == patchColorComps || depth == kPatchMaxDepth)
++        {
++            const GfxColor aFlat = lcl_patchFlatColor(patch, colorComps, shading);
++            rState.setFillColor(&aFlat);
++            rOut.updateFillColor(&rState);
++            rState.moveTo(patch->x[0][0], patch->y[0][0]);
++            rState.curveTo(patch->x[0][1], patch->y[0][1], patch->x[0][2], patch->y[0][2], patch->x[0][3], patch->y[0][3]);
++            rState.curveTo(patch->x[1][3], patch->y[1][3], patch->x[2][3], patch->y[2][3], patch->x[3][3], patch->y[3][3]);
++            rState.curveTo(patch->x[3][2], patch->y[3][2], patch->x[3][1], patch->y[3][1], patch->x[3][0], patch->y[3][0]);
++            rState.curveTo(patch->x[2][0], patch->y[2][0], patch->x[1][0], patch->y[1][0], patch->x[0][0], patch->y[0][0]);
++            rState.closePath();
++            rOut.fill(&rState);
++            rState.clearPath();
++            return;
++        }
++
++        GfxPatch patch00, patch01, patch10, patch11;
++        double xx[4][8], yy[4][8];
++        double xxm, yym;
++        for (i = 0; i < 4; ++i)
++        {
++            xx[i][0] = patch->x[i][0];
++            yy[i][0] = patch->y[i][0];
++            xx[i][1] = 0.5 * (patch->x[i][0] + patch->x[i][1]);
++            yy[i][1] = 0.5 * (patch->y[i][0] + patch->y[i][1]);
++            xxm = 0.5 * (patch->x[i][1] + patch->x[i][2]);
++            yym = 0.5 * (patch->y[i][1] + patch->y[i][2]);
++            xx[i][6] = 0.5 * (patch->x[i][2] + patch->x[i][3]);
++            yy[i][6] = 0.5 * (patch->y[i][2] + patch->y[i][3]);
++            xx[i][2] = 0.5 * (xx[i][1] + xxm);
++            yy[i][2] = 0.5 * (yy[i][1] + yym);
++            xx[i][5] = 0.5 * (xxm + xx[i][6]);
++            yy[i][5] = 0.5 * (yym + yy[i][6]);
++            xx[i][3] = xx[i][4] = 0.5 * (xx[i][2] + xx[i][5]);
++            yy[i][3] = yy[i][4] = 0.5 * (yy[i][2] + yy[i][5]);
++            xx[i][7] = patch->x[i][3];
++            yy[i][7] = patch->y[i][3];
++        }
++        for (i = 0; i < 4; ++i)
++        {
++            patch00.x[0][i] = xx[0][i];
++            patch00.y[0][i] = yy[0][i];
++            patch00.x[1][i] = 0.5 * (xx[0][i] + xx[1][i]);
++            patch00.y[1][i] = 0.5 * (yy[0][i] + yy[1][i]);
++            xxm = 0.5 * (xx[1][i] + xx[2][i]);
++            yym = 0.5 * (yy[1][i] + yy[2][i]);
++            patch10.x[2][i] = 0.5 * (xx[2][i] + xx[3][i]);
++            patch10.y[2][i] = 0.5 * (yy[2][i] + yy[3][i]);
++            patch00.x[2][i] = 0.5 * (patch00.x[1][i] + xxm);
++            patch00.y[2][i] = 0.5 * (patch00.y[1][i] + yym);
++            patch10.x[1][i] = 0.5 * (xxm + patch10.x[2][i]);
++            patch10.y[1][i] = 0.5 * (yym + patch10.y[2][i]);
++            patch00.x[3][i] = 0.5 * (patch00.x[2][i] + patch10.x[1][i]);
++            patch00.y[3][i] = 0.5 * (patch00.y[2][i] + patch10.y[1][i]);
++            patch10.x[0][i] = patch00.x[3][i];
++            patch10.y[0][i] = patch00.y[3][i];
++            patch10.x[3][i] = xx[3][i];
++            patch10.y[3][i] = yy[3][i];
++        }
++        for (i = 4; i < 8; ++i)
++        {
++            patch01.x[0][i - 4] = xx[0][i];
++            patch01.y[0][i - 4] = yy[0][i];
++            patch01.x[1][i - 4] = 0.5 * (xx[0][i] + xx[1][i]);
++            patch01.y[1][i - 4] = 0.5 * (yy[0][i] + yy[1][i]);
++            xxm = 0.5 * (xx[1][i] + xx[2][i]);
++            yym = 0.5 * (yy[1][i] + yy[2][i]);
++            patch11.x[2][i - 4] = 0.5 * (xx[2][i] + xx[3][i]);
++            patch11.y[2][i - 4] = 0.5 * (yy[2][i] + yy[3][i]);
++            patch01.x[2][i - 4] = 0.5 * (patch01.x[1][i - 4] + xxm);
++            patch01.y[2][i - 4] = 0.5 * (patch01.y[1][i - 4] + yym);
++            patch11.x[1][i - 4] = 0.5 * (xxm + patch11.x[2][i - 4]);
++            patch11.y[1][i - 4] = 0.5 * (yym + patch11.y[2][i - 4]);
++            patch01.x[3][i - 4] = 0.5 * (patch01.x[2][i - 4] + patch11.x[1][i - 4]);
++            patch01.y[3][i - 4] = 0.5 * (patch01.y[2][i - 4] + patch11.y[1][i - 4]);
++            patch11.x[0][i - 4] = patch01.x[3][i - 4];
++            patch11.y[0][i - 4] = patch01.y[3][i - 4];
++            patch11.x[3][i - 4] = xx[3][i];
++            patch11.y[3][i - 4] = yy[3][i];
++        }
++        for (i = 0; i < patchColorComps; ++i)
++        {
++            patch00.color[0][0].c[i] = patch->color[0][0].c[i];
++            patch00.color[0][1].c[i] = (patch->color[0][0].c[i] + patch->color[0][1].c[i]) / 2.;
++            patch01.color[0][0].c[i] = patch00.color[0][1].c[i];
++            patch01.color[0][1].c[i] = patch->color[0][1].c[i];
++            patch01.color[1][1].c[i] = (patch->color[0][1].c[i] + patch->color[1][1].c[i]) / 2.;
++            patch11.color[0][1].c[i] = patch01.color[1][1].c[i];
++            patch11.color[1][1].c[i] = patch->color[1][1].c[i];
++            patch11.color[1][0].c[i] = (patch->color[1][1].c[i] + patch->color[1][0].c[i]) / 2.;
++            patch10.color[1][1].c[i] = patch11.color[1][0].c[i];
++            patch10.color[1][0].c[i] = patch->color[1][0].c[i];
++            patch10.color[0][0].c[i] = (patch->color[1][0].c[i] + patch->color[0][0].c[i]) / 2.;
++            patch00.color[1][0].c[i] = patch10.color[0][0].c[i];
++            patch00.color[1][1].c[i] = (patch00.color[1][0].c[i] + patch01.color[1][1].c[i]) / 2.;
++            patch01.color[1][0].c[i] = patch00.color[1][1].c[i];
++            patch11.color[0][0].c[i] = patch00.color[1][1].c[i];
++            patch10.color[0][1].c[i] = patch00.color[1][1].c[i];
++        }
++        lcl_fillPatch(rOut, rState, &patch00, colorComps, patchColorComps, refineColorThreshold, depth + 1, shading);
++        lcl_fillPatch(rOut, rState, &patch10, colorComps, patchColorComps, refineColorThreshold, depth + 1, shading);
++        lcl_fillPatch(rOut, rState, &patch01, colorComps, patchColorComps, refineColorThreshold, depth + 1, shading);
++        lcl_fillPatch(rOut, rState, &patch11, colorComps, patchColorComps, refineColorThreshold, depth + 1, shading);
++    }
++}
++
++void PDFOutDev::ClipBox::intersect( double x0, double y0, double x1, double y1 )
++{
++    if (x0 > x1) std::swap(x0, x1);
++    if (y0 > y1) std::swap(y0, y1);
++    if (!bValid)
++    {
++        bValid = true;
++        fXMin = x0; fYMin = y0; fXMax = x1; fYMax = y1;
++        return;
++    }
++    fXMin = std::max(fXMin, x0);
++    fYMin = std::max(fYMin, y0);
++    fXMax = std::min(fXMax, x1);
++    fYMax = std::min(fYMax, y1);
++}
++
++void PDFOutDev::intersectTightClipWithPath( const GfxState* state )
++{
++    double xMin, yMin, xMax, yMax;
++    if (lcl_tightPathBounds(state, state->getPath(), xMin, yMin, xMax, yMax))
++        m_aTightClip.intersect(xMin, yMin, xMax, yMax);
++    else
++        m_aTightClip.intersect(0, 0, 0, 0); // empty clip
++}
++
++poppler_bool PDFOutDev::useShadedFills(int type)
++{
++    return type >= 1 && type <= 7;
++}
++
++poppler_bool PDFOutDev::shadedFillImpl( GfxState* state, GfxShading* shading,
++                                        const std::function<bool(SplashOutputDev&, GfxState&)>& rPaint )
++{
++    assert(state);
++    assert(shading);
++
++    // Same contract as tilingPatternFill: with images skipped, claim the fill
++    // so poppler does not decompose it into thousands of band fills.
++    if (m_bSkipImages)
++        return true;
++
++    // The region a shading paints is the current clip (Gfx::opShFill and
++    // doShadingPatternFill have already intersected it with the shading's
++    // BBox and, for pattern fills, the filled path). Start from GfxState's
++    // clip bbox and tighten it with the exact curve bounds tracked in clip().
++    double xMin, yMin, xMax, yMax;
++    state->getClipBBox(&xMin, &yMin, &xMax, &yMax);
++    if (m_aTightClip.bValid)
++    {
++        xMin = std::max(xMin, m_aTightClip.fXMin);
++        yMin = std::max(yMin, m_aTightClip.fYMin);
++        xMax = std::min(xMax, m_aTightClip.fXMax);
++        yMax = std::min(yMax, m_aTightClip.fYMax);
++    }
++    if (!std::isfinite(xMin) || !std::isfinite(yMin) || !std::isfinite(xMax) || !std::isfinite(yMax))
++        return false;
++    if (!(xMax > xMin) || !(yMax > yMin))
++    {
++        // Empty clip: the shading paints nothing. Claiming it is exact and
++        // saves poppler the band decomposition.
++        return true;
++    }
++
++    // Raster size: ~2 px/pt (device space has getHDPI()/72 units per pt), longest side clamped.
++    const double fW = xMax - xMin;
++    const double fH = yMax - yMin;
++    const double fLongest = std::max(fW, fH);
++    double fScale = kShadedFillPixelsPerPoint * 72.0 / (state->getHDPI() > 0 ? state->getHDPI() : 72.0);
++    if (fLongest * fScale > kShadedFillMaxSide)
++        fScale = kShadedFillMaxSide / fLongest;
++    if (fLongest * fScale < kShadedFillMinSide)
++        fScale = kShadedFillMinSide / fLongest;
++    const int nW = std::max(1, static_cast<int>(std::ceil(fW * fScale - 1e-9)));
++    const int nH = std::max(1, static_cast<int>(std::ceil(fH * fScale - 1e-9)));
++    // The bitmap covers [xMin, xMin + nW/fScale) x [yMin, yMin + nH/fScale),
++    // which can exceed the clip bbox by less than a pixel because of the
++    // ceil; emit THAT rectangle so the stretched image lines up exactly.
++    const double fX1 = xMin + nW / fScale;
++    const double fY1 = yMin + nH / fScale;
++
++    // Nested state in pixel space. The CTM maps user space -> device space
++    // (the current CTM) -> pixels (scale about the raster origin). Device
++    // space is already top-down (upsideDown() is true for this device), so
++    // bitmap row 0 is device y == yMin and no flip is needed; contrast with
++    // tilingPatternFill, which renders pattern space (y up) and flips.
++    PDFRectangle aBox(0, 0, nW, nH);
++    GfxState aState(72.0, 72.0, &aBox, 0, false);
++    aState.setCTM(fScale, 0, 0, fScale, -fScale * xMin, -fScale * yMin);
++    const double* pCTM = state->getCTM();
++    aState.concatCTM(pCTM[0], pCTM[1], pCTM[2], pCTM[3], pCTM[4], pCTM[5]);
++    aState.setFillColorSpace(shading->getColorSpace()->copy());
++
++    SplashOutputDev aSplashOut(splashModeRGB8, 1, false, nullptr);
++    aSplashOut.setEnableFreeType(false);
++    aSplashOut.startDoc(m_pDoc);
++    aSplashOut.startPage(0 /* pageNum */, &aState, nullptr /* xref */);
++    aSplashOut.updateFillColorSpace(&aState);
++
++    if (!rPaint(aSplashOut, aState))
++        return false; // nothing written yet: poppler falls back to bands
++
++    std::unique_ptr<SplashBitmap> pSplashBitmap(aSplashOut.takeBitmap());
++    if (!pSplashBitmap || !pSplashBitmap->getDataPtr() || !pSplashBitmap->getAlphaPtr())
++        return false;
++
++    const auto nBitmapWidth  = static_cast<size_t>(pSplashBitmap->getWidth());
++    const auto nBitmapHeight = static_cast<size_t>(pSplashBitmap->getHeight());
++    if (nBitmapWidth == 0 || nBitmapHeight == 0)
++        return false;
++    // bitmapRowPad == 1 and RGB8: rows are contiguous, 3 bytes per pixel.
++    if (static_cast<size_t>(pSplashBitmap->getRowSize()) != nBitmapWidth * 3)
++        return false;
++
++    char* pBitmapData = reinterpret_cast<char*>(pSplashBitmap->getDataPtr());
++
++#if POPPLER_CHECK_VERSION(25, 5, 0)
++    std::unique_ptr<MemStream> pRgbStr(new MemStream(pBitmapData, 0,
++        nBitmapWidth * nBitmapHeight * 3, Object::null()));
++    std::unique_ptr<MemStream> pAlphaStr(new MemStream(reinterpret_cast<char*>(pSplashBitmap->getAlphaPtr()),
++        0, nBitmapWidth * nBitmapHeight, Object::null()));
++    auto aDecode = Object::null();
++#else
++    std::unique_ptr<MemStream> pRgbStr(new MemStream(pBitmapData, 0,
++        nBitmapWidth * nBitmapHeight * 3, Object(objNull)));
++    std::unique_ptr<MemStream> pAlphaStr(new MemStream(reinterpret_cast<char*>(pSplashBitmap->getAlphaPtr()),
++        0, nBitmapWidth * nBitmapHeight, Object(objNull)));
++    auto aDecode = Object(objNull);
++#endif
++#if POPPLER_CHECK_VERSION(24, 10, 0)
++    std::unique_ptr<GfxImageColorMap> pRgbIdentityColorMap(new GfxImageColorMap(8, &aDecode,
++        std::make_unique<GfxDeviceRGBColorSpace>()));
++    std::unique_ptr<GfxImageColorMap> pGrayIdentityColorMap(new GfxImageColorMap(8, &aDecode,
++        std::make_unique<GfxDeviceGrayColorSpace>()));
++#else
++    std::unique_ptr<GfxImageColorMap> pRgbIdentityColorMap(new GfxImageColorMap(8, &aDecode,
++        new GfxDeviceRGBColorSpace()));
++    std::unique_ptr<GfxImageColorMap> pGrayIdentityColorMap(new GfxImageColorMap(8, &aDecode,
++        new GfxDeviceGrayColorSpace()));
++#endif
++
++    // Record: "shadedFill x0 y0 x1 y1" then writePng_ appends " PNG <size>\n"
++    // and writeBinaryBuffer puts the PNG on the binary stream, exactly like
++    // tilingPatternFill. Nothing may be written before this point.
++    printf( "shadedFill %f %f %f %f",
++            normalize(xMin), normalize(yMin), normalize(fX1), normalize(fY1) );
++
++    OutputBuffer aBuf; initBuf(aBuf);
++    writePng_(aBuf, pRgbStr.get(), nBitmapWidth, nBitmapHeight, pRgbIdentityColorMap.get(),
++        pAlphaStr.get(), nBitmapWidth, nBitmapHeight, pGrayIdentityColorMap.get());
++    writeBinaryBuffer(aBuf);
++
++    return true;
++}
++
++poppler_bool PDFOutDev::functionShadedFill(GfxState *state, GfxFunctionShading *shading)
++{
++    return shadedFillImpl(state, shading,
++        [shading](SplashOutputDev& rOut, GfxState& rState)
++        { return rOut.functionShadedFill(&rState, shading); });
++}
++
++poppler_bool PDFOutDev::axialShadedFill(GfxState *state, GfxAxialShading *shading,
++                                        double tMin, double tMax)
++{
++    return shadedFillImpl(state, shading,
++        [shading, tMin, tMax](SplashOutputDev& rOut, GfxState& rState)
++        { return rOut.axialShadedFill(&rState, shading, tMin, tMax); });
++}
++
++poppler_bool PDFOutDev::radialShadedFill(GfxState *state, GfxRadialShading *shading,
++                                         double sMin, double sMax)
++{
++    return shadedFillImpl(state, shading,
++        [shading, sMin, sMax](SplashOutputDev& rOut, GfxState& rState)
++        { return rOut.radialShadedFill(&rState, shading, sMin, sMax); });
++}
++
++poppler_bool PDFOutDev::gouraudTriangleShadedFill(GfxState *state, GfxGouraudTriangleShading *shading)
++{
++    return shadedFillImpl(state, shading,
++        [shading](SplashOutputDev& rOut, GfxState& rState)
++        { return rOut.gouraudTriangleShadedFill(&rState, shading); });
++}
++
++poppler_bool PDFOutDev::patchMeshShadedFill(GfxState *state, GfxPatchMeshShading *shading)
++{
++    // Splash has no patch-mesh entry point; subdivide as Gfx::doPatchMeshShFill
++    // does and paint the flat quads into the nested device, with antialiasing
++    // off so adjacent quads do not show seams.
++    return shadedFillImpl(state, shading,
++        [shading](SplashOutputDev& rOut, GfxState& rState)
++        {
++            const int nPatches = shading->getNPatches();
++            int nStart;
++            if (nPatches > 128)
++                nStart = 3;
++            else if (nPatches > 64)
++                nStart = 2;
++            else if (nPatches > 16)
++                nStart = 1;
++            else
++                nStart = 0;
++
++            const int nColorComps = shading->getColorSpace()->getNComps();
++            double fRefineColorThreshold;
++            if (shading->isParameterized())
++                fRefineColorThreshold = kGouraudParameterizedColorDelta
++                    * (shading->getParameterDomainMax() - shading->getParameterDomainMin());
++            else
++                fRefineColorThreshold = dblToCol(3. / 256.0); // patchColorDelta
++
++            rOut.setVectorAntialias(false);
++            for (int i = 0; i < nPatches; ++i)
++            {
++                lcl_fillPatch(rOut, rState, shading->getPatch(i), nColorComps,
++                              shading->isParameterized() ? 1 : nColorComps,
++                              fRefineColorThreshold, nStart, shading);
++            }
++            return true;
++        });
++}
+ }
+ 
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
+index 4d0ff48..384d613 100644
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
+@@ -52,8 +52,10 @@
+ #include <vector>
+ #include <memory>
++#include <functional>
+ 
+ class GfxPath;
+ class GfxFont;
+ class PDFDoc;
++class SplashOutputDev;
+ #include <cpp/poppler-version.h>
+ #define POPPLER_CHECK_VERSION(major,minor,micro) \
+@@ -151,4 +153,28 @@ namespace pdfi
+         bool                                    m_bSkipImages;
+ 
++        // FG-142: tight device-space bounding box of the current clip path.
++        // GfxState::getClipBBox() is the hull of the clip's Bezier CONTROL
++        // points, which is larger than the curve for anything but axis-aligned
++        // arcs. A shaded fill is emitted as the clip polygon filled with a
++        // bitmap stretched over its bounding box, so the bitmap must cover the
++        // tight box or the gradient is displaced. Mirrors the GfxState clip
++        // stack via saveState/restoreState.
++        struct ClipBox
++        {
++            bool   bValid = false;
++            double fXMin = 0, fYMin = 0, fXMax = 0, fYMax = 0;
++            void intersect( double x0, double y0, double x1, double y1 );
++        };
++        ClipBox                                 m_aTightClip;
++        std::vector<ClipBox>                    m_aTightClipStack;
++        void intersectTightClipWithPath( const GfxState* state );
++
++        /// Rasterizes one shading into a nested Splash device covering the
++        /// current clip's bounding box and emits a "shadedFill" record.
++        /// Returns false (and emits nothing) when poppler should fall back to
++        /// its band decomposition.
++        poppler_bool shadedFillImpl( GfxState* state, GfxShading* shading,
++                                     const std::function<bool(SplashOutputDev&, GfxState&)>& rPaint );
++
+         int  parseFont( long long nNewId, GfxFont* pFont, const GfxState* state ) const;
+         void writeFontFile( GfxFont* gfxFont ) const;
+@@ -306,4 +332,18 @@ namespace pdfi
+                                        double xStep, double yStep) override;
+ #endif
++
++        //----- shaded fills (FG-142). Without these, poppler decomposes every
++        //      shading into up to 256 flat bands (Gfx::doAxialShFill /
++        //      doRadialShFill) and every mesh patch into up to 4^6 flat quads,
++        //      each of which becomes a clipped polygon on the LibreOffice side.
++        poppler_bool useShadedFills(int type) override;
++        poppler_bool functionShadedFill(GfxState *state, GfxFunctionShading *shading) override;
++        poppler_bool axialShadedFill(GfxState *state, GfxAxialShading *shading,
++                                     double tMin, double tMax) override;
++        poppler_bool radialShadedFill(GfxState *state, GfxRadialShading *shading,
++                                      double sMin, double sMax) override;
++        poppler_bool gouraudTriangleShadedFill(GfxState *state,
++                                               GfxGouraudTriangleShading *shading) override;
++        poppler_bool patchMeshShadedFill(GfxState *state, GfxPatchMeshShading *shading) override;
+     };
+ }

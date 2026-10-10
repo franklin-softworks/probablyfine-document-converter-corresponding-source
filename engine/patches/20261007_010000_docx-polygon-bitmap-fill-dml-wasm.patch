@@ -1,0 +1,28 @@
+diff --git a/sw/source/filter/ww8/docxsdrexport.cxx b/sw/source/filter/ww8/docxsdrexport.cxx
+--- a/sw/source/filter/ww8/docxsdrexport.cxx
++++ b/sw/source/filter/ww8/docxsdrexport.cxx
+@@ -1568,7 +1568,24 @@
+     uno::Reference<lang::XServiceInfo> xServiceInfo(xShape, uno::UNO_QUERY_THROW);
+     if (xServiceInfo->supportsService(u"com.sun.star.drawing.PolyPolygonShape"_ustr)
+         || xServiceInfo->supportsService(u"com.sun.star.drawing.PolyLineShape"_ustr))
++    {
++#ifdef __EMSCRIPTEN__
++        // FG-142: the VML fallback writes a bitmap fill as <v:fill type="frame"> with no
++        // image reference, so a polygon filled with a bitmap (a PDF shading imported as a
++        // stretched image) vanished from the DOCX. A closed polygon goes through the same
++        // oox writer as a ClosedBezierShape, which already exports bitmap fills in DML;
++        // use DML for exactly that case and keep VML for everything else.
++        if (xServiceInfo->supportsService(u"com.sun.star.drawing.PolyPolygonShape"_ustr))
++        {
++            uno::Reference<beans::XPropertySet> xProps(xShape, uno::UNO_QUERY);
++            css::drawing::FillStyle eFillStyle = css::drawing::FillStyle_NONE;
++            if (xProps.is() && (xProps->getPropertyValue(u"FillStyle"_ustr) >>= eFillStyle)
++                && eFillStyle == css::drawing::FillStyle_BITMAP)
++                return true;
++        }
++#endif
+         return false;
++    }
+ 
+     uno::Reference<beans::XPropertySet> xShapeProperties(xShape, uno::UNO_QUERY);
+     // For signature line shapes, we don't want DML, just the VML shape.
