@@ -1,0 +1,1177 @@
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+index 42c2aa6..64a6d1f 100644
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+@@ -684,4 +684,12 @@ void PDFOutDev::startPage(int /*pageNum*/, GfxState* state
+     m_nKnockoutDepth = 0;
+     m_fGroupAlpha = 1.0;
++    m_aGroupBlend.clear(); // FG-177b
++    m_nBlendLayerDepth = 0;
++    m_nBlendSuppressDepth = 0;
++    m_nBlendVectorDepth = 0;
++    m_nBlendCount = 0;
++    m_nBlendLayersEmitted = 0;
++    m_nBlendGroupsVector = 0;
++    m_nBlendGroupsKept = 0;
+     // FG-175: spans are per page; the store set for this page is trusted
+     // until a span has no recorded layer.
+@@ -701,4 +709,8 @@ void PDFOutDev::endPage()
+         fprintf(stderr, "[SMASK] page %d: span count differs: this pass %d, recorder %d\n",
+                 m_nBeatPage, m_aSpans.spanCount(), m_pLayers->nSpans);
++    if (m_nBlendCount > 0) // FG-177b
++        fprintf(stderr, "[BLEND] page %d: multiply groups=%d (recorder %d), layers emitted=%d, vector=%d, kept per element=%d\n",
++                m_nBeatPage, m_nBlendCount, m_pLayers && m_pLayers->bUsable ? m_pLayers->nBlendGroups : -1,
++                m_nBlendLayersEmitted, m_nBlendGroupsVector, m_nBlendGroupsKept);
+     printf("endPage\n");
+ }
+@@ -847,22 +859,64 @@ void PDFOutDev::emitSoftMaskLayer( GfxState* state, int nOrdinal )
+         return;
+ 
+-    // Same record and space as shadedFillImpl: a bitmap stretched over a
+-    // device-space rectangle. Recorder px -> this device's units.
++    // Splash applied the fill/stroke opacity (/ca, /CA) per operation while
++    // recording, and it may change within the span, so the layer already
++    // carries it. The LibreOffice side would apply the current fill alpha to
++    // the bitmap-filled polygon as well (draw:opacity): emit the layer at
++    // the alpha of the groups enclosing the span (FG-176; 1 outside any
++    // group) and restore the colour record afterwards.
++    const bool bAlpha = state && state->getFillOpacity() != 1.0;
++    GfxRGB aRGB = { 0, 0, 0 };
++    if (bAlpha)
++    {
++        state->getFillRGB( &aRGB );
++        printf( "updateFillColor %f %f %f %f\n",
++                normalize(colToDbl(aRGB.r)), normalize(colToDbl(aRGB.g)),
++                normalize(colToDbl(aRGB.b)), normalize(m_fGroupAlpha) );
++    }
++
++    emitLayerBitmap(pLayer->aRGB.data(), pLayer->aAlpha.data(), pLayer->nW, pLayer->nH,
++                    pLayer->nX, pLayer->nY, pLayer->nW, pLayer->nH);
++
++    if (bAlpha)
++        printf( "updateFillColor %f %f %f %f\n",
++                normalize(colToDbl(aRGB.r)), normalize(colToDbl(aRGB.g)),
++                normalize(colToDbl(aRGB.b)), normalize(state->getFillOpacity() * m_fGroupAlpha) );
++    ++m_nLayersEmitted;
++    beat();
++}
++
++// FG-175/177b: one RGBA bitmap as a "shadedFill" record, the same record and
++// space as shadedFillImpl: a bitmap stretched over a device-space rectangle
++// (here (nX, nY) .. (nX + nRectW, nY + nRectH) in recorder page px; the bitmap
++// may be smaller than the rectangle), clipped by the LibreOffice side to the
++// current clip, at the current fill colour record's alpha. pRGB may be null:
++// black.
++void PDFOutDev::emitLayerBitmap( const unsigned char* pRGB, const unsigned char* pAlpha, int nW, int nH,
++                                 int nX, int nY, int nRectW, int nRectH )
++{
++    const size_t nPixels = static_cast<size_t>(nW) * nH;
++    std::vector<unsigned char> aBlack;
++    if (!pRGB)
++    {
++        aBlack.assign(nPixels * 3, 0);
++        pRGB = aBlack.data();
++    }
++    // Recorder px -> this device's units.
+     const double k = m_fLayerDevPerPx;
+-    const double fX0 = pLayer->nX * k;
+-    const double fY0 = pLayer->nY * k;
+-    const double fX1 = (pLayer->nX + pLayer->nW) * k;
+-    const double fY1 = (pLayer->nY + pLayer->nH) * k;
++    const double fX0 = nX * k;
++    const double fY0 = nY * k;
++    const double fX1 = (nX + nRectW) * k;
++    const double fY1 = (nY + nRectH) * k;
+ 
+     // MemStream does not write through its buffer; the store is read-only here.
+-    char* pRgb = const_cast<char*>(reinterpret_cast<const char*>(pLayer->aRGB.data()));
+-    char* pAlpha = const_cast<char*>(reinterpret_cast<const char*>(pLayer->aAlpha.data()));
++    char* pRgbData = const_cast<char*>(reinterpret_cast<const char*>(pRGB));
++    char* pAlphaData = const_cast<char*>(reinterpret_cast<const char*>(pAlpha));
+ #if POPPLER_CHECK_VERSION(25, 5, 0)
+-    std::unique_ptr<MemStream> pRgbStr(new MemStream(pRgb, 0, nPixels * 3, Object::null()));
+-    std::unique_ptr<MemStream> pAlphaStr(new MemStream(pAlpha, 0, nPixels, Object::null()));
++    std::unique_ptr<MemStream> pRgbStr(new MemStream(pRgbData, 0, nPixels * 3, Object::null()));
++    std::unique_ptr<MemStream> pAlphaStr(new MemStream(pAlphaData, 0, nPixels, Object::null()));
+     auto aDecode = Object::null();
+ #else
+-    std::unique_ptr<MemStream> pRgbStr(new MemStream(pRgb, 0, nPixels * 3, Object(objNull)));
+-    std::unique_ptr<MemStream> pAlphaStr(new MemStream(pAlpha, 0, nPixels, Object(objNull)));
++    std::unique_ptr<MemStream> pRgbStr(new MemStream(pRgbData, 0, nPixels * 3, Object(objNull)));
++    std::unique_ptr<MemStream> pAlphaStr(new MemStream(pAlphaData, 0, nPixels, Object(objNull)));
+     auto aDecode = Object(objNull);
+ #endif
+@@ -879,32 +933,121 @@ void PDFOutDev::emitSoftMaskLayer( GfxState* state, int nOrdinal )
+ #endif
+ 
+-    // Splash applied the fill/stroke opacity (/ca, /CA) per operation while
+-    // recording, and it may change within the span, so the layer already
+-    // carries it. The LibreOffice side would apply the current fill alpha to
+-    // the bitmap-filled polygon as well (draw:opacity): emit the layer at
+-    // the alpha of the groups enclosing the span (FG-176; 1 outside any
+-    // group) and restore the colour record afterwards.
+-    const bool bAlpha = state && state->getFillOpacity() != 1.0;
+-    GfxRGB aRGB = { 0, 0, 0 };
+-    if (bAlpha)
+-    {
+-        state->getFillRGB( &aRGB );
+-        printf( "updateFillColor %f %f %f %f\n",
+-                normalize(colToDbl(aRGB.r)), normalize(colToDbl(aRGB.g)),
+-                normalize(colToDbl(aRGB.b)), normalize(m_fGroupAlpha) );
+-    }
+-
+     printf( "shadedFill %f %f %f %f",
+             normalize(fX0), normalize(fY0), normalize(fX1), normalize(fY1) );
+     OutputBuffer aBuf; initBuf(aBuf);
+-    writePng_(aBuf, pRgbStr.get(), pLayer->nW, pLayer->nH, pRgbIdentityColorMap.get(),
+-        pAlphaStr.get(), pLayer->nW, pLayer->nH, pGrayIdentityColorMap.get());
++    writePng_(aBuf, pRgbStr.get(), nW, nH, pRgbIdentityColorMap.get(),
++        pAlphaStr.get(), nW, nH, pGrayIdentityColorMap.get());
+     writeBinaryBuffer(aBuf);
++}
+ 
+-    if (bAlpha)
+-        printf( "updateFillColor %f %f %f %f\n",
+-                normalize(colToDbl(aRGB.r)), normalize(colToDbl(aRGB.g)),
+-                normalize(colToDbl(aRGB.b)), normalize(state->getFillOpacity() * m_fGroupAlpha) );
+-    ++m_nLayersEmitted;
++// ---------------------------------------------------------------------------
++// FG-177b: blend layers (see the member comment in the header).
++// ---------------------------------------------------------------------------
++
++// The identical predicate to MaskLayerRecorder::blendGroupBegins, on the
++// identical state: the saved-blend-mode stack (the /BM in force at the "Do";
++// Gfx::drawForm has already reset the state's to Normal) and the span
++// tracker, both driven by the same hooks on both devices.
++bool PDFOutDev::blendGroupBegins( bool bForSoftMask ) const
++{
++    return !bForSoftMask && spanTrackerActive() && m_nBlendLayerDepth == 0
++        && !m_aSavedBlendMode.empty()
++        && m_aSavedBlendMode.back() == static_cast<int>(gfxBlendMultiply)
++        && m_aSpans.softMaskDepth() == 0 && !m_aSpans.effectivelyMasked()
++        && !m_aSpans.groupWouldBeMasked();
++}
++
++// Returns 2 when the group is replaced by its recorded layer (emitted here),
++// 1 when it stays on per-element emission. The ordinal advances either way,
++// so that it keeps pairing with the recorder's.
++signed char PDFOutDev::beginBlendGroup( GfxState* state )
++{
++    const int nOrdinal = m_nBlendCount++;
++    if (!layersUsable())
++        return 1;
++    const BlendLayer* pLayer = m_pLayers->getBlend(nOrdinal);
++    if (!pLayer || pLayer->aSignature != m_aSpans.signature())
++    {
++        // The hook sequences diverged: no later ordinal (span or blend) can
++        // be trusted. Fall back for the rest of the page, as FG-175 does.
++        const SoftMaskSpanSignature aNow = m_aSpans.signature();
++        fprintf(stderr, "[BLEND] page %d: multiply group %d %s (recorder saw %d; hooks %ld/%ld, "
++                        "levels %d/%d, groups %d/%d); per-element emission for the rest of the page\n",
++                m_nBeatPage, nOrdinal, pLayer ? "began elsewhere in the recorder" : "has no recorded layer",
++                m_pLayers->nBlendGroups,
++                aNow.nHooks, pLayer ? pLayer->aSignature.nHooks : -1L,
++                aNow.nLevels, pLayer ? pLayer->aSignature.nLevels : -1,
++                aNow.nGroups, pLayer ? pLayer->aSignature.nGroups : -1);
++        m_bLayersUsable = false;
++        return 1;
++    }
++    if (!pLayer->bRecorded || !pLayer->bGrey)
++    {
++        ++m_nBlendGroupsKept;
++        fprintf(stderr, "[BLEND] page %d: multiply group %d kept per element (%s, colour error %d/255)\n",
++                m_nBeatPage, nOrdinal,
++                pLayer->bRecorded ? "coloured" : pLayer->bAbandoned ? "soft mask set inside" : "not recorded",
++                pLayer->nMaxColourError);
++        return 1;
++    }
++    if (pLayer->bPlainGreyFills)
++    {
++        // VECTOR mode: the group's fills follow, recoloured by updateFillColor
++        // to black at (1 - L) times the alpha in force inside the group (the
++        // group's own /ca, applied by FG-176 to m_fGroupAlpha right after
++        // this, times the enclosing groups'). The mark carries the same
++        // alpha, so PDFIProcessor::endAlphaGroup merges the fills' union.
++        // Gfx has reset the state's own opacity to 1 for the content.
++        const double fOwn = m_aSavedFillOpacity.empty() ? 1.0 : m_aSavedFillOpacity.back();
++        const double fAlpha = (1.0 - pLayer->nFillLuminance / 255.0) * m_fGroupAlpha * fOwn;
++        ++m_nBlendGroupsVector;
++        if (!m_bSkipImages)
++        {
++            printf( "beginAlphaGroup %f\n", normalize(fAlpha) );
++            // The record in force is the colour from outside the group; a
++            // fill that inherits it must come out recoloured too.
++            printf( "updateFillColor 0 0 0 %f\n",
++                    normalize((1.0 - fillLuminance(state) / 255.0) * state->getFillOpacity() * m_fGroupAlpha * fOwn) );
++        }
++        return 3;
++    }
++    if (pLayer->nW > 0 && pLayer->nH > 0)
++        emitBlendLayer(state, *pLayer, m_fGroupAlpha);
++    return 2;
++}
++
++int PDFOutDev::fillLuminance( const GfxState* state )
++{
++    GfxRGB aRGB = { 0, 0, 0 };
++    if (state)
++        const_cast<GfxState*>(state)->getFillRGB( &aRGB );
++    const int r = colToByte(aRGB.r), g = colToByte(aRGB.g), b = colToByte(aRGB.b);
++    return (54 * r + 183 * g + 18 * b + 127) / 255;
++}
++
++void PDFOutDev::emitBlendLayer( GfxState* state, const BlendLayer& rLayer, double fEnclosingAlpha )
++{
++    if (m_bSkipImages || !state)
++        return;
++    const size_t nPixels = static_cast<size_t>(rLayer.nW) * rLayer.nH;
++    if (rLayer.aAlpha.size() != nPixels)
++        return;
++    // The group's own /ca, and every /ca inside it, is in the layer: Splash
++    // applied them while compositing. What the LibreOffice side must still
++    // apply (draw:opacity, from the fill colour record) is the ENCLOSING
++    // groups' alpha, so set the record to that for this one shape. Gfx has
++    // reset the state's own opacity to 1 for the group's content; restore
++    // the record the way updateFillColor would write it now.
++    GfxRGB aRGB = { 0, 0, 0 };
++    state->getFillRGB( &aRGB );
++    printf( "updateFillColor %f %f %f %f\n",
++            normalize(colToDbl(aRGB.r)), normalize(colToDbl(aRGB.g)),
++            normalize(colToDbl(aRGB.b)), normalize(fEnclosingAlpha) );
++    emitLayerBitmap(nullptr /* black */, rLayer.aAlpha.data(), rLayer.nW, rLayer.nH,
++                    rLayer.nX, rLayer.nY, rLayer.nRectW, rLayer.nRectH);
++    printf( "updateFillColor %f %f %f %f\n",
++            normalize(colToDbl(aRGB.r)), normalize(colToDbl(aRGB.g)),
++            normalize(colToDbl(aRGB.b)), normalize(state->getFillOpacity() * m_fGroupAlpha) );
++    ++m_nBlendLayersEmitted;
+     beat();
+ }
+@@ -1048,4 +1191,14 @@ void PDFOutDev::updateFillColor(GfxState *state)
+     state->getFillRGB( &aRGB );
+ 
++    if (m_nBlendVectorDepth > 0)
++    {
++        // FG-177b vector mode: Multiply of this grey onto any backdrop is
++        // black at (1 - L); the recorder verified the group's fills are all
++        // this one opaque grey (see beginBlendGroup).
++        printf( "updateFillColor 0 0 0 %f\n",
++                normalize((1.0 - fillLuminance(state) / 255.0) * state->getFillOpacity() * m_fGroupAlpha) );
++        return;
++    }
++
+     printf( "updateFillColor %f %f %f %f\n",
+             normalize(colToDbl(aRGB.r)),
+@@ -1553,6 +1706,4 @@ poppler_bool PDFOutDev::tilingPatternFill(GfxState *state, Gfx *, Catalog *,
+                                           double xStep, double yStep)
+ {
+-    if (suppressed())
+-        return true; // FG-174/175: claimed, nothing painted, see suppressed()
+ #if POPPLER_CHECK_VERSION(25, 9, 0)
+     const std::array<double, 4> pBbox = tPat->getBBox();
+@@ -1566,4 +1717,13 @@ poppler_bool PDFOutDev::tilingPatternFill(GfxState *state, Gfx *, Catalog *,
+     double nHeight = pBbox[3] - pBbox[1];
+ 
++    // FG-177b: inside a Multiply group replaced by its layer, a GAPPED pattern
++    // is declined like everywhere else on this device (the recorder declines it
++    // too), so Gfx runs its tracked per-tile fallback on both devices alike;
++    // the tiles then reach fill(), which suppressed() silences.
++    if (m_nBlendSuppressDepth > 0 && (xStep != nWidth || yStep != nHeight))
++        return false;
++    if (suppressed())
++        return true; // FG-174/175: claimed, nothing painted, see suppressed()
++
+     // If our wrapper is skipping images then we don't need to do anything
+     // but return 'true' so that Poppler doesn't do the slow method
+@@ -2293,9 +2453,17 @@ bool pdfi_process_pdf_inline(
+                 aOutDev.setSoftMaskLayers(nullptr, 1.0);
+ #ifdef PDFI_SOFTMASK_RECORDER
+-                if (!skipImages && pdfi::pageDeclaresSoftMask(aDoc.getPage(i)))
++                // FG-177b: the same pre-pass also records top-level Multiply
++                // groups as blend layers, so a page declaring either runs it.
++                const bool bSoftMaskPage = !skipImages && pdfi::pageDeclaresSoftMask(aDoc.getPage(i));
++                const bool bBlendOnlyPage = !skipImages && !bSoftMaskPage
++                                            && pdfi::pageDeclaresBlendGroup(aDoc.getPage(i));
++                if (bSoftMaskPage || bBlendOnlyPage)
+                 {
+                     const auto aT0 = std::chrono::steady_clock::now();
+-                    const double fDpi = pdfi::chooseSoftMaskRecorderDpi(
+-                        aDoc.getPageMediaWidth(i), aDoc.getPageMediaHeight(i));
++                    // Blend layers are stored at 1 px/pt; with no soft mask on
++                    // the page the recorder need not run at 2.
++                    const double fDpi = bBlendOnlyPage
++                        ? pdfi::chooseBlendRecorderDpi(aDoc.getPageMediaWidth(i), aDoc.getPageMediaHeight(i))
++                        : pdfi::chooseSoftMaskRecorderDpi(aDoc.getPageMediaWidth(i), aDoc.getPageMediaHeight(i));
+                     const std::function<void()> aBeat = [&aOutDev]() { aOutDev.tickHeartbeat(); };
+                     pdfi::recordSoftMaskLayers(aDoc, i, fDpi, aSoftMaskLayers, aBeat);
+@@ -2306,7 +2474,8 @@ bool pdfi_process_pdf_inline(
+                         aOutDev.setSoftMaskLayers(&aSoftMaskLayers, PDF_OUTDEV_RESOLUTION / fDpi);
+                         fprintf(stderr, "[SMASK] page %d: pre-pass %lld ms, %.0f dpi, %dx%d px, "
+-                                        "spans=%d layers=%d bytes=%zu\n",
++                                        "spans=%d layers=%d blend groups=%d (grey %d) bytes=%zu\n",
+                                 i, nMs, fDpi, aSoftMaskLayers.nPageW, aSoftMaskLayers.nPageH,
+                                 aSoftMaskLayers.nSpans, aSoftMaskLayers.nLayersWithPixels,
++                                aSoftMaskLayers.nBlendGroups, aSoftMaskLayers.nBlendLayersGrey,
+                                 aSoftMaskLayers.nBytes);
+                     }
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
+index ee48249..e012844 100644
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
+@@ -194,4 +194,5 @@ namespace pdfi
+         // one is invisible under Multiply anyway, a grey one is a soft shadow
+         // we lose. Everything else in a Multiply group is emitted as before.
++        // That is now the FALLBACK; the blend layers below are the fix.
+         std::vector<bool>                       m_aGroupAlphaMarked;
+         std::vector<int>                        m_aSavedBlendMode; ///< mirrors saveState/restoreState
+@@ -206,4 +207,43 @@ namespace pdfi
+         void emitAlphaGroupMark( bool bBegin );
+ 
++        // FG-177b: BLEND LAYERS. A /BM /Multiply transparency group begun at
++        // the top level (outside any soft-mask span, masked group, mask
++        // definition or other such group) is recorded by the FG-175 pre-pass
++        // as ONE layer -- Splash composites the knockout group, the nested
++        // alpha groups and the group's own /ca -- and converted to black at
++        // per-pixel alpha a*(1-L), which is exactly what Multiply does to any
++        // backdrop when the content is grey (BlendLayer, pdfisoftmask.hxx).
++        // Here the layer is emitted where the group BEGINS (under the group's
++        // clip, at the ENCLOSING groups' alpha) and the group's own content is
++        // then suppressed, except text, which stays text above the layer, at
++        // its source colour and fillOpacity x group alpha, composited Normal
++        // (exact for black text, or over white; a coloured backdrop would be
++        // darkened by Multiply instead).
++        // Not grey, not recorded, or no usable store: the group is emitted per
++        // element exactly as before (blendShadowShading included). Pages with
++        // no Multiply ExtGState are byte-identical to before.
++        // A third mode, VECTOR (BlendLayer::bPlainGreyFills): the group held
++        // only opaque plain fills of one grey, so its Multiply is exactly those
++        // fills recoloured to black at (1 - L); updateFillColor writes that
++        // while m_nBlendVectorDepth > 0, inside a beginAlphaGroup/endAlphaGroup
++        // mark at the same alpha so the LibreOffice side merges overlaps into
++        // one shape. No bitmap at all, and the fills stay vector.
++        std::vector<signed char>                m_aGroupBlend; ///< per open group: 0 none, 1 blend group kept per element, 2 replaced by its layer, 3 vector mode
++        int                                     m_nBlendLayerDepth = 0;    ///< > 0: inside a blend group (any kind); keeps the ordinals aligned with the recorder's
++        int                                     m_nBlendSuppressDepth = 0; ///< > 0: inside a replaced group: paint nothing but text
++        int                                     m_nBlendVectorDepth = 0;   ///< > 0: inside a vector-mode group: fills are black at (1 - L)
++        int                                     m_nBlendCount = 0;         ///< blend groups begun on this page (ordinal)
++        int                                     m_nBlendLayersEmitted = 0;
++        int                                     m_nBlendGroupsVector = 0;
++        int                                     m_nBlendGroupsKept = 0;    ///< coloured or unrecorded: per-element emission kept
++        bool blendGroupBegins( bool bForSoftMask ) const;
++        signed char beginBlendGroup( GfxState* state );
++        void emitBlendLayer( GfxState* state, const BlendLayer& rLayer, double fEnclosingAlpha );
++        /// A bitmap of nW x nH stretched over (nX, nY) .. (nX + nRectW, nY + nRectH), recorder px.
++        void emitLayerBitmap( const unsigned char* pRGB, const unsigned char* pAlpha, int nW, int nH,
++                              int nX, int nY, int nRectW, int nRectH );
++        /// Rec. 709 luminance of the state's fill colour, 0..255, the recorder's arithmetic.
++        static int fillLuminance( const GfxState* state );
++
+         // FG-175: soft masks APPLIED. The span tracker is driven by the same
+         // hooks as MaskLayerRecorder's (pdfisoftmask.hxx); when a span begins
+@@ -225,4 +265,6 @@ namespace pdfi
+             if (m_nSoftMaskDepth > 0)
+                 return true; // FG-174: inside a soft-mask group definition
++            if (m_nBlendSuppressDepth > 0)
++                return true; // FG-177b: inside a Multiply group replaced by its layer
+             return layersUsable() && m_aSpans.effectivelyMasked();
+         }
+@@ -443,4 +485,15 @@ namespace pdfi
+ #endif
+         {
++            // FG-177b: first, before any record of this group and before the
++            // alpha bookkeeping (the layer goes out at the enclosing alpha).
++            const signed char nBlend = blendGroupBegins(forSoftMask) ? beginBlendGroup(state)
++                                                                     : static_cast<signed char>(0);
++            m_aGroupBlend.push_back(nBlend);
++            if (nBlend)
++                ++m_nBlendLayerDepth;
++            if (nBlend == 2)
++                ++m_nBlendSuppressDepth;
++            if (nBlend == 3)
++                ++m_nBlendVectorDepth;
+             m_aGroupIsSoftMask.push_back(forSoftMask);
+             if (forSoftMask)
+@@ -479,4 +532,14 @@ namespace pdfi
+         virtual void endTransparencyGroup(GfxState* state) override
+         {
++            signed char nBlend = 0;
++            if (!m_aGroupBlend.empty())
++            {
++                nBlend = m_aGroupBlend.back(); // FG-177b
++                m_aGroupBlend.pop_back();
++                if (nBlend && m_nBlendLayerDepth > 0)
++                    --m_nBlendLayerDepth;
++                if (nBlend == 2 && m_nBlendSuppressDepth > 0)
++                    --m_nBlendSuppressDepth;
++            }
+             if (spanTrackerActive())
+                 applySpanTransition(state, m_aSpans.endGroup());
+@@ -506,4 +569,16 @@ namespace pdfi
+                 m_aGroupKnockout.pop_back();
+             }
++            if (nBlend == 3)
++            {
++                // FG-177b vector mode: our mark was opened before the FG-177
++                // one, so it closes after it (they nest on the LibreOffice side).
++                // Through the .cxx: on pdf-docx only there is printf the record
++                // stream. Guarded like the begin (beginBlendGroup): no mark with
++                // images skipped.
++                if (!m_bSkipImages)
++                    emitAlphaGroupMark(false);
++                if (m_nBlendVectorDepth > 0)
++                    --m_nBlendVectorDepth;
++            }
+             if (m_aGroupIsSoftMask.empty())
+                 return;
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfisoftmask.cxx b/sdext/source/pdfimport/xpdfwrapper/pdfisoftmask.cxx
+index 1fde4c6..8fd76cd 100644
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfisoftmask.cxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfisoftmask.cxx
+@@ -58,4 +58,13 @@ namespace
+     const double kRecorderMinDpi         = 18.0;
+     const size_t kRecorderByteBudget     = static_cast<size_t>(96) << 20; ///< raw layer bytes per page (4 GiB WASM heap shared with LibreOffice)
++    // FG-177b: a blend layer is "grey" when max over its pixels of a*|c - L|
++    // is at most this (in 1/255). That bound IS the per-channel error of
++    // emitting black at a*(1-L) instead of the exact Multiply, on a white
++    // backdrop (less on darker ones). Illustrator's shadows are cool greys
++    // (fahr page 17: (153,158,161) at the darkest point, error 6/255);
++    // a pastel tint at full alpha is ~28/255 and a saturated colour >200/255.
++    const int    kBlendGreyTolerance     = 12;
++    const double kBlendPixelsPerPoint    = 1.0; ///< recorder resolution on blend-only pages, and the stored layer resolution
++    const int    kBlendMinAlpha          = 3;   ///< a' below this (in 1/255, < 1.2 % darkening) is cropped away
+ 
+     typedef SoftMaskSpanTracker::Transition Transition;
+@@ -91,4 +100,5 @@ namespace
+ 
+         int spanCount() const { return m_aSpans.spanCount(); }
++        int blendCount() const { return m_nBlendCount; } ///< FG-177b
+ 
+         //----- capability answers mirror PDFOutDev so that Gfx issues the
+@@ -113,4 +123,9 @@ namespace
+             m_aOffsets.clear();
+             m_nOffX = m_nOffY = 0;
++            m_aSavedBlendMode.clear(); // FG-177b
++            m_aGroupIsBlendLayer.clear();
++            m_nBlendDepth = 0;
++            m_nBlendCount = 0;
++            m_nBlendPendingCut = -1;
+             m_rStore.nPageW = getBitmapWidth();
+             m_rStore.nPageH = getBitmapHeight();
+@@ -125,4 +140,10 @@ namespace
+         void saveState( GfxState* state ) override
+         {
++            // FG-177b: the blend mode in force at a group's "Do" is what the
++            // group is painted with; Gfx::drawForm saves state right before
++            // resetting it to Normal for the content. Mirrored exactly as
++            // PDFOutDev::saveState does (every save, tracker active or not).
++            m_aSavedBlendMode.push_back( state ? static_cast<int>( state->getBlendMode() )
++                                               : static_cast<int>( gfxBlendNormal ) );
+             SplashOutputDev::saveState( state );
+             if (trackerActive())
+@@ -132,4 +153,6 @@ namespace
+         void restoreState( GfxState* state ) override
+         {
++            if (!m_aSavedBlendMode.empty())
++                m_aSavedBlendMode.pop_back(); // FG-177b
+             const Transition aT = trackerActive() ? m_aSpans.restoreState() : Transition();
+             onEnd( aT );
+@@ -186,4 +209,12 @@ namespace
+                                      bool knockout, bool forSoftMask ) override
+         {
++            // FG-177b: decided BEFORE the tracker sees the group, from the
++            // same state PDFOutDev::beginTransparencyGroup reads.
++            const bool bBlend = blendGroupBegins( forSoftMask );
++            if (bBlend)
++                beginBlendLayer();
++            else
++                blendNotPlain(); // a nested group: not plain fills
++            m_aGroupIsBlendLayer.push_back( bBlend );
+             if (trackerActive())
+                 apply( m_aSpans.beginGroup( forSoftMask ) );
+@@ -202,4 +233,10 @@ namespace
+         void endTransparencyGroup( GfxState* state ) override
+         {
++            bool bBlend = false;
++            if (!m_aGroupIsBlendLayer.empty())
++            {
++                bBlend = m_aGroupIsBlendLayer.back(); // FG-177b
++                m_aGroupIsBlendLayer.pop_back();
++            }
+             // A span still open here was set inside the group: cut its layer
+             // from the group bitmap before Splash discards it.
+@@ -213,4 +250,28 @@ namespace
+                 m_aOffsets.pop_back();
+             }
++            if (bBlend)
++            {
++                // The group is composited onto the (cleared) parent bitmap by
++                // paintTransparencyGroup, which Gfx::drawForm calls after
++                // restoreState; the layer is cut there. Blend layers do not
++                // nest, so the one ending is the last one begun.
++                if (m_nBlendDepth > 0)
++                    --m_nBlendDepth;
++                m_nBlendPendingCut = m_nBlendCount - 1;
++            }
++        }
++
++        // FG-177b: the Multiply composite of the group onto a transparent
++        // backdrop IS the group's own colour and alpha (see BlendLayer).
++        void paintTransparencyGroup( GfxState* state, const std::array<double, 4>& bbox ) override
++        {
++            SplashOutputDev::paintTransparencyGroup( state, bbox );
++            if (m_nBlendPendingCut < 0)
++                return;
++            const int n = m_nBlendPendingCut;
++            m_nBlendPendingCut = -1;
++            if (m_rStore.pFailure || static_cast<size_t>( n ) >= m_rStore.aBlendLayers.size())
++                return;
++            cutBlendLayer( m_rStore.aBlendLayers[n] );
+         }
+ 
+@@ -220,12 +281,15 @@ namespace
+         void stroke( GfxState* state ) override
+         {
++            blendNotPlain();
+             if (paintAllowed()) { tick(); SplashOutputDev::stroke( state ); }
+         }
+         void fill( GfxState* state ) override
+         {
++            blendPlainFill( state );
+             if (paintAllowed()) { tick(); SplashOutputDev::fill( state ); }
+         }
+         void eoFill( GfxState* state ) override
+         {
++            blendPlainFill( state );
+             if (paintAllowed()) { tick(); SplashOutputDev::eoFill( state ); }
+         }
+@@ -234,9 +298,13 @@ namespace
+         // has no glyph rasterizer in this build anyway.
+         void drawChar( GfxState*, double, double, double, double, double, double,
+-                       CharCode, int, const Unicode*, int ) override {}
++                       CharCode, int, const Unicode*, int ) override
++        {
++            blendNotPlain(); // its colour would be recoloured in vector mode
++        }
+ 
+         void drawImageMask( GfxState* state, Object* ref, Stream* str, int width, int height,
+                             bool invert, bool interpolate, bool inlineImg ) override
+         {
++            blendNotPlain();
+             if (paintAllowed())
+             {
+@@ -251,4 +319,5 @@ namespace
+                         bool inlineImg ) override
+         {
++            blendNotPlain();
+             if (paintAllowed())
+             {
+@@ -263,4 +332,5 @@ namespace
+                               int maskWidth, int maskHeight, bool maskInvert, bool maskInterpolate ) override
+         {
++            blendNotPlain();
+             if (paintAllowed())
+             {
+@@ -275,4 +345,5 @@ namespace
+                                   bool maskInterpolate ) override
+         {
++            blendNotPlain();
+             if (paintAllowed())
+             {
+@@ -287,5 +358,7 @@ namespace
+                                 double xStep, double yStep ) override
+         {
++            blendNotPlain();
+             const std::array<double, 4>& rBBox = tPat->getBBox();
++            const bool bGapped = xStep != rBBox[2] - rBBox[0] || yStep != rBBox[3] - rBBox[1];
+             if (!paintAllowed())
+             {
+@@ -294,7 +367,17 @@ namespace
+                 // the per-tile drawForm fallback, whose save/restore hooks the
+                 // tracker counts. PDFOutDev declines gapped patterns only.
+-                const bool bGapped = xStep != rBBox[2] - rBBox[0] || yStep != rBBox[3] - rBBox[1];
+                 return !bGapped;
+             }
++            if (bGapped && m_nBlendDepth > 0 && m_aSpans.softMaskDepth() == 0
++                && !m_aSpans.effectivelyMasked())
++            {
++                // FG-177b: painting only because of the blend group. PDFOutDev
++                // declines a gapped pattern here in every mode (per element as
++                // always; replaced: see its tilingPatternFill), so Gfx runs the
++                // tracked per-tile fallback on BOTH devices and the tiles reach
++                // fill() above. Rendering it privately here would desynchronise
++                // the hook sequences.
++                return false;
++            }
+             tick();
+             // Painting (PDFOutDev is suppressed here and returned true): the
+@@ -340,4 +423,5 @@ namespace
+         bool functionShadedFill( GfxState* state, GfxFunctionShading* shading ) override
+         {
++            blendNotPlain();
+             if (!paintAllowed()) return true;
+             tick();
+@@ -346,4 +430,5 @@ namespace
+         bool axialShadedFill( GfxState* state, GfxAxialShading* shading, double tMin, double tMax ) override
+         {
++            blendNotPlain();
+             if (!paintAllowed()) return true;
+             tick();
+@@ -352,4 +437,5 @@ namespace
+         bool radialShadedFill( GfxState* state, GfxRadialShading* shading, double tMin, double tMax ) override
+         {
++            blendNotPlain();
+             if (!paintAllowed()) return true;
+             tick();
+@@ -358,8 +444,16 @@ namespace
+         bool gouraudTriangleShadedFill( GfxState* state, GfxGouraudTriangleShading* shading ) override
+         {
++            blendNotPlain();
+             if (!paintAllowed()) return true;
+             tick();
+             return SplashOutputDev::gouraudTriangleShadedFill( state, shading );
+         }
++        // patchMeshShadedFill is decomposed by Gfx into fills, but its colours
++        // vary: disqualify it here, where it is announced.
++        bool patchMeshShadedFill( GfxState* state, GfxPatchMeshShading* shading ) override
++        {
++            blendNotPlain();
++            return SplashOutputDev::patchMeshShadedFill( state, shading );
++        }
+         // patchMeshShadedFill: OutputDev's default (false) lets Gfx subdivide
+         // the mesh into fills, which fill() above gates.
+@@ -370,7 +464,272 @@ namespace
+             if (m_nNestedRender > 0)
+                 return true; // inside a tile Splash is rendering for an allowed fill
++            if (m_nBlendDepth > 0 && !m_bBlendAbandoned)
++                return true; // FG-177b: inside a blend layer group
+             return m_aSpans.softMaskDepth() > 0 || m_aSpans.effectivelyMasked();
+         }
+ 
++        /// FG-177b: a soft-mask SPAN began inside the blend group (a member did
++        /// "/GSx gs" with an /SMask). The span machinery clears the current
++        /// bitmap -- the group's -- and cuts its layer from it, so the group
++        /// can no longer be recorded as one layer without painting the masked
++        /// content twice and losing what came before the span. Abandon it: the
++        /// recorder paints only masked content from here on and stores no
++        /// layer (bRecorded stays false), PDFOutDev keeps the group per element
++        /// and emits the span's layer as before -- exactly the pre-FG-177b path.
++        void abandonBlendLayer()
++        {
++            if (m_nBlendDepth == 0 || m_bBlendAbandoned)
++                return;
++            m_bBlendAbandoned = true;
++            m_bBlendPlain = false;
++            const int n = m_nBlendCount - 1;
++            if (n >= 0 && static_cast<size_t>( n ) < m_rStore.aBlendLayers.size())
++                m_rStore.aBlendLayers[n].bAbandoned = true;
++        }
++
++        // FG-177b: a /BM /Multiply transparency group begun at the top level
++        // -- outside any soft-mask span, masked group, mask definition or
++        // other blend layer -- becomes a blend layer. PDFOutDev evaluates the
++        // identical predicate on the identical state (its own saved-blend-mode
++        // stack and span tracker, driven by the same hooks), so the ordinals
++        // agree; the signature stamped at begin verifies that they did.
++        bool blendGroupBegins( bool bForSoftMask ) const
++        {
++            // effectivelyMasked(): an active span, or inside a masked group,
++            // whose content this device paints into the enclosing bitmap --
++            // a clear() here would wipe it.
++            return !bForSoftMask && trackerActive() && m_nBlendDepth == 0
++                && !m_aSavedBlendMode.empty()
++                && m_aSavedBlendMode.back() == static_cast<int>( gfxBlendMultiply )
++                && m_aSpans.softMaskDepth() == 0 && !m_aSpans.effectivelyMasked()
++                && !m_aSpans.groupWouldBeMasked();
++        }
++
++        /// Inside a blend layer: something other than an opaque plain fill of
++        /// the one grey was painted (see BlendLayer::bPlainGreyFills).
++        void blendNotPlain()
++        {
++            if (m_nBlendDepth > 0)
++                m_bBlendPlain = false;
++        }
++        void blendPlainFill( GfxState* state )
++        {
++            if (m_nBlendDepth == 0 || !m_bBlendPlain || !state)
++                return;
++            if (state->getFillOpacity() != 1.0 || state->getFillColorSpace() == nullptr
++                || state->getFillColorSpace()->getMode() == csPattern)
++            {
++                m_bBlendPlain = false;
++                return;
++            }
++            GfxRGB aRGB;
++            state->getFillRGB( &aRGB );
++            const int nPacked = (colToByte( aRGB.r ) << 16) | (colToByte( aRGB.g ) << 8) | colToByte( aRGB.b );
++            if (m_nBlendFillColour < 0)
++                m_nBlendFillColour = nPacked;
++            else if (m_nBlendFillColour != nPacked)
++                m_bBlendPlain = false;
++        }
++
++        void beginBlendLayer()
++        {
++            const int n = m_nBlendCount++;
++            ++m_nBlendDepth;
++            m_nBlendPendingCut = -1;
++            m_bBlendPlain = true;
++            m_bBlendAbandoned = false;
++            m_nBlendFillColour = -1;
++            if (m_rStore.pFailure)
++                return;
++            if (m_rStore.aBlendLayers.size() <= static_cast<size_t>( n ))
++                m_rStore.aBlendLayers.resize( n + 1 );
++            m_rStore.aBlendLayers[n].aSignature = m_aSpans.signature();
++            m_rStore.nBlendGroups = m_nBlendCount;
++            // Start from a transparent bitmap, so that the group's Multiply
++            // composite lands on alpha 0 (its own colour). Everything painted
++            // so far belongs to earlier spans or layers, already cut.
++            Splash* pSplash = getSplash();
++            if (pSplash)
++            {
++                SplashColor aClear = { 0, 0, 0, 0 };
++                pSplash->clear( aClear, 0 );
++            }
++        }
++
++        /// Crop the current bitmap to the group's pixels and store it as
++        /// black at alpha a*(1-L) (see BlendLayer), classifying grey/coloured.
++        void cutBlendLayer( BlendLayer& rLayer )
++        {
++            if (m_bBlendAbandoned)
++            {
++                // See abandonBlendLayer(): nothing of the group was kept, and
++                // the bitmap holds the span's content, already cut.
++                m_bBlendAbandoned = false;
++                rLayer.bRecorded = false;
++                rLayer.bAbandoned = true;
++                return;
++            }
++            tick( true );
++            SplashBitmap* pBmp = getBitmap();
++            if (!pBmp || !pBmp->getDataPtr() || !pBmp->getAlphaPtr())
++            {
++                fail( "bitmap without alpha" );
++                return;
++            }
++            const SplashColorMode eMode = pBmp->getMode();
++            int nComps = 0;
++            switch (eMode)
++            {
++                case splashModeMono8:  nComps = 1; break;
++                case splashModeRGB8:   nComps = 3; break;
++                case splashModeBGR8:   nComps = 3; break;
++                case splashModeXBGR8:  nComps = 4; break;
++                case splashModeCMYK8:  nComps = 4; break;
++                default:
++                    fail( "unsupported group colour mode" );
++                    return;
++            }
++            const int nW = pBmp->getWidth();
++            const int nH = pBmp->getHeight();
++            const unsigned char* pData = pBmp->getDataPtr();
++            const unsigned char* pAlpha = pBmp->getAlphaPtr();
++            const int nRow = pBmp->getRowSize();
++            const int nAlphaRow = pBmp->getAlphaRowSize();
++
++            // Pass 1: converted alpha per pixel (into a page-sized buffer),
++            // its bounding box, and the colour error.
++            std::vector<unsigned char> aConv( static_cast<size_t>( nW ) * nH, 0 );
++            int nX0 = nW, nY0 = nH, nX1 = -1, nY1 = -1;
++            int nMaxErr = 0;
++            for (int y = 0; y < nH; ++y)
++            {
++                const unsigned char* pSrcA = pAlpha + static_cast<size_t>( y ) * nAlphaRow;
++                const unsigned char* pSrc = pData + static_cast<size_t>( y ) * nRow;
++                unsigned char* pDst = aConv.data() + static_cast<size_t>( y ) * nW;
++                for (int x = 0; x < nW; ++x, pSrc += nComps)
++                {
++                    const int a = pSrcA[x];
++                    if (!a)
++                        continue;
++                    int r, g, b;
++                    switch (eMode)
++                    {
++                        case splashModeMono8: r = g = b = pSrc[0]; break;
++                        case splashModeRGB8:  r = pSrc[0]; g = pSrc[1]; b = pSrc[2]; break;
++                        case splashModeBGR8:
++                        case splashModeXBGR8: r = pSrc[2]; g = pSrc[1]; b = pSrc[0]; break;
++                        case splashModeCMYK8:
++                        {
++                            const int k = pSrc[3];
++                            r = 255 - std::min( 255, pSrc[0] + k );
++                            g = 255 - std::min( 255, pSrc[1] + k );
++                            b = 255 - std::min( 255, pSrc[2] + k );
++                            break;
++                        }
++                        default: r = g = b = 0; break;
++                    }
++                    // Rec. 709 luminance, weights summing to 255.
++                    const int L = (54 * r + 183 * g + 18 * b + 127) / 255;
++                    const int nErr = (a * std::max( { std::abs( r - L ), std::abs( g - L ), std::abs( b - L ) } ) + 127) / 255;
++                    if (nErr > nMaxErr)
++                        nMaxErr = nErr;
++                    const int aBlack = (a * (255 - L) + 127) / 255;
++                    if (!aBlack)
++                        continue; // white under Multiply: a no-op
++                    pDst[x] = static_cast<unsigned char>( aBlack );
++                    if (x < nX0) nX0 = x;
++                    if (x > nX1) nX1 = x;
++                    if (y < nY0) nY0 = y;
++                    nY1 = y;
++                }
++            }
++            rLayer.bRecorded = true;
++            rLayer.nMaxColourError = nMaxErr;
++            rLayer.bGrey = nMaxErr <= kBlendGreyTolerance;
++            if (rLayer.bGrey)
++                ++m_rStore.nBlendLayersGrey;
++            if (nX1 < 0)
++            {
++                rLayer.nW = rLayer.nH = 0; // nothing visible (all white, or nothing painted)
++                return;
++            }
++            if (!rLayer.bGrey)
++                return; // the main pass keeps per-element emission; no pixels needed
++            if (m_bBlendPlain && m_nBlendFillColour >= 0)
++            {
++                // VECTOR mode (see BlendLayer): the fills themselves, recoloured.
++                const int r = (m_nBlendFillColour >> 16) & 0xff;
++                const int g = (m_nBlendFillColour >> 8) & 0xff;
++                const int b = m_nBlendFillColour & 0xff;
++                rLayer.bPlainGreyFills = true;
++                rLayer.nFillLuminance = (54 * r + 183 * g + 18 * b + 127) / 255;
++                return;
++            }
++
++            // Store at about kBlendPixelsPerPoint: box-average nShrink x nShrink
++            // cells (the recorder runs at 2 px/pt when the page has soft masks).
++            // Shadows are soft; a' below kBlendMinAlpha is cropped.
++            const int nShrink = std::max( 1, static_cast<int>( std::lround(
++                m_rStore.fDpi / (kBlendPixelsPerPoint * 72.0) ) ) );
++            const int nCW = (nX1 - nX0 + nShrink) / nShrink;
++            const int nCH = (nY1 - nY0 + nShrink) / nShrink;
++            std::vector<unsigned char> aCells( static_cast<size_t>( nCW ) * nCH, 0 );
++            int cX0 = nCW, cY0 = nCH, cX1 = -1, cY1 = -1;
++            for (int cy = 0; cy < nCH; ++cy)
++            {
++                for (int cx = 0; cx < nCW; ++cx)
++                {
++                    int nSum = 0, nCount = 0;
++                    for (int dy = 0; dy < nShrink; ++dy)
++                    {
++                        const int y = nY0 + cy * nShrink + dy;
++                        if (y > nY1) break;
++                        const unsigned char* pRow = aConv.data() + static_cast<size_t>( y ) * nW;
++                        for (int dx = 0; dx < nShrink; ++dx)
++                        {
++                            const int x = nX0 + cx * nShrink + dx;
++                            if (x > nX1) break;
++                            nSum += pRow[x];
++                            ++nCount;
++                        }
++                    }
++                    const int v = nCount ? (nSum + nCount / 2) / nCount : 0;
++                    if (v < kBlendMinAlpha)
++                        continue;
++                    aCells[static_cast<size_t>( cy ) * nCW + cx] = static_cast<unsigned char>( v );
++                    if (cx < cX0) cX0 = cx;
++                    if (cx > cX1) cX1 = cx;
++                    if (cy < cY0) cY0 = cy;
++                    cY1 = cy;
++                }
++            }
++            if (cX1 < 0)
++            {
++                rLayer.nW = rLayer.nH = 0;
++                return;
++            }
++            const int nLW = cX1 - cX0 + 1;
++            const int nLH = cY1 - cY0 + 1;
++            const size_t nBytes = static_cast<size_t>( nLW ) * nLH;
++            if (m_rStore.nBytes + nBytes > kRecorderByteBudget)
++            {
++                fail( "layer byte budget exceeded" );
++                return;
++            }
++            rLayer.aAlpha.resize( nBytes );
++            for (int y = 0; y < nLH; ++y)
++                std::copy_n( aCells.data() + static_cast<size_t>( cY0 + y ) * nCW + cX0, nLW,
++                             rLayer.aAlpha.data() + static_cast<size_t>( y ) * nLW );
++            // Group bitmaps are offset from the page; translate back. The
++            // rectangle is the cells' extent in full-resolution px.
++            rLayer.nX = nX0 + cX0 * nShrink + m_nOffX;
++            rLayer.nY = nY0 + cY0 * nShrink + m_nOffY;
++            rLayer.nRectW = nLW * nShrink;
++            rLayer.nRectH = nLH * nShrink;
++            rLayer.nW = nLW;
++            rLayer.nH = nLH;
++            m_rStore.nBytes += nBytes;
++        }
++
+         /// False while Splash drives hooks PDFOutDev will never see.
+         bool trackerActive() const
+@@ -393,4 +752,6 @@ namespace
+         void onBegin( const Transition& rT )
+         {
++            if (rT.nBegan >= 0)
++                abandonBlendLayer(); // FG-177b: before the clear below wipes the group's content
+             if (rT.nBegan < 0 || m_rStore.pFailure)
+                 return;
+@@ -555,7 +916,36 @@ namespace
+         int                               m_nSplashInternalGroups = 0; ///< stencil-mask pattern fill open (set..unset)
+         int                               m_nNestedRender = 0;         ///< inside Splash's tilingPatternFill
++        // FG-177b: blend layers (see BlendLayer and blendGroupBegins()).
++        std::vector<int>                  m_aSavedBlendMode;    ///< mirrors saveState/restoreState, as PDFOutDev's
++        std::vector<bool>                 m_aGroupIsBlendLayer; ///< per open group
++        int                               m_nBlendDepth = 0;    ///< > 0: painting a blend layer's content
++        int                               m_nBlendCount = 0;    ///< blend groups begun on this page (ordinal source)
++        int                               m_nBlendPendingCut = -1; ///< layer to cut at the next paintTransparencyGroup
++        bool                              m_bBlendPlain = false;   ///< current blend layer: only opaque plain fills so far
++        bool                              m_bBlendAbandoned = false; ///< a span began inside it (abandonBlendLayer)
++        int                               m_nBlendFillColour = -1; ///< ...of this packed RGB (-1: none yet)
+     };
+ 
+-    bool lcl_resourcesDeclareSoftMask( Dict* pRes, int nDepth, std::set<int>& rVisited )
++    /// FG-177b: /BM is a name or an array of names (the first supported one
++    /// applies); Multiply anywhere in it counts.
++    bool lcl_namesMultiply( const Object& rBM )
++    {
++        if (rBM.isName( "Multiply" ))
++            return true;
++        if (!rBM.isArray())
++            return false;
++        for (int i = 0; i < rBM.arrayGetLength(); ++i)
++        {
++            Object aItem = rBM.arrayGet( i );
++            if (aItem.isName( "Multiply" ))
++                return true;
++        }
++        return false;
++    }
++
++    /// bSoftMask: an ExtGState with an /SMask group. bMultiply (FG-177b): one
++    /// with /BM /Multiply. Either, as requested.
++    bool lcl_resourcesDeclare( Dict* pRes, int nDepth, std::set<int>& rVisited,
++                               bool bSoftMask, bool bMultiply )
+     {
+         if (!pRes || nDepth > 8)
+@@ -571,7 +961,16 @@ namespace
+                 if (!aGS.isDict())
+                     continue;
+-                Object aSMask = aGS.getDict()->lookup( "SMask" );
+-                if (aSMask.isDict())
+-                    return true;
++                if (bSoftMask)
++                {
++                    Object aSMask = aGS.getDict()->lookup( "SMask" );
++                    if (aSMask.isDict())
++                        return true;
++                }
++                if (bMultiply)
++                {
++                    Object aBM = aGS.getDict()->lookup( "BM" );
++                    if (lcl_namesMultiply( aBM ))
++                        return true;
++                }
+             }
+         }
+@@ -593,5 +992,5 @@ namespace
+                     continue;
+                 Object aSub = aVal.streamGetDict()->lookup( "Resources" );
+-                if (aSub.isDict() && lcl_resourcesDeclareSoftMask( aSub.getDict(), nDepth + 1, rVisited ))
++                if (aSub.isDict() && lcl_resourcesDeclare( aSub.getDict(), nDepth + 1, rVisited, bSoftMask, bMultiply ))
+                     return true;
+             }
+@@ -612,4 +1011,15 @@ double chooseSoftMaskRecorderDpi( double fPageWidthPt, double fPageHeightPt )
+ }
+ 
++double chooseBlendRecorderDpi( double fPageWidthPt, double fPageHeightPt )
++{
++    const double fLongest = std::max( std::max( fPageWidthPt, fPageHeightPt ), 1.0 );
++    double fDpi = kBlendPixelsPerPoint * 72.0;
++    if (fLongest * fDpi / 72.0 > kRecorderMaxSide)
++        fDpi = kRecorderMaxSide * 72.0 / fLongest;
++    if (fDpi < kRecorderMinDpi)
++        fDpi = kRecorderMinDpi;
++    return fDpi;
++}
++
+ bool pageDeclaresSoftMask( Page* pPage )
+ {
+@@ -617,5 +1027,13 @@ bool pageDeclaresSoftMask( Page* pPage )
+         return false;
+     std::set<int> aVisited;
+-    return lcl_resourcesDeclareSoftMask( pPage->getResourceDict(), 0, aVisited );
++    return lcl_resourcesDeclare( pPage->getResourceDict(), 0, aVisited, true, false );
++}
++
++bool pageDeclaresBlendGroup( Page* pPage )
++{
++    if (!pPage)
++        return false;
++    std::set<int> aVisited;
++    return lcl_resourcesDeclare( pPage->getResourceDict(), 0, aVisited, false, true );
+ }
+ 
+@@ -636,4 +1054,6 @@ void recordSoftMaskLayers( PDFDoc& rDoc, int nPage, double fDpi,
+             rStore.nSpans = aRecorder.spanCount();
+             rStore.aLayers.resize( rStore.nSpans );
++            rStore.nBlendGroups = aRecorder.blendCount(); // FG-177b
++            rStore.aBlendLayers.resize( rStore.nBlendGroups );
+             rStore.bUsable = true;
+         }
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfisoftmask.hxx b/sdext/source/pdfimport/xpdfwrapper/pdfisoftmask.hxx
+index a5d8b9b..74da7a7 100644
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfisoftmask.hxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfisoftmask.hxx
+@@ -38,4 +38,23 @@
+ // glyphs anyway.
+ //
++// FG-177b: the same pre-pass records BLEND LAYERS. A /BM /Multiply
++// transparency group begun at the top level (outside any span, masked group,
++// mask definition or other such group) is painted by the recorder into a
++// cleared bitmap, so that Splash's Multiply composite of the finished group
++// onto alpha 0 is the group's own colour and alpha; the layer is stored as
++// black at alpha a*(1-L), which Multiply makes exact for grey content on any
++// backdrop, and PDFOutDev emits it where the group begins and suppresses the
++// group's own content except text. Ordinals pair by construction (the same
++// predicate on the same hooks, stamped with a signature). A coloured group,
++// an unrecorded one, or a failed pre-pass leaves that group on per-element
++// emission, exactly as before (see BlendLayer). Known limits: Splash knocks
++// out only for an ISOLATED knockout group (SplashOutputDev::
++// beginTransparencyGroup: knockout && isolated); Illustrator writes /K true
++// /I false, so its blob stacks composite Normal inside the layer -- white
++// blobs are no-ops under Multiply, grey ones come out slightly darker where
++// they overlap (fahr page 17: within 7/255 of the source). Other blend modes,
++// and Multiply applied to a plain fill or image without a group, are not
++// handled and are emitted Normal as before.
++//
+ // Any failure of the pre-pass (exception, memory budget, span-count mismatch)
+ // marks the page's store unusable, and PDFOutDev then behaves exactly as
+@@ -229,4 +248,25 @@ namespace pdfi
+         bool effectivelyMasked() const { return spanActive() || m_nMaskedGroupDepth > 0; }
+ 
++        /// FG-177b: where the hook sequence stands now, in the form a span
++        /// signature takes. Both devices stamp a blend layer with it at the
++        /// group's begin, so a mismatch proves their sequences diverged.
++        SoftMaskSpanSignature signature() const
++        {
++            SoftMaskSpanSignature aS;
++            aS.nHooks  = m_nHooks;
++            aS.nLevels = static_cast<int>(m_aMask.size());
++            aS.nGroups = static_cast<int>(m_aGroups.size());
++            aS.bNested = m_bActiveNested;
++            return aS;
++        }
++        /// FG-177b: what beginGroup(false) is about to record as "masked":
++        /// Gfx has pushed a level and cleared the mask on it, so the mask that
++        /// applies to the group as a whole is the one on the level below.
++        bool groupWouldBeMasked() const
++        {
++            const size_t n = m_aMask.size();
++            return m_aMask.back() || (n >= 2 && m_aMask[n - 2]);
++        }
++
+     private:
+         struct Group { bool bForSoftMask; bool bMasked; };
+@@ -299,4 +339,46 @@ namespace pdfi
+     };
+ 
++    /// FG-177b: one BLEND LAYER -- a /BM /Multiply transparency group that
++    /// began outside any soft-mask span, masked group, mask definition or
++    /// other blend layer. The recorder lets Splash composite the whole group
++    /// (nested groups, knockout as far as Splash implements it, every /ca,
++    /// the group's own /ca) onto a TRANSPARENT backdrop, which under Multiply
++    /// yields the group's own colour C and alpha a (Splash::pipeRun:
++    /// aDest == 0 gives cResult = cSrc). Multiplying that onto a backdrop B
++    /// is B * (1 - a*(1-C)) per channel; for grey C that is exactly black
++    /// composited Normal at alpha a*(1-L), L = luminance -- the only form an
++    /// ODF shape can carry. So the layer is stored as black at that alpha,
++    /// and bGrey says whether the conversion was within tolerance: a coloured
++    /// Multiply group (a tinted photo, a saturated overlay) would be wrong as
++    /// black, so the main pass keeps its per-element emission (today's
++    /// behaviour) instead. White pixels (L == 1) have alpha 0: a no-op under
++    /// Multiply, as in the source.
++    struct BlendLayer
++    {
++        bool bRecorded = false;   ///< the group's paint hook was seen and the layer cut
++        bool bAbandoned = false;  ///< a soft-mask span began inside the group: per element, as before FG-177b
++        bool bGrey = false;       ///< black at per-pixel alpha is exact within tolerance
++        int  nMaxColourError = 0; ///< max over pixels of a*|c - L|, in 1/255
++        SoftMaskSpanSignature aSignature; ///< where the recorder saw the group begin
++        /// VECTOR mode: the group painted nothing but opaque plain fills of ONE
++        /// grey (no stroke, image, shading, pattern, text or nested group).
++        /// Composited Normal inside the group they form a union of that grey,
++        /// and the group's Multiply with the page is then exactly black at
++        /// (1 - L) over that union -- which the main pass emits as the fills
++        /// themselves, recoloured, inside a beginAlphaGroup/endAlphaGroup mark
++        /// at that alpha so PDFIProcessor::endAlphaGroup merges overlaps. No
++        /// pixels are stored or emitted (fahr: the ribbon pattern painted under
++        /// Multiply on 17 pages was a full-page 4 Mpx layer each).
++        bool bPlainGreyFills = false;
++        int  nFillLuminance = 255; ///< L of that grey, 0..255
++        /// Bitmap of nW x nH alpha values stretched over the rectangle
++        /// (nX, nY) .. (nX + nRectW, nY + nRectH), recorder page px. The bitmap
++        /// is stored at about 1 px/pt (shadows are soft; the recorder may run
++        /// at 2 px/pt for soft masks), so nRectW / nW is the shrink factor.
++        int  nX = 0, nY = 0, nRectW = 0, nRectH = 0;
++        int  nW = 0, nH = 0;                 ///< nW == 0: nothing visible
++        std::vector<unsigned char> aAlpha;   ///< nW * nH: alpha of black
++    };
++
+     /// Everything the pre-pass learned about one page.
+     struct SoftMaskLayerStore
+@@ -306,8 +388,12 @@ namespace pdfi
+         double fDpi = 144.0;      ///< recorder resolution
+         int    nPageW = 0, nPageH = 0; ///< recorder bitmap size in px
+-        size_t nBytes = 0;        ///< raw bytes held by aLayers
++        size_t nBytes = 0;        ///< raw bytes held by aLayers and aBlendLayers
+         int    nSpans = 0;        ///< spans the recorder counted
+         int    nLayersWithPixels = 0;
+         const char* pFailure = nullptr; ///< why bUsable is false, for the log
++        // FG-177b
++        std::vector<BlendLayer> aBlendLayers; ///< by ordinal of the blend group's begin
++        int    nBlendGroups = 0;     ///< blend groups the recorder counted
++        int    nBlendLayersGrey = 0; ///< of which converted to black at alpha
+ 
+         void clear()
+@@ -320,4 +406,7 @@ namespace pdfi
+             nLayersWithPixels = 0;
+             pFailure = nullptr;
++            aBlendLayers.clear();
++            nBlendGroups = 0;
++            nBlendLayersGrey = 0;
+         }
+         const SoftMaskLayer* get(int n) const
+@@ -327,4 +416,10 @@ namespace pdfi
+             return &aLayers[n];
+         }
++        const BlendLayer* getBlend(int n) const
++        {
++            if (n < 0 || static_cast<size_t>(n) >= aBlendLayers.size())
++                return nullptr;
++            return &aBlendLayers[n];
++        }
+     };
+ }
+@@ -350,8 +445,19 @@ namespace pdfi
+     double chooseSoftMaskRecorderDpi( double fPageWidthPt, double fPageHeightPt );
+ 
++    /// FG-177b: for a page with blend groups and no soft mask: 1 px/pt. The
++    /// blend layers are stored at that resolution anyway, and the pre-pass
++    /// cost is the pixel work of the groups' nested bitmaps (fahr page 33:
++    /// 314 nested forms, 3.0 s at 2 px/pt).
++    double chooseBlendRecorderDpi( double fPageWidthPt, double fPageHeightPt );
++
+     /// True when the page's resources (recursively through form XObjects and
+     /// patterns) declare an ExtGState with an /SMask group.
+     bool pageDeclaresSoftMask( Page* pPage );
+ 
++    /// FG-177b: true when they declare an ExtGState with /BM /Multiply (a name
++    /// or an array naming it). Other blend modes are not handled: they stay on
++    /// per-element Normal emission.
++    bool pageDeclaresBlendGroup( Page* pPage );
++
+     /// Runs the pre-pass for one page. Never throws; on failure rStore.bUsable
+     /// is false and rStore.pFailure says why. rBeat is called from the heavy
