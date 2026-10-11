@@ -1,0 +1,26 @@
+diff --git a/configure.ac b/configure.ac
+index eb4dd017a406..0b3fc913740b 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -3097,7 +3097,7 @@ if test "$enable_wasm_strip" = "yes"; then
+     enable_odk=no
+     enable_online_update=no
+     enable_opencl=no
+-    enable_pdfimport=no
++    test "${enable_pdfimport+set}" = set || enable_pdfimport=no
+     enable_randr=no
+     enable_report_builder=no
+     enable_scripting=no
+diff --git a/RepositoryModule_host.mk b/RepositoryModule_host.mk
+index 2fbee39dc610..27cf51dd027d 100644
+--- a/RepositoryModule_host.mk
++++ b/RepositoryModule_host.mk
+@@ -139,6 +139,8 @@ $(eval $(call gb_Module_add_moduledirs,libreoffice,\
+ 	scripting \
+     $(if $(ENABLE_WASM_STRIP_BASIC_DRAW_MATH_IMPRESS),, \
+ 	sd \
++    ) \
++	$(if $(or $(filter-out TRUE,$(ENABLE_WASM_STRIP_BASIC_DRAW_MATH_IMPRESS)),$(ENABLE_PDFIMPORT)), \
+ 	sdext \
+     ) \
+ 	$(call gb_Helper_optional,DESKTOP,setup_native) \

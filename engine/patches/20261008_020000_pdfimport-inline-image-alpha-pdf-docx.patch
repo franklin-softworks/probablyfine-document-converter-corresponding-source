@@ -1,0 +1,41 @@
+diff --git a/sdext/source/pdfimport/tree/drawtreevisiting.cxx b/sdext/source/pdfimport/tree/drawtreevisiting.cxx
+index 721487c..ded7a76 100644
+--- a/sdext/source/pdfimport/tree/drawtreevisiting.cxx
++++ b/sdext/source/pdfimport/tree/drawtreevisiting.cxx
+@@ -1079,4 +1079,14 @@ void DrawXmlFinalizer::visit( FrameElement& elem, const std::list< std::unique_p
+     aGCProps[ u"fo:padding-bottom"_ustr ]              = "0cm";
+ 
++    // FG-177: an image painted under /ca < 1 (times any enclosing group's
++    // alpha, FG-176) came in opaque. Same contract as the Writer finalizer.
++    if (!elem.Children.empty()
++        && dynamic_cast<ImageElement*>(elem.Children.front().get()) != nullptr)
++    {
++        const GraphicsContext& rGC = m_rProcessor.getGraphicsContext(elem.GCId);
++        if (rGC.FillColor.Alpha != 1.0)
++            aGCProps[ u"draw:image-opacity"_ustr ] = getPercentString(rGC.FillColor.Alpha * 100.0);
++    }
++
+     StyleContainer::Style style1( "style:style"_ostr, std::move(props1) );
+     StyleContainer::Style subStyle1( "style:graphic-properties"_ostr, std::move(aGCProps) );
+diff --git a/sdext/source/pdfimport/tree/writertreevisiting.cxx b/sdext/source/pdfimport/tree/writertreevisiting.cxx
+index 9910fcc..52f8d83 100644
+--- a/sdext/source/pdfimport/tree/writertreevisiting.cxx
++++ b/sdext/source/pdfimport/tree/writertreevisiting.cxx
+@@ -1343,4 +1343,17 @@ void WriterXmlFinalizer::visit( FrameElement& elem, const std::list< std::unique
+     aGCProps[ u"fo:padding-bottom"_ustr ]              = "0cm";
+ 
++    // FG-177: an image painted under /ca < 1 -- times any enclosing group's
++    // alpha, which FG-176 folds into the fill colour record the image frame's
++    // graphics context carries -- came in opaque: nothing wrote the alpha.
++    // draw:image-opacity is the graphic's Transparency in both Writer and
++    // Draw (xmloff txtprmap.cxx / sdpropls.cxx, XML_IMAGE_OPACITY).
++    if (!elem.Children.empty()
++        && dynamic_cast<ImageElement*>(elem.Children.front().get()) != nullptr)
++    {
++        const GraphicsContext& rGC = m_rProcessor.getGraphicsContext(elem.GCId);
++        if (rGC.FillColor.Alpha != 1.0)
++            aGCProps[ u"draw:image-opacity"_ustr ] = getPercentString(rGC.FillColor.Alpha * 100.0);
++    }
++
+     StyleContainer::Style aStyle( "style:style"_ostr, std::move(aProps) );
+     StyleContainer::Style aSubStyle( "style:graphic-properties"_ostr, std::move(aGCProps) );

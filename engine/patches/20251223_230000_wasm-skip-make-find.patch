@@ -1,0 +1,36 @@
+diff --git a/svl/source/items/style.cxx b/svl/source/items/style.cxx
+index a5144962632e..3223a670842a 100644
+--- a/svl/source/items/style.cxx
++++ b/svl/source/items/style.cxx
+@@ -17,6 +17,9 @@
+  *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
+  */
+
++#ifdef __EMSCRIPTEN__
++#include <comphelper/lok.hxx>
++#endif
+ #include <memory>
+ #include <svl/style.hxx>
+
+@@ -651,6 +654,21 @@ SfxStyleSheetBase& SfxStyleSheetBasePool::Make( const OUString& rName, SfxStyleF
+ {
+     OSL_ENSURE( eFam != SfxStyleFamily::All, "svl::SfxStyleSheetBasePool::Make(), FamilyAll is not an allowed Family" );
+
++#ifdef __EMSCRIPTEN__
++    // WASM/LOK optimization: Skip Find() in Make() for headless mode.
++    // The Find() call iterates through existing stylesheets which can
++    // hang in WASM when the style pool is being initialized with many
++    // default styles. Since we're creating new styles, we can skip the
++    // existence check and directly create/store the style.
++    if (comphelper::LibreOfficeKit::isActive())
++    {
++        rtl::Reference<SfxStyleSheetBase> xStyle = Create(rName, eFam, mask, sParentStyleSheetName);
++        StoreStyleSheet(xStyle);
++        Broadcast(SfxStyleSheetHint(SfxHintId::StyleSheetChanged, *xStyle));
++        return *xStyle;
++    }
++#endif
++
+     SfxStyleSheetIterator aIter(this, eFam, mask);
+     rtl::Reference< SfxStyleSheetBase > xStyle( aIter.Find( rName ) );
+     OSL_ENSURE( !xStyle.is(), "svl::SfxStyleSheetBasePool::Make(), StyleSheet already exists" );
