@@ -1,0 +1,16 @@
+diff --git a/sc/source/filter/excel/xetable.cxx b/sc/source/filter/excel/xetable.cxx
+index f7b9a81be9f0..589fc4ef7774 100644
+--- a/sc/source/filter/excel/xetable.cxx
++++ b/sc/source/filter/excel/xetable.cxx
+@@ -2262,7 +2262,10 @@ void XclExpRowBuffer::Finalize( XclExpDefaultRowData& rDefRowData,
+ 
+     GetProgressBar().ActivateFinalRowsSegment();
+ 
+-#if 1
++#ifdef __EMSCRIPTEN__
++    // WASM: ThreadPool can deadlock - always use single thread
++    const size_t nThreads = 1;
++#elif 1
+     // This is staggeringly slow, and each element operates only
+     // on its own data.
+     const size_t nRows = maRowMap.size();
