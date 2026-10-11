@@ -1,0 +1,416 @@
+From: Claude <claude@anthropic.com>
+Subject: [PATCH] sw: default fly/draw object names in O(1) amortised (WASM only) (FG-141)
+
+PDF import into Writer creates one frame per glyph line plus one shape per
+path (vision2030: ~43,000 objects). lcl_GetUniqueFlyName walked every object
+for every new name: O(N^2), measured 282 s of a 310 s emit phase. Under
+__EMSCRIPTEN__ each SwDoc keeps a per-prefix monotonic counter plus a superset
+of numbers above it that may be in use; SdrObject names (not indexed) are
+learned by one full walk and then from a small svx ring buffer fed by
+SdrObject::SetName and SdrObjList insertion. Ring wrap -> full walk again;
+counter overflow -> the upstream walk. Upstream's own fix (a61128c95e32) was
+reverted (f1c247acd6b8) only because UITests rely on predictable names.
+
+Behaviour difference (all Writer documents, WASM build): names stay unique,
+but a number freed by deleting or renaming an object is never reused, so an
+import that creates then deletes a frame yields e.g. "Frame3" where upstream
+gives "Frame2". Such names are written to DOCX (wp:docPr name) and ODT
+(draw:name); nothing compares them. Measured after: 43,000 names in 142 ms;
+vision2030 PDF -> DOCX 60 s (was failing), 11,294 text boxes, no duplicates.
+---
+diff --git a/include/svx/svdobjnamelog.hxx b/include/svx/svdobjnamelog.hxx
+new file mode 100644
+index 0000000..4ebac4f
+--- /dev/null
++++ b/include/svx/svdobjnamelog.hxx
+@@ -0,0 +1,53 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++#pragma once
++
++#ifdef __EMSCRIPTEN__
++
++#include <svx/svxdllapi.h>
++#include <rtl/ustring.hxx>
++#include <sal/types.h>
++
++class SdrObject;
++
++/** FG-141 (WASM only): a bounded record of SdrObject names as they become visible.
++
++    An entry is written whenever SdrObject::SetName sets a non-empty name, and whenever an
++    object enters an SdrObjList (its name and, recursively, its sub-objects' names). Those
++    are the only ways a name can appear on an object that a document can reach, so a
++    reader that has seen every object once and then reads every entry written since knows
++    every name in use. Writer's default shape naming (sw/source/core/doc/doclay.cxx,
++    lcl_GetUniqueDefaultFlyName) relies on this to avoid walking every object per name.
++
++    Process-wide and unsynchronised: the WASM build runs single-threaded. The entries are
++    a ring of nCapacity; a reader that falls further behind than that must start over.
++*/
++namespace svx::objnamelog
++{
++constexpr sal_uInt64 nCapacity = 4096;
++
++/// Serial number the next entry will get; the entries [GetSerial() - nCapacity, GetSerial())
++/// (those >= 0) are readable.
++SVXCORE_DLLPUBLIC sal_uInt64 GetSerial();
++
++/// The entry with serial nSerial; requires nSerial < GetSerial() <= nSerial + nCapacity.
++SVXCORE_DLLPUBLIC const OUString& GetEntry(sal_uInt64 nSerial);
++
++/// Records rName (nothing if empty). Called by SdrObject::SetName.
++SVXCORE_DLLPUBLIC void NoteName(const OUString& rName);
++
++/// Records rObj's name and those of everything in its sub-list, recursively. Called when
++/// rObj enters an SdrObjList.
++SVXCORE_DLLPUBLIC void NoteInserted(const SdrObject& rObj);
++}
++
++#endif
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/svx/source/svdraw/svdobj.cxx b/svx/source/svdraw/svdobj.cxx
+index 4eb5146..4b15fae 100644
+--- a/svx/source/svdraw/svdobj.cxx
++++ b/svx/source/svdraw/svdobj.cxx
+@@ -120,6 +120,10 @@
+ #include <tools/UnitConversion.hxx>
+ #include <o3tl/string_view.hxx>
+ #include <tools/lazydelete.hxx>
++#ifdef __EMSCRIPTEN__
++#include <svx/svdobjnamelog.hxx>
++#include <array>
++#endif
+ 
+ using namespace ::com::sun::star;
+ 
+@@ -683,6 +687,44 @@ SdrObject* SdrObject::getParentSdrObjectFromSdrObject() const
+     return pParent->getSdrObjectFromSdrObjList();
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// FG-141: see include/svx/svdobjnamelog.hxx.
++namespace svx::objnamelog
++{
++namespace
++{
++std::array<OUString, static_cast<std::size_t>(nCapacity)> g_aEntries;
++sal_uInt64 g_nSerial = 0;
++}
++
++sal_uInt64 GetSerial() { return g_nSerial; }
++
++const OUString& GetEntry(sal_uInt64 nSerial)
++{
++    assert(nSerial < g_nSerial && g_nSerial - nSerial <= nCapacity);
++    return g_aEntries[static_cast<std::size_t>(nSerial % nCapacity)];
++}
++
++void NoteName(const OUString& rName)
++{
++    if (rName.isEmpty())
++        return;
++    g_aEntries[static_cast<std::size_t>(g_nSerial % nCapacity)] = rName;
++    ++g_nSerial;
++}
++
++void NoteInserted(const SdrObject& rObj)
++{
++    NoteName(rObj.GetName());
++    if (const SdrObjList* pSub = rObj.GetSubList())
++    {
++        for (const rtl::Reference<SdrObject>& pObj : *pSub)
++            NoteInserted(*pObj);
++    }
++}
++}
++#endif
++
+ void SdrObject::SetName(const OUString& rStr, const bool bSetChanged)
+ {
+     if (!rStr.isEmpty() && !m_pPlusData)
+@@ -708,6 +750,9 @@ void SdrObject::SetName(const OUString& rStr, const bool bSetChanged)
+         getSdrModelFromSdrObject().AddUndo( std::move(pUndoAction) );
+     }
+     m_pPlusData->aObjName = rStr;
++#ifdef __EMSCRIPTEN__
++    svx::objnamelog::NoteName(rStr); // FG-141
++#endif
+     // Undo/Redo for setting object's name (#i73249#)
+     if ( bUndo )
+     {
+diff --git a/svx/source/svdraw/svdpage.cxx b/svx/source/svdraw/svdpage.cxx
+index bee2bc5..7fd0b3b 100644
+--- a/svx/source/svdraw/svdpage.cxx
++++ b/svx/source/svdraw/svdpage.cxx
+@@ -60,6 +60,9 @@
+ #include <comphelper/lok.hxx>
+ 
+ #include <com/sun/star/lang/IllegalArgumentException.hpp>
++#ifdef __EMSCRIPTEN__
++#include <svx/svdobjnamelog.hxx>
++#endif
+ 
+ using namespace ::com::sun::star;
+ 
+@@ -1048,6 +1051,9 @@ void SdrObjList::InsertObjectIntoContainer (
+     else
+         maList.insert(maList.begin()+nInsertPosition, &rObject);
+     mbObjOrdNumsDirty=true;
++#ifdef __EMSCRIPTEN__
++    svx::objnamelog::NoteInserted(rObject); // FG-141
++#endif
+ }
+ 
+ 
+@@ -1083,6 +1089,9 @@ void SdrObjList::ReplaceObjectInContainer (
+ 
+     maList[nObjectPosition] = &rNewObject;
+     mbObjOrdNumsDirty=true;
++#ifdef __EMSCRIPTEN__
++    svx::objnamelog::NoteInserted(rNewObject); // FG-141
++#endif
+ }
+ 
+ 
+diff --git a/sw/inc/doc.hxx b/sw/inc/doc.hxx
+index 3ee03fb..092a185 100644
+--- a/sw/inc/doc.hxx
++++ b/sw/inc/doc.hxx
+@@ -48,6 +48,9 @@
+ #include <unordered_map>
+ #include <utility>
+ #include <vector>
++#ifdef __EMSCRIPTEN__
++#include <unordered_set>
++#endif
+ 
+ namespace editeng { class SvxBorderLine; }
+ 
+@@ -192,6 +195,28 @@ void SetAllScriptItem( SfxItemSet& rSet, const SfxPoolItem& rItem );
+ 
+ using SwRubyList = std::vector<std::unique_ptr<SwRubyListEntry>>;
+ 
++#ifdef __EMSCRIPTEN__
++namespace sw
++{
++/// FG-141: what lcl_GetUniqueFlyName (doclay.cxx) remembers about one default name base
++/// ("Frame", "Image", "Shape", "DrawObject", ...) of one SwDoc, so that a unique default
++/// name costs O(1) amortised instead of a walk over every fly. Kept on the SwDoc, never
++/// process-global: documents are loaded one after another in one WASM instance.
++struct DefaultFlyNameState
++{
++    /// Every number <= nCounter has been handed out or skipped, and is never proposed again.
++    sal_Int32 nCounter = 0;
++    /// Draw objects only: aDrawNumbersAbove was built by a full walk of the document.
++    bool bDrawWalked = false;
++    /// Draw objects only: svx::objnamelog serial up to which names have been absorbed.
++    sal_uInt64 nDrawLogSerial = 0;
++    /// Draw objects only: every number > nCounter for which some SdrObject may be named
++    /// <base><number> (a superset; see lcl_syncDrawNames in doclay.cxx).
++    std::unordered_set<sal_Int32> aDrawNumbersAbove;
++};
++}
++#endif
++
+ // Represents the model of a Writer document.
+ class SwDoc final
+ {
+@@ -307,6 +332,10 @@ private:
+ 
+     sal_uInt32  mnRsid;              //< current session ID of the document
+     sal_uInt32  mnRsidRoot;          //< session ID when the document was created
++#ifdef __EMSCRIPTEN__
++    /// FG-141: per default fly-name base, see sw::DefaultFlyNameState.
++    mutable std::unordered_map<OUString, sw::DefaultFlyNameState> maDefaultFlyNameStates;
++#endif
+ 
+     oslInterlockedCount  mReferenceCount;
+ 
+@@ -764,6 +793,11 @@ public:
+     // LayoutFormats (frames, DrawObjects), sometimes const sometimes not
+     const sw::FrameFormats<sw::SpzFrameFormat*>* GetSpzFrameFormats() const   { return mpSpzFrameFormatTable.get(); }
+           sw::FrameFormats<sw::SpzFrameFormat*>* GetSpzFrameFormats()         { return mpSpzFrameFormatTable.get(); }
++#ifdef __EMSCRIPTEN__
++    /// FG-141: see sw::DefaultFlyNameState and lcl_GetUniqueFlyName.
++    sw::DefaultFlyNameState& GetDefaultFlyNameState(const OUString& rBaseName) const
++        { return maDefaultFlyNameStates[rBaseName]; }
++#endif
+ 
+     const SwFrameFormat *GetDfltFrameFormat() const   { return mpDfltFrameFormat.get(); }
+           SwFrameFormat *GetDfltFrameFormat()         { return mpDfltFrameFormat.get(); }
+diff --git a/sw/source/core/doc/doclay.cxx b/sw/source/core/doc/doclay.cxx
+index fda630a..0d49b1e 100644
+--- a/sw/source/core/doc/doclay.cxx
++++ b/sw/source/core/doc/doclay.cxx
+@@ -85,6 +85,10 @@
+ #include <tools/datetimeutils.hxx>
+ #include <comphelper/string.hxx>
+ #include <o3tl/string_view.hxx>
++#ifdef __EMSCRIPTEN__
++#include <svx/svdobjnamelog.hxx>
++#include <optional>
++#endif
+ 
+ #include <sortedobjs.hxx>
+ 
+@@ -1348,6 +1352,139 @@ namespace
+     }
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// FG-141: the upstream walk below collects the number of every same-type fly whose name
++// starts with the default base, sorts them and takes the first gap: O(N log N) per call,
++// O(N^2 log N) for a document that creates N frames or shapes. A large PDF imported into
++// Writer creates tens of thousands of draw objects (vision2030: 43,088), each named
++// through GetUniqueShapeName (SwFmDrawPage::add), inside the import's silent emit phase;
++// measured 282 s of a 310 s emit with the walk merely reduced to a name comparison.
++//
++// lcl_GetUniqueDefaultFlyName finds the name in O(1) amortised instead. Like upstream
++// a61128c95e32 ("improve perf of lcl_GetUniqueFlyName", reverted in f1c247acd6b8 only
++// because UITests depend on predictable names), it keeps a counter per default base
++// (sw::DefaultFlyNameState, on the SwDoc) and only ever moves it forward, so a number
++// freed after the counter passed it (a deleted or renamed object) is not reused: names
++// are the same as upstream's except that gaps are not refilled. Every candidate is
++// still checked, by the rules below, and is returned only if it is provably free.
++//
++// What "free" means is upstream's scope, widened, never narrowed:
++//  * fly frames (RES_FLYFRMFMT): no fly format has that name. Exact and current via the
++//    SpzFrameFormats (type, name) index, which SwFrameFormat::SetFormatName maintains.
++//  * draw objects (RES_DRAWFRMFMT): no draw format has that name (index, as above), no
++//    fly format has it either (not checked upstream; costs one more index lookup), and
++//    no SdrObject reachable from a draw format -- including group members -- has it.
++//    SdrObject names are not indexed anywhere, so for them the state holds a SUPERSET
++//    of the numbers in use above the counter (aDrawNumbersAbove), kept current like this
++//    (lcl_syncDrawNames):
++//      - once per document and base, a full walk: every draw format's object (exactly
++//        upstream's scope) plus every object on every page of the draw model, recursing
++//        into groups;
++//      - after that, svx::objnamelog: svx records each SdrObject name at the only two
++//        places a name can become visible -- SdrObject::SetName (any rename, import,
++//        undo/redo of a rename) and the moment an object enters an SdrObjList
++//        (SdrObjList::InsertObjectIntoContainer / ReplaceObjectInContainer: a clone,
++//        a paste, an undo-restored deletion, a group with named members; recursively).
++//        Those are the only writers of the name (SdrObjPlusData::aObjName: SetName and
++//        the clone constructor, and a clone is invisible until inserted). Each call
++//        absorbs the entries written since the previous call.
++//    An object reachable from a draw format at call time was therefore either seen by
++//    the walk, or named or inserted since, so its number is in the set. The one
++//    assumption is Writer's own invariant that a draw format's master object is in the
++//    draw page (SwDrawContact's constructor and InsertMasterIntoDrawPage insert it).
++//  * if the log has wrapped since the last call (more than objnamelog::nCapacity names
++//    written in between -- possible only when something else renames or inserts that
++//    much between two calls), the entries are gone, so the walk is simply redone.
++//  * if the counter would overflow, std::nullopt sends the caller to the upstream walk.
++//
++// Names are matched exactly: only "<base><digits>" as OUString::number writes it (no
++// sign, no leading zero) can equal a candidate, so nothing else needs remembering.
++static void lcl_noteDrawName(sw::DefaultFlyNameState& rState, std::u16string_view rBase, std::u16string_view rName)
++{
++    if (!o3tl::starts_with(rName, rBase))
++        return;
++    const std::u16string_view aDigits = rName.substr(rBase.size());
++    if (aDigits.empty() || aDigits.size() > 10 || aDigits[0] == '0')
++        return;
++    sal_Int64 nNum = 0;
++    for (const sal_Unicode c : aDigits)
++    {
++        if (c < '0' || c > '9')
++            return;
++        nNum = nNum * 10 + (c - '0');
++    }
++    if (nNum > rState.nCounter && nNum <= SAL_MAX_INT32)
++        rState.aDrawNumbersAbove.insert(static_cast<sal_Int32>(nNum));
++}
++
++static void lcl_noteDrawNamesIn(sw::DefaultFlyNameState& rState, std::u16string_view rBase, const SdrObject& rObj)
++{
++    lcl_noteDrawName(rState, rBase, rObj.GetName());
++    // tdf#122487 group members count too, as in lcl_collectUsedNums
++    if (const SdrObjList* pSub = rObj.GetSubList())
++    {
++        for (const rtl::Reference<SdrObject>& pObj : *pSub)
++            lcl_noteDrawNamesIn(rState, rBase, *pObj);
++    }
++}
++
++static void lcl_syncDrawNames(const SwDoc& rDoc, sw::DefaultFlyNameState& rState, std::u16string_view rBase)
++{
++    const sal_uInt64 nNow = svx::objnamelog::GetSerial();
++    if (rState.bDrawWalked && nNow - rState.nDrawLogSerial <= svx::objnamelog::nCapacity)
++    {
++        for (sal_uInt64 nEntry = rState.nDrawLogSerial; nEntry < nNow; ++nEntry)
++            lcl_noteDrawName(rState, rBase, svx::objnamelog::GetEntry(nEntry));
++    }
++    else
++    {
++        rState.aDrawNumbersAbove.clear();
++        for (const sw::SpzFrameFormat* pFormat : *rDoc.GetSpzFrameFormats())
++        {
++            if (pFormat->Which() != RES_DRAWFRMFMT)
++                continue;
++            if (const SdrObject* pObj = pFormat->FindSdrObject())
++                lcl_noteDrawNamesIn(rState, rBase, *pObj);
++        }
++        if (const SwDrawModel* pModel = rDoc.getIDocumentDrawModelAccess().GetDrawModel())
++        {
++            for (sal_uInt16 nPage = 0; nPage < pModel->GetPageCount(); ++nPage)
++                for (const rtl::Reference<SdrObject>& pObj : *pModel->GetPage(nPage))
++                    lcl_noteDrawNamesIn(rState, rBase, *pObj);
++            for (sal_uInt16 nPage = 0; nPage < pModel->GetMasterPageCount(); ++nPage)
++                for (const rtl::Reference<SdrObject>& pObj : *pModel->GetMasterPage(nPage))
++                    lcl_noteDrawNamesIn(rState, rBase, *pObj);
++        }
++        rState.bDrawWalked = true;
++    }
++    rState.nDrawLogSerial = nNow;
++}
++
++static std::optional<UIName> lcl_GetUniqueDefaultFlyName(const SwDoc& rDoc, sal_uInt16 eType, const OUString& rBase)
++{
++    if (eType != RES_FLYFRMFMT && eType != RES_DRAWFRMFMT)
++        return std::nullopt;
++    sw::DefaultFlyNameState& rState = rDoc.GetDefaultFlyNameState(rBase);
++    const bool bDraw = eType == RES_DRAWFRMFMT;
++    if (bDraw)
++        lcl_syncDrawNames(rDoc, rState, rBase);
++    const sw::FrameFormats<sw::SpzFrameFormat*>& rFormats = *rDoc.GetSpzFrameFormats();
++    while (rState.nCounter < SAL_MAX_INT32)
++    {
++        const sal_Int32 nNum = ++rState.nCounter;
++        if (bDraw && rState.aDrawNumbersAbove.erase(nNum))
++            continue;
++        UIName aCandidate(rBase + OUString::number(nNum));
++        if (rFormats.findByTypeAndName(RES_FLYFRMFMT, aCandidate) != rFormats.typeAndNameEnd())
++            continue;
++        if (bDraw && rFormats.findByTypeAndName(RES_DRAWFRMFMT, aCandidate) != rFormats.typeAndNameEnd())
++            continue;
++        return aCandidate;
++    }
++    return std::nullopt;
++}
++#endif
++
+ static UIName lcl_GetUniqueFlyName(const SwDoc& rDoc, TranslateId pDefStrId, sal_uInt16 eType, std::u16string_view rPrefix = std::u16string_view(), SwNodeType nNdTyp = SwNodeType::NONE)
+ {
+     assert(eType >= RES_FMT_BEGIN && eType < RES_FMT_END);
+@@ -1380,6 +1517,11 @@ static UIName lcl_GetUniqueFlyName(const SwDoc& rDoc, TranslateId pDefStrId, sal
+     }
+ 
+     UIName aName(SwResId(pDefStrId));
++#ifdef __EMSCRIPTEN__
++    // FG-141: see lcl_GetUniqueDefaultFlyName; the walk below is only the fallback.
++    if (std::optional<UIName> oName = lcl_GetUniqueDefaultFlyName(rDoc, eType, aName.toString()))
++        return *oName;
++#endif
+     sal_Int32 nNmLen = aName.toString().getLength();
+ 
+     std::vector<unsigned int> aUsedNums;
