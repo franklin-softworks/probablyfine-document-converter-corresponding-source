@@ -1,0 +1,66 @@
+diff --git a/cui/Library_cui.mk b/cui/Library_cui.mk
+index 835d185dbfd2..e5fb35a01b92 100644
+--- a/cui/Library_cui.mk
++++ b/cui/Library_cui.mk
+@@ -9,7 +9,27 @@
+ 
+ $(eval $(call gb_Library_Library,cui))
+ 
++# WASM: do NOT register the component file.
++#
++# solenv/gbuild/static.mk:66-67 force-links every library that has one into the
++# static `components` library, and solenv/bin/native-code.py emits a static map
++# that names its constructors by symbol -- so --gc-sections can never drop them.
++# cui contributes two constructors, and one of them,
++# com_sun_star_cui_GetCreateDialogFactoryService, instantiates
++# AbstractDialogFactory_Impl (cui/source/factory/cuiexp.cxx:103), whose vtable
++# reaches every options tab page. That retains ~1.9 MB of code (~389 KiB brotli)
++# for dialogs that cannot be drawn in a headless converter.
++#
++# --disable-gui does not do this: in LibreOffice it only selects the headless
++# VCL backend and drops the splash screen. Nothing links cui via use_libraries.
++#
++# Dropping only the registration (rather than Library_cui itself) is deliberate:
++# static/CustomTarget_emscripten_fs_image.mk needs Package_cui/UIConfig_cui to
++# have installed the cui/ui/*.ui files. libcuilo.a is still built, just no
++# longer linked. Lookups become a catchable css::uno::DeploymentException.
++ifneq ($(OS),EMSCRIPTEN)
+ $(eval $(call gb_Library_set_componentfile,cui,cui/util/cui,services))
++endif
+ 
+ $(eval $(call gb_Library_set_include,cui,\
+     $$(INCLUDE) \
+diff --git a/sfx2/source/appl/appinit.cxx b/sfx2/source/appl/appinit.cxx
+index 2356099ecc88..a977fe0f51ba 100644
+--- a/sfx2/source/appl/appinit.cxx
++++ b/sfx2/source/appl/appinit.cxx
+@@ -136,6 +136,20 @@ typedef bool (*PFunc_getSpecialCharsForEdit)(weld::Widget* i_pParent, const vcl:
+ 
+ extern "C" { static void thisModule() {} }
+ 
++#elif defined(__EMSCRIPTEN__)
++
++// WASM: cui is not linked (its .component registration is dropped -- see
++// static/CustomTarget_emscripten_fs_image.mk and the cui patch), so this symbol
++// does not exist. sfx2 reaches for it through DISABLE_DYNLOADING's static path,
++// which is a DIRECT link-time reference rather than the runtime lookup the
++// dynamic path uses -- that is why dropping cui alone fails the link with
++// "undefined symbol: GetSpecialCharsForEdit".
++//
++// Leave the function pointer null. The call site below already guards on it and
++// returns an empty string, which is the right answer headless: this is the
++// "insert special character" dialog helper for interactive text editing, and a
++// document converter never opens it.
++
+ #else
+ 
+ extern "C" bool GetSpecialCharsForEdit(weld::Widget* i_pParent, const vcl::Font& i_rFont, OUString& o_rOutString);
+@@ -161,6 +175,8 @@ static OUString SfxGetSpecialCharsForEdit(weld::Widget* pParent, const vcl::Font
+         pfunc = reinterpret_cast<PFunc_getSpecialCharsForEdit>(aMod.getFunctionSymbol("GetSpecialCharsForEdit"));
+         DBG_ASSERT( pfunc, "GetSpecialCharsForEdit() not found!" );
+         aMod.release();
++#elif defined(__EMSCRIPTEN__)
++        pfunc = nullptr;   // cui not linked; the null guard below handles it
+ #else
+         pfunc = GetSpecialCharsForEdit;
+ #endif

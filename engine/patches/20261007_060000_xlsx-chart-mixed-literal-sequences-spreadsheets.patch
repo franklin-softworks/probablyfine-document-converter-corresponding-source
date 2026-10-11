@@ -1,0 +1,340 @@
+diff --git a/include/oox/drawingml/chart/chartconverter.hxx b/include/oox/drawingml/chart/chartconverter.hxx
+index fcf3b2f..81ab815 100644
+--- a/include/oox/drawingml/chart/chartconverter.hxx
++++ b/include/oox/drawingml/chart/chartconverter.hxx
+@@ -22,6 +22,7 @@
+ 
+ #include <com/sun/star/uno/Reference.hxx>
+ #include <oox/dllapi.h>
++#include <optional>
+ #include <rtl/ustring.hxx>
+ 
+ namespace com::sun::star {
+@@ -87,9 +88,41 @@ public:
+             const DataSequenceModel& rDataSeq, const OUString& rRole,
+             const OUString& aRoleQualifier );
+ 
++    /** True while converting a chart in which at least one series data
++        source (values, categories, bubble sizes, error bars) is a cell
++        reference rather than an inline literal (<c:numLit>/<c:strLit>).
++
++        A converter backed by sheet data (Calc's ExcelChartConverter) uses
++        this to decide whether an inline literal must be materialised as a
++        data sequence of its own. In an all-literal chart it must NOT be:
++        Shape::createAndInsert then re-imports the chart with an internal
++        data table, which is the established path and stays unchanged. */
++    bool                hasReferencedData() const { return mbHasReferencedData; }
++
++    /** Whether EVERY referenced series data source of the chart being
++        converted resolves to a data sequence WITH DATA with rxDataProvider
++        (a sequence that exists but yields no cells counts as unresolved,
++        as it does for Shape::createAndInsert's fallback test). Decided
++        lazily (a pre-pass over the model that creates and discards the
++        referenced sequences) and cached for the rest of this chart.
++
++        A sheet-backed converter must materialise a literal only when this
++        holds: if any reference fails (an external workbook name, say) the
++        chart's first used sequence may be null, and Shape::createAndInsert
++        then re-imports the chart from its caches -- which only works if the
++        literal was left null too. Conversion is per series, in model order,
++        so the literal cannot know whether a later reference will fail;
++        hence the pre-pass. */
++    bool                allReferencedSourcesResolve(
++                            const css::uno::Reference< css::chart2::data::XDataProvider >& rxDataProvider );
++
+ private:
+                         ChartConverter( const ChartConverter& ) = delete;
+     ChartConverter&     operator=( const ChartConverter& ) = delete;
++
++    ChartSpaceModel*    mpChartModel = nullptr;     /// Valid during convertFromModel only.
++    bool                mbHasReferencedData = false;
++    std::optional<bool> moReferencesResolve;        /// Cache for allReferencedSourcesResolve().
+ };
+ 
+ 
+diff --git a/oox/source/drawingml/chart/chartconverter.cxx b/oox/source/drawingml/chart/chartconverter.cxx
+index 3f004ff..163bbc0 100644
+--- a/oox/source/drawingml/chart/chartconverter.cxx
++++ b/oox/source/drawingml/chart/chartconverter.cxx
+@@ -68,6 +68,79 @@ static OUString lclGenerateApiArray(const std::vector<Any>& rRow, sal_Int32 nSta
+     return aBuffer.makeStringAndClear();
+ }
+ 
++namespace {
++
++/** A data source references the sheet when its formula is not a quoted
++    string constant. TextContext stores a literal <c:tx><c:v> series name as
++    the formula "\"name\"" (titlecontext.cxx), which is a literal too. */
++bool lclIsReferencedSource( const DataSourceModel* pSource )
++{
++    if( !pSource || !pSource->mxDataSeq.is() )
++        return false;
++    const OUString& rFormula = pSource->mxDataSeq->maFormula;
++    return !rFormula.isEmpty() && !rFormula.startsWith( "\"" );
++}
++
++/** Calls rFunc for every referenced series data source (values, categories,
++    point sizes, error-bar values) of the chart; stops and returns true as
++    soon as rFunc returns true. */
++template< typename Func >
++bool lclAnyReferencedSource( const ChartSpaceModel& rChartModel, Func&& rFunc )
++{
++    if( !rChartModel.mxPlotArea.is() )
++        return false;
++    for( const auto& rxTypeGroup : rChartModel.mxPlotArea->maTypeGroups )
++    {
++        if( !rxTypeGroup )
++            continue;
++        for( const auto& rxSeries : rxTypeGroup->maSeries )
++        {
++            if( !rxSeries )
++                continue;
++            for( const auto& rSource : rxSeries->maSources )
++                if( lclIsReferencedSource( rSource.second.get() ) && rFunc( *rSource.second->mxDataSeq ) )
++                    return true;
++            for( const auto& rxErrorBar : rxSeries->maErrorBars )
++                if( rxErrorBar )
++                    for( const auto& rSource : rxErrorBar->maSources )
++                        if( lclIsReferencedSource( rSource.second.get() ) && rFunc( *rSource.second->mxDataSeq ) )
++                            return true;
++        }
++    }
++    return false;
++}
++
++/** Whether any series of the chart takes values, categories, point sizes or
++    error-bar values from a cell reference. */
++bool lclHasReferencedData( const ChartSpaceModel& rChartModel )
++{
++    return lclAnyReferencedSource( rChartModel, []( const DataSequenceModel& ) { return true; } );
++}
++
++} // namespace
++
++bool ChartConverter::allReferencedSourcesResolve( const Reference< XDataProvider >& rxDataProvider )
++{
++    if( moReferencesResolve.has_value() )
++        return *moReferencesResolve;
++    bool bAllResolve = mpChartModel && rxDataProvider.is();
++    if( bAllResolve )
++    {
++        // Create and discard. This mirrors the test Shape::createAndInsert
++        // applies to the first used sequence: null, OR no data. A defined
++        // name whose code is a formula rather than a range (tdf140489:
++        // GrowthIR = Capital*(1+InterestRate/12)^vector) gives a sequence
++        // that exists but resolves to no cells; the chart must then stay on
++        // the cache path exactly as if the reference had failed.
++        bAllResolve = !lclAnyReferencedSource( *mpChartModel, [&]( const DataSequenceModel& rDataSeq ) {
++            Reference< XDataSequence > xSeq = createDataSequence( rxDataProvider, rDataSeq, OUString(), OUString() );
++            return !xSeq.is() || !xSeq->getData().hasElements();
++        } );
++    }
++    moReferencesResolve = bAllResolve;
++    return bAllResolve;
++}
++
+ ChartConverter::ChartConverter()
+ {
+ }
+@@ -81,6 +154,11 @@ void ChartConverter::convertFromModel( XmlFilterBase& rFilter,
+         const Reference< XShapes >& rxExternalPage, const awt::Point& rChartPos, const awt::Size& rChartSize )
+ {
+     OSL_ENSURE( rxChartDoc.is(), "ChartConverter::convertFromModel - missing chart document" );
++    // FG-051: per-chart state for the literal-sequence decision, reset here
++    // so nothing from a previous chart (or a previous pass) leaks in.
++    mpChartModel = &rChartModel;
++    mbHasReferencedData = lclHasReferencedData( rChartModel );
++    moReferencesResolve.reset();
+     if( rxChartDoc.is() )
+     {
+         Reference< data::XDataReceiver > xDataReceiver( rxChartDoc, uno::UNO_QUERY_THROW );
+@@ -92,6 +170,7 @@ void ChartConverter::convertFromModel( XmlFilterBase& rFilter,
+         ChartSpaceConverter aSpaceConv( aConvBase, rChartModel );
+         aSpaceConv.convertFromModel( rxExternalPage, rChartPos );
+     }
++    mpChartModel = nullptr;
+ }
+ 
+ void ChartConverter::createDataProvider( const Reference< XChartDocument >& rxChartDoc )
+diff --git a/oox/source/export/chartexport.cxx b/oox/source/export/chartexport.cxx
+index b64caa8..bc9a5fe 100644
+--- a/oox/source/export/chartexport.cxx
++++ b/oox/source/export/chartexport.cxx
+@@ -3463,6 +3463,10 @@ void ChartExport::exportSeriesCategory( const Reference< chart2::data::XDataSequ
+     pFS->startElement(FSNS(XML_c, nValueType));
+ 
+     OUString aCellRange = xValueSeq.is() ? xValueSeq->getSourceRangeRepresentation() : OUString();
++    // FG-051: a sequence that exists but has no source range holds inline
++    // literal data; it is written as <c:strLit>/<c:numLit>, not as a
++    // reference with an empty <c:f>.
++    const bool bLiteral = xValueSeq.is() && aCellRange.isEmpty();
+     const Sequence< Sequence< OUString >> aFinalSplitSource = (nValueType == XML_cat) ? getSplitCategoriesList(aCellRange) : Sequence< Sequence< OUString>>(0);
+     aCellRange = parseFormula( aCellRange );
+ 
+@@ -3519,13 +3523,19 @@ void ChartExport::exportSeriesCategory( const Reference< chart2::data::XDataSequ
+                 bWriteDateCategories = false;
+         }
+ 
+-        pFS->startElement(FSNS(XML_c, bWriteDateCategories ? XML_numRef : XML_strRef));
++        const sal_Int32 nRefTag = bWriteDateCategories ? (bLiteral ? XML_numLit : XML_numRef)
++                                                       : (bLiteral ? XML_strLit : XML_strRef);
++        pFS->startElement(FSNS(XML_c, nRefTag));
+ 
+-        pFS->startElement(FSNS(XML_c, XML_f));
+-        pFS->writeEscaped(aCellRange);
+-        pFS->endElement(FSNS(XML_c, XML_f));
++        if (!bLiteral)
++        {
++            pFS->startElement(FSNS(XML_c, XML_f));
++            pFS->writeEscaped(aCellRange);
++            pFS->endElement(FSNS(XML_c, XML_f));
+ 
+-        pFS->startElement(FSNS(XML_c, bWriteDateCategories ? XML_numCache : XML_strCache));
++            // a literal carries its points directly; a reference wraps them in a cache
++            pFS->startElement(FSNS(XML_c, bWriteDateCategories ? XML_numCache : XML_strCache));
++        }
+         if (bWriteDateCategories)
+         {
+             pFS->startElement(FSNS(XML_c, XML_formatCode));
+@@ -3563,8 +3573,9 @@ void ChartExport::exportSeriesCategory( const Reference< chart2::data::XDataSequ
+             }
+         }
+ 
+-        pFS->endElement(FSNS(XML_c, bWriteDateCategories ? XML_numCache : XML_strCache));
+-        pFS->endElement(FSNS(XML_c, bWriteDateCategories ? XML_numRef : XML_strRef));
++        if (!bLiteral)
++            pFS->endElement(FSNS(XML_c, bWriteDateCategories ? XML_numCache : XML_strCache));
++        pFS->endElement(FSNS(XML_c, nRefTag));
+     }
+ 
+     pFS->endElement( FSNS( XML_c, nValueType ) );
+@@ -3576,17 +3587,23 @@ void ChartExport::exportSeriesValues( const Reference< chart2::data::XDataSequen
+     pFS->startElement(FSNS(XML_c, nValueType));
+ 
+     OUString aCellRange = xValueSeq.is() ? xValueSeq->getSourceRangeRepresentation() : OUString();
++    // FG-051: see exportSeriesCategory -- no source range means inline literal data.
++    const bool bLiteral = xValueSeq.is() && aCellRange.isEmpty();
+     aCellRange = parseFormula( aCellRange );
+     // TODO: need to handle XML_multiLvlStrRef according to aCellRange
+-    pFS->startElement(FSNS(XML_c, XML_numRef));
++    pFS->startElement(FSNS(XML_c, bLiteral ? XML_numLit : XML_numRef));
+ 
+-    pFS->startElement(FSNS(XML_c, XML_f));
+-    pFS->writeEscaped( aCellRange );
+-    pFS->endElement( FSNS( XML_c, XML_f ) );
++    if (!bLiteral)
++    {
++        pFS->startElement(FSNS(XML_c, XML_f));
++        pFS->writeEscaped( aCellRange );
++        pFS->endElement( FSNS( XML_c, XML_f ) );
++    }
+ 
+     ::std::vector< double > aValues = lcl_getAllValuesFromSequence( xValueSeq );
+     sal_Int32 ptCount = aValues.size();
+-    pFS->startElement(FSNS(XML_c, XML_numCache));
++    if (!bLiteral)
++        pFS->startElement(FSNS(XML_c, XML_numCache));
+     pFS->startElement(FSNS(XML_c, XML_formatCode));
+     OUString sNumberFormatString(u"General"_ustr);
+     const sal_Int32 nKey = xValueSeq.is() ? xValueSeq->getNumberFormatKeyByIndex(-1) : 0;
+@@ -3608,8 +3625,9 @@ void ChartExport::exportSeriesValues( const Reference< chart2::data::XDataSequen
+         }
+     }
+ 
+-    pFS->endElement( FSNS( XML_c, XML_numCache ) );
+-    pFS->endElement( FSNS( XML_c, XML_numRef ) );
++    if (!bLiteral)
++        pFS->endElement( FSNS( XML_c, XML_numCache ) );
++    pFS->endElement( FSNS( XML_c, bLiteral ? XML_numLit : XML_numRef ) );
+     pFS->endElement( FSNS( XML_c, nValueType ) );
+ }
+ 
+diff --git a/sc/inc/PivotTableDataSequence.hxx b/sc/inc/PivotTableDataSequence.hxx
+index b92d736..c36b1da 100644
+--- a/sc/inc/PivotTableDataSequence.hxx
++++ b/sc/inc/PivotTableDataSequence.hxx
+@@ -23,6 +23,8 @@
+ #include <svl/itemprop.hxx>
+ #include <cppuhelper/implbase.hxx>
+ 
++#include "scdllapi.h"
++
+ #include <limits>
+ #include <utility>
+ 
+@@ -78,7 +80,9 @@ typedef cppu::WeakImplHelper<css::chart2::data::XDataSequence,
+                              css::lang::XServiceInfo>
+         PivotTableDataSequence_Base;
+ 
+-class PivotTableDataSequence final : public PivotTableDataSequence_Base, public SfxListener
++// Also the literal-backed sequence behind inline <c:numLit>/<c:strLit> chart
++// data (ExcelChartConverter, FG-051): a sequence with values but no source range.
++class SC_DLLPUBLIC PivotTableDataSequence final : public PivotTableDataSequence_Base, public SfxListener
+ {
+ public:
+     explicit PivotTableDataSequence(ScDocument* pDocument,
+diff --git a/sc/source/filter/oox/excelchartconverter.cxx b/sc/source/filter/oox/excelchartconverter.cxx
+index 3800cf6..690d60a 100644
+--- a/sc/source/filter/oox/excelchartconverter.cxx
++++ b/sc/source/filter/oox/excelchartconverter.cxx
+@@ -30,6 +30,10 @@
+ #include <oox/drawingml/chart/datasourcemodel.hxx>
+ #include <oox/helper/containerhelper.hxx>
+ #include <formulaparser.hxx>
++#include <PivotTableDataSequence.hxx>
++
++#include <algorithm>
++#include <vector>
+ 
+ namespace oox::xls {
+ 
+@@ -116,6 +120,49 @@ Reference< XDataSequence > ExcelChartConverter::createDataSequence(
+                 OSL_FAIL( "ExcelChartConverter::createDataSequence - cannot create data sequence" );
+             }
+         }
++
++        // FG-051: an inline literal (<c:numLit>/<c:strLit>) is not a cell
++        // reference, so the sheet data provider cannot compile the array
++        // string above and xDataSeq is still null here. In a chart whose
++        // other sources DO reference the sheet nothing else supplies this
++        // sequence -- the all-literal fallback in oox Shape::createAndInsert
++        // re-imports a chart with an internal data table only when its FIRST
++        // used sequence has no values -- so the literal was silently dropped:
++        // a bubble lost its size, a bar chart its category labels. Materialise
++        // it as a literal-backed sequence (values, no source range) instead.
++        // All-literal charts never enter this block and keep taking the
++        // internal-data-table fallback exactly as before. So does a chart in
++        // which ANY reference fails to resolve (e.g. an external workbook
++        // name, tdf140489.xlsx): its first used sequence may be null, the
++        // fallback then re-imports the chart from its caches, and that only
++        // works if the literal was left null as well.
++        if (!xDataSeq.is() && hasReferencedData() && allReferencedSourcesResolve(rxDataProvider))
++        {
++            // ptCount and the point indices come from the file: bound the
++            // allocation to Calc's row limit, above which the sequence stays
++            // null (today's behaviour) rather than exhausting memory.
++            constexpr sal_Int64 nMaxLiteralPoints = 1048576;
++            sal_Int64 nCount = std::max<sal_Int64>(rDataSeq.mnPointCount, 0);
++            if (!rDataSeq.maData.empty())
++                nCount = std::max<sal_Int64>(nCount, sal_Int64(rDataSeq.maData.rbegin()->first) + 1);
++            if (nCount > 0 && nCount <= nMaxLiteralPoints)
++            {
++                // a point missing from the map stays an empty ValueAndFormat (NaN)
++                std::vector<sc::ValueAndFormat> aValues(static_cast<size_t>(nCount));
++                for (const auto& rEntry : rDataSeq.maData)
++                {
++                    if (rEntry.first < 0 || rEntry.first >= nCount)
++                        continue;
++                    double fValue = 0.0;
++                    OUString aString;
++                    if (rEntry.second >>= fValue)
++                        aValues[rEntry.first] = sc::ValueAndFormat(fValue, 0);
++                    else if (rEntry.second >>= aString)
++                        aValues[rEntry.first] = sc::ValueAndFormat(aString);
++                }
++                xDataSeq.set(new sc::PivotTableDataSequence(&getScDocument(), OUString(), std::move(aValues)));
++            }
++        }
+     }
+     return xDataSeq;
+ }
