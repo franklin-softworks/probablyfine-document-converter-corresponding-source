@@ -1,0 +1,28 @@
+diff --git a/desktop/Executable_soffice_bin.mk b/desktop/Executable_soffice_bin.mk
+index 0a26ff86f8e8..a2b8b5391e1c 100644
+--- a/desktop/Executable_soffice_bin.mk
++++ b/desktop/Executable_soffice_bin.mk
+@@ -11,9 +11,23 @@ $(eval $(call gb_Executable_Executable,soffice_bin))
+ 
+ $(eval $(call gb_Executable_set_include,soffice_bin,\
+     $$(INCLUDE) \
++    -I$(SRCDIR)/desktop/inc \
+     -I$(SRCDIR)/desktop/source/inc \
+ ))
+ 
++# desktop/source/app/wasm_bridge.cxx (the WASM JS<->LOK bridge, injected by
++# engine/build/build.sh) sets the Calc print area on the UNO model rather than
++# via .uno:DefinePrintArea, which is a view-shell command and does nothing in
++# headless WASM. That needs:
++#   - the UNO API headers (css::sheet::XPrintAreas & friends)  -> use_sdk_api
++#   - desktop/inc/lib/init.hxx for desktop::LibLODocument_Impl  -> -I desktop/inc
++#     which in turn includes boost/property_tree, boost/variant,
++#     boost/container                                           -> boost_headers
++# sofficeapp already uses all three (desktop/Library_sofficeapp.mk).
++$(eval $(call gb_Executable_use_sdk_api,soffice_bin))
++
++$(eval $(call gb_Executable_use_external,soffice_bin,boost_headers))
++
+ $(eval $(call gb_Executable_add_defs,soffice_bin,\
+     $(if $(DISABLE_DYNLOADING),$(if $(SYSTEM_LIBXML),,-DNOTEST_xmlCleanupParser)) \
+ ))
