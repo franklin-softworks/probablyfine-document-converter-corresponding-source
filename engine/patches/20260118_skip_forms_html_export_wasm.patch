@@ -1,0 +1,23 @@
+diff --git a/sw/source/filter/html/htmlform.cxx b/sw/source/filter/html/htmlform.cxx
+--- a/sw/source/filter/html/htmlform.cxx
++++ b/sw/source/filter/html/htmlform.cxx
+@@ -304,6 +304,11 @@ const uno::Reference< container::XIndexContainer >& SwHTMLForm_Impl::GetForms()
+ {
+     if( !m_xForms.is() )
+     {
++#ifdef __EMSCRIPTEN__
++        // Forms service not available in WASM build - return empty
++        // This prevents XFormsSupplier query failure during HTML export
++        return m_xForms;
++#else
+         GetDrawPage();
+         if( m_xDrawPage.is() )
+         {
+@@ -317,6 +322,7 @@ const uno::Reference< container::XIndexContainer >& SwHTMLForm_Impl::GetForms()
+
+             OSL_ENSURE( m_xForms.is(), "XForms not received" );
+         }
++#endif
+     }
+     return m_xForms;
+ }

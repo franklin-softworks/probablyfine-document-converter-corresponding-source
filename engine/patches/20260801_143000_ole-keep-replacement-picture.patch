@@ -1,0 +1,113 @@
+diff --git a/sw/source/writerfilter/dmapper/DomainMapper_Impl.cxx b/sw/source/writerfilter/dmapper/DomainMapper_Impl.cxx
+index 8abec3397c69..f450ec18ec67 100644
+--- a/sw/source/writerfilter/dmapper/DomainMapper_Impl.cxx
++++ b/sw/source/writerfilter/dmapper/DomainMapper_Impl.cxx
+@@ -3655,6 +3655,45 @@ void DomainMapper_Impl::appendTextContent(
+     }
+ }
+ 
++/** appendTextContent() for an embedded object, but reporting whether the object
++    actually landed in the document instead of swallowing the failure. */
++bool DomainMapper_Impl::insertOLEObject(const rtl::Reference<SwXTextEmbeddedObject>& xOLE)
++{
++    if (m_aTextAppendStack.empty() || !hasTableManager() || getTableManager().isIgnore())
++        return false;
++
++    uno::Reference<text::XTextAppendAndConvert> xTextAppendAndConvert(
++        m_aTextAppendStack.top().xTextAppend, uno::UNO_QUERY);
++    if (!xTextAppendAndConvert.is())
++        return false;
++
++    try
++    {
++        if (m_aTextAppendStack.top().xInsertPosition.is())
++            xTextAppendAndConvert->insertTextContentWithProperties(
++                xOLE, uno::Sequence<beans::PropertyValue>(),
++                m_aTextAppendStack.top().xInsertPosition);
++        else
++            xTextAppendAndConvert->appendTextContent(
++                xOLE, uno::Sequence<beans::PropertyValue>());
++    }
++    catch (const uno::Exception&)
++    {
++        TOOLS_WARN_EXCEPTION("writerfilter.dmapper", "failed to insert OLE object");
++        return false;
++    }
++
++    // An insert that raises no exception is NOT proof that anything landed.
++    // SwXFrame::attachToRange creates the OLE node only "if (xIPObj.is())" --
++    // when the embedded object cannot be created from its CLSID it takes no
++    // else branch, throws nothing, and returns leaving the frame a descriptor
++    // with no frame format. That is the whole of this bug: a formula whose
++    // CLSID is Math (078B7ABA-...) hits it in the writer-only WASM module,
++    // where Math is not linked. Ask the object whether it is really in the
++    // document rather than trusting the silence.
++    return xOLE->GetFrameFormat() != nullptr;
++}
++
+ void DomainMapper_Impl::appendOLE( const OUString& rStreamName, const std::shared_ptr<OLEHandler>& pOLEHandler )
+ {
+     try
+@@ -3753,7 +3792,19 @@ void DomainMapper_Impl::appendOLE( const OUString& rStreamName, const std::share
+         if (!m_aTextAppendStack.empty())
+             m_aTextAppendStack.pop();
+ 
+-        appendTextContent( xOLE, uno::Sequence< beans::PropertyValue >() );
++        // appendTextContent() swallows every failure silently. That is fatal
++        // here: the replacement shape has already been marked for deletion, so
++        // a swallowed failure removes the picture AND inserts nothing, and the
++        // object vanishes from the page with no error anywhere. Do the insert
++        // directly so the outcome is known.
++        const bool bInserted = insertOLEObject(xOLE);
++        if (!bInserted && !m_vAnchoredStack.empty())
++        {
++            // The embedded object did not land. Keep the replacement picture --
++            // it is what the object looked like when the document was authored,
++            // and it is strictly better than a hole in the page.
++            m_vAnchoredStack.back().bKeepShape = true;
++        }
+ 
+         if (!aCLSID.isEmpty())
+             pOLEHandler->importStream(m_xComponentContext, GetTextDocument(), xOLE);
+@@ -5219,7 +5270,9 @@ void DomainMapper_Impl::PopShapeContext()
+     const uno::Reference<drawing::XShape> xShape( xObj, uno::UNO_QUERY_THROW );
+     // Remove the shape if required (most likely replacement shape for OLE object)
+     // or anchored to a discarded header or footer
+-    if (m_xTextDocument && (m_vAnchoredStack.back().bToRemove || m_bDiscardHeaderFooter))
++    if (m_xTextDocument
++        && ((m_vAnchoredStack.back().bToRemove && !m_vAnchoredStack.back().bKeepShape)
++            || m_bDiscardHeaderFooter))
+     {
+         try
+         {
+diff --git a/sw/source/writerfilter/dmapper/DomainMapper_Impl.hxx b/sw/source/writerfilter/dmapper/DomainMapper_Impl.hxx
+index 237b4a4d1db1..57c28c4a727d 100644
+--- a/sw/source/writerfilter/dmapper/DomainMapper_Impl.hxx
++++ b/sw/source/writerfilter/dmapper/DomainMapper_Impl.hxx
+@@ -397,9 +397,17 @@ struct AnchoredContext
+ {
+     css::uno::Reference<css::text::XTextContent> xTextContent;
+     bool bToRemove;
++    /** bToRemove carries two meanings at once: "the text append context was
++        already popped by appendOLE" AND "delete the replacement shape, the
++        embedded object stands in for it". They are only the same thing when
++        the embedded object was actually inserted. When the insert fails the
++        stack still needs rebalancing, but deleting the shape as well loses the
++        replacement picture and leaves nothing at all on the page. This flag
++        splits the second meaning off from the first. */
++    bool bKeepShape;
+ 
+     explicit AnchoredContext(css::uno::Reference<css::text::XTextContent> xContent)
+-        : xTextContent(std::move(xContent)), bToRemove(false)
++        : xTextContent(std::move(xContent)), bToRemove(false), bKeepShape(false)
+     {
+     }
+ };
+@@ -834,6 +842,7 @@ public:
+     void appendTextPortion( const OUString& rString, const PropertyMapPtr& pPropertyMap );
+     void appendTextContent(const css::uno::Reference<css::text::XTextContent>&, const css::uno::Sequence<css::beans::PropertyValue>&);
+     void appendOLE( const OUString& rStreamName, const std::shared_ptr<OLEHandler>& pOleHandler );
++    bool insertOLEObject( const rtl::Reference<SwXTextEmbeddedObject>& xOLE );
+     void appendStarMath( const Value& v);
+     void adjustLastPara(sal_Int8 nAlign);
+     rtl::Reference<SwXTextSection> appendTextSectionAfter(css::uno::Reference<css::text::XTextRange> const & xBefore);
