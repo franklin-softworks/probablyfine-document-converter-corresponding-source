@@ -1,0 +1,19 @@
+diff --git a/desktop/source/app/appinit.cxx b/desktop/source/app/appinit.cxx
+index 5d575934063c..031d01b53f36 100644
+--- a/desktop/source/app/appinit.cxx
++++ b/desktop/source/app/appinit.cxx
+@@ -67,7 +67,13 @@ namespace {
+ 
+ extern "C" void getUnoScriptUrls(std::vector<std::u16string> * urls) {
+     assert(urls != nullptr);
+-    OUString const base(emscripten::val::global("document")["baseURI"].as<std::u16string>());
++    // In a Web Worker context, 'document' is not available (only exists in main browser thread).
++    // This is the case for LibreOfficeKit WASM usage where LOK runs inside a Web Worker.
++    auto const docVal = emscripten::val::global("document");
++    if (docVal.isUndefined() || docVal.isNull()) {
++        return;
++    }
++    OUString const base(docVal["baseURI"].as<std::u16string>());
+     auto const val = emscripten::val::module_property("uno_scripts");
+     if (!val.isUndefined()) {
+         auto const len = val["length"].as<std::uint32_t>();
