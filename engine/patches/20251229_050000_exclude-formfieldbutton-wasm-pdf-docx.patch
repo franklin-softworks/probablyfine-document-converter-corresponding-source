@@ -1,0 +1,47 @@
+diff --git a/sw/Library_sw.mk b/sw/Library_sw.mk
+index f49117e58f86..b5f567b6002a 100644
+--- a/sw/Library_sw.mk
++++ b/sw/Library_sw.mk
+@@ -159,21 +159,15 @@ $(eval $(call gb_Library_add_exception_objects,sw,\
+     sw/source/core/crsr/BlockCursor \
+     sw/source/core/crsr/bookmark \
+     sw/source/core/crsr/callnk \
+-    sw/source/core/crsr/contentcontrolbutton \
+     sw/source/core/crsr/crbm \
+     sw/source/core/crsr/crossrefbookmark \
+     sw/source/core/crsr/crsrsh \
+     sw/source/core/crsr/crstrvl \
+     sw/source/core/crsr/crstrvl1 \
+-    sw/source/core/crsr/DateFormFieldButton \
+-    sw/source/core/crsr/DropDownFormFieldButton \
+-    sw/source/core/crsr/datecontentcontrolbutton \
+-    sw/source/core/crsr/dropdowncontentcontrolbutton \
+     sw/source/core/crsr/findattr \
+     sw/source/core/crsr/findcoll \
+     sw/source/core/crsr/findfmt \
+     sw/source/core/crsr/findtxt \
+-    sw/source/core/crsr/FormFieldButton \
+     sw/source/core/crsr/pam \
+     sw/source/core/crsr/paminit \
+     sw/source/core/crsr/swcrsr \
+@@ -815,6 +809,20 @@ $(eval $(call gb_Library_add_exception_objects,sw,\
+     sw/source/uibase/wrtsh/wrtundo \
+ ))
+ 
++# Form field button classes - GUI components not needed in WASM headless builds
++# Excluded from WASM because they conflict with Poppler's FormFieldButton class
++# when PDF import is enabled (both define FormFieldButton in global namespace)
++ifneq ($(OS),EMSCRIPTEN)
++$(eval $(call gb_Library_add_exception_objects,sw,\
++    sw/source/core/crsr/contentcontrolbutton \
++    sw/source/core/crsr/DateFormFieldButton \
++    sw/source/core/crsr/DropDownFormFieldButton \
++    sw/source/core/crsr/datecontentcontrolbutton \
++    sw/source/core/crsr/dropdowncontentcontrolbutton \
++    sw/source/core/crsr/FormFieldButton \
++))
++endif
++
+ ifneq (,$(filter DBCONNECTIVITY,$(BUILD_TYPE)))
+ $(eval $(call gb_Library_add_exception_objects,sw,\
+     sw/source/uibase/dbui/dbtree \
