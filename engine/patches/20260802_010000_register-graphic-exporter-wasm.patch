@@ -1,0 +1,25 @@
+diff --git a/svx/Library_svxcore.mk b/svx/Library_svxcore.mk
+index 496b6ccd17d7..fab5a5bd7689 100644
+--- a/svx/Library_svxcore.mk
++++ b/svx/Library_svxcore.mk
+@@ -22,8 +22,19 @@ $(eval $(call gb_Library_Library,svxcore))
+ $(eval $(call gb_Library_set_componentfile,svxcore,svx/util/svxcore,services))
+ 
+ $(eval $(call gb_Library_add_componentimpls,svxcore, \
+-    $(if $(ENABLE_WASM_STRIP_BASIC_DRAW_MATH_IMPRESS),,draw) \
++    draw \
+ ))
++# The "draw" componentimpl registers exactly one implementation:
++# com.sun.star.comp.Draw.GraphicExporter (service
++# com.sun.star.drawing.GraphicExportFilter). Upstream gates it on
++# !ENABLE_WASM_STRIP_BASIC_DRAW_MATH_IMPRESS, but chart2's
++# ChartView::getMetaFile() needs this service to produce the OLE replacement
++# metafile. Without it, every embedded chart in a Writer/Calc WASM module
++# renders as NOTHING: ChartModel::getPreferredVisualRepresentation catches the
++# DeploymentException silently (DBG_UNHANDLED_EXCEPTION is a no-op in release
++# builds) and returns an empty metafile. The constructor is already linked via
++# solenv/bin/native-code.py core_constructor_list; only this registration was
++# missing. See bugs/ chart-blank-page investigation (2026-08-02).
+ 
+ $(eval $(call gb_Library_add_sdi_headers,svxcore,svx/sdi/svxslots))
+ 
