@@ -1,0 +1,101 @@
+From: Claude <claude@anthropic.com>
+Date: Sun, 27 Jul 2026 21:00:00 +0000
+Subject: [PATCH] WASM: symmetric headless fast path for setComponent DETACH (BUG-20)
+
+Root cause of the shutdown_office() trap ("function signature mismatch", every
+instance, since forever — BUG-20):
+
+lo_destroy() -> Desktop::terminate() -> impl_closeFrames() -> XFrameImpl::close()
+-> setComponent(nullptr, nullptr).  The stock detach path broadcasts
+FrameAction_COMPONENT_DETACHING.  The frame's TitleHelper reacts
+(frameAction -> impl_updateListeningForFrame -> impl_setSubTitle) and calls
+SfxBaseController::addTitleChangeListener on the dying headless controller,
+whose impl_getTitleHelper() lazily creates a NEW framework::TitleHelper for a
+controller that is seconds from disposal, with a model that is already closed.
+That helper self-registers into the controller's m_aListenerContainer from
+inside its own constructor, and construction-time Reference temporaries drive
+its refcount to zero before impl_getTitleHelper() returns: measured via CDP
+wasm breakpoints — cppu::OWeakObject::release() fires twice from inside the
+TitleHelper constructor call chain and dlfree(helper) is reached from within
+SfxBaseController::impl_getTitleHelper() itself, with no ~TitleHelper frame
+(inlined) and no removeEventListener ever called.  The controller's listener
+container is left holding a raw pointer to freed memory (acquired via
+addInterface, never released).  SfxBaseController::dispose() then iterates the
+container; OInterfaceIteratorHelper2's constructor virtual-calls acquire()
+through the freed object's clobbered vtable, and under WASM that call_indirect
+deterministically traps with "function signature mismatch", aborting
+lo_destroy() before any teardown or static reset runs.
+
+The attach side of setComponent already takes a headless fast path (patch
+20251221_210000) that skips implts_sendFrameActionEvent(COMPONENT_ATTACHED) —
+so frame listeners were never introduced to the headless controller in the
+first place.  Broadcasting COMPONENT_DETACHING at teardown is therefore
+asymmetric, and it is exactly what wakes the TitleHelper chain.  Fix: mirror
+the attach fast path on the detach side.  When LOK-headless (EMSCRIPTEN + LOK
+active), both arguments are null and the frame has no component window, skip
+window listening/broadcast work entirely: clear m_xController and protocol
+handlers under the SolarMutex, dispose the old controller, and return.  The
+controller's dispose() still runs (its listener container is now empty, so no
+trap), close() then proceeds to dispose the frame, and lo_destroy() finally
+reaches Application::Quit, the LibLibreOffice_Impl delete, and the extended
+static reset (which had never executed before this fix).
+
+diff --git a/framework/source/services/frame.cxx b/framework/source/services/frame.cxx
+--- a/framework/source/services/frame.cxx
++++ b/framework/source/services/frame.cxx
+@@ -1463,6 +1463,55 @@
+         return true;
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++    // WASM/LOK headless mode: symmetric fast path for DETACH (BUG-20).
++    // The attach fast path above never broadcast COMPONENT_ATTACHED, so frame
++    // listeners were never introduced to the headless controller.  The stock
++    // detach path below would broadcast COMPONENT_DETACHING anyway, which makes
++    // the frame's TitleHelper poke the dying controller
++    // (SfxBaseController::addTitleChangeListener -> impl_getTitleHelper),
++    // spawning a TitleHelper that is freed during construction-time reentrancy
++    // while the controller's listener container still holds its raw pointer.
++    // SfxBaseController::dispose() then virtual-calls acquire() through freed
++    // memory and traps ("function signature mismatch"), aborting lo_destroy().
++    // Skip the UI broadcasts entirely and just dispose the controller: headless
++    // conversion has no UI listeners that need COMPONENT_DETACHING.
++    if (comphelper::LibreOfficeKit::isActive()
++        && !xController.is() && !xComponentWindow.is()
++        && !m_xComponentWindow.is())
++    {
++        std::cerr << "[FRAME] LOK headless mode: fast path for setComponent detach" << std::endl << std::flush;
++        checkDisposed();
++        css::uno::Reference< css::frame::XController > xOldController;
++        /* SAFE { */
++        {
++            SolarMutexGuard aWriteLock;
++            xOldController = m_xController;
++            m_xController.clear();
++            if (m_xDispatchHelper)
++            {
++                rtl::Reference<DispatchProvider> pDispatchProvider = m_xDispatchHelper->GetSlave();
++                if (pDispatchProvider)
++                    pDispatchProvider->ClearProtocolHandlers();
++            }
++            m_bConnected = false;
++        }
++        /* } SAFE */
++        if (xOldController.is())
++        {
++            try
++            {
++                xOldController->dispose();
++            }
++            catch(const css::lang::DisposedException&)
++                {}
++        }
++        xOldController.clear();
++        std::cerr << "[FRAME] LOK headless setComponent detach completed" << std::endl << std::flush;
++        return true;
++    }
++#endif
++
+     checkDisposed();
+ 
+     // Get threadsafe some copies of used members.

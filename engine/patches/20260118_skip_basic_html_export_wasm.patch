@@ -1,0 +1,25 @@
+diff --git a/sw/source/filter/html/wrthtml.cxx b/sw/source/filter/html/wrthtml.cxx
+--- a/sw/source/filter/html/wrthtml.cxx
++++ b/sw/source/filter/html/wrthtml.cxx
+@@ -1173,8 +1173,10 @@ const SwPageDesc *SwHTMLWriter::MakeHeader( sal_uInt16 &rHeaderAttrs )
+         }
+
+         // and now ... the BASIC and JavaScript!
++#ifndef __EMSCRIPTEN__
+         if( m_pDoc->GetDocShell() )   // BASIC is possible only in case we have a DocShell
+             OutBasic(*this);
++#endif
+
+         DecIndentLevel();   // indent content of <HEAD>
+         OutNewLine();
+@@ -1215,8 +1217,10 @@ const SwPageDesc *SwHTMLWriter::MakeHeader( sal_uInt16 &rHeaderAttrs )
+             OutCSS1_BodyTagStyleOpt( *this, rItemSet );
+         }
+         // append events
++#ifndef __EMSCRIPTEN__
+         if( m_pDoc->GetDocShell() )   // BASIC is possible only in case we have a DocShell
+             OutBasicBodyEvents();
++#endif
+
+         Strm().WriteChar( '>' );
+     }
