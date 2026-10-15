@@ -1,0 +1,85 @@
+diff --git a/sc/source/filter/oox/drawingfragment.cxx b/sc/source/filter/oox/drawingfragment.cxx
+index 6b58204..953188d 100644
+--- a/sc/source/filter/oox/drawingfragment.cxx
++++ b/sc/source/filter/oox/drawingfragment.cxx
+@@ -19,6 +19,9 @@
+ 
+ #include <drawingfragment.hxx>
+ 
++#include <cstdlib>
++
++#include <sal/log.hxx>
+ #include <basegfx/matrix/b2dhommatrix.hxx>
+ #include <comphelper/propertyvalue.hxx>
+ 
+@@ -159,6 +162,25 @@ GroupShapeContext::GroupShapeContext( const FragmentHandler2& rParent,
+         }
+         case XDR_TOKEN( graphicFrame ):
+         {
++#ifdef __EMSCRIPTEN__
++            // <xdr:graphicFrame> is the only drawing element that carries charts,
++            // SmartArt and OLE objects, and a chart is the ONLY drawing kind for
++            // which an abort was ever actually evidenced in this build
++            // (2025-12-07, college_budget.xlsx, 4 charts). Pictures (<xdr:pic>)
++            // and shapes (<xdr:sp>) never had a reproducer and are always
++            // imported.
++            //
++            // SC_WASM_SKIP_CHART_IMPORT is a kill switch settable from the worker
++            // (Module.ENV): it drops chart/OLE frames only, leaving every picture
++            // in the sheet intact. Use it if chart import turns out to still
++            // abort — it is a JS change, not a rebuild.
++            if( std::getenv( "SC_WASM_SKIP_CHART_IMPORT" ) != nullptr )
++            {
++                SAL_WARN( "sc.filter", "WASM: SC_WASM_SKIP_CHART_IMPORT is set - "
++                                       "skipping xdr:graphicFrame (chart/OLE/SmartArt)" );
++                return nullptr;
++            }
++#endif
+             ShapePtr xShape = std::make_shared<Shape>( rHelper, rAttribs, u"com.sun.star.drawing.GraphicObjectShape"_ustr );
+             if( pxShape ) *pxShape = xShape;
+             return new GraphicalObjectFrameContext( rParent, rxParentShape, xShape, rHelper.getSheetType() != WorksheetType::Chart );
+diff --git a/sc/source/filter/oox/worksheethelper.cxx b/sc/source/filter/oox/worksheethelper.cxx
+index fe6a086..5c45671 100644
+--- a/sc/source/filter/oox/worksheethelper.cxx
++++ b/sc/source/filter/oox/worksheethelper.cxx
+@@ -17,6 +17,7 @@
+  *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
+  */
+ 
++#include <cstdlib>
+ #include <memory>
+ #include <utility>
+ #include <worksheethelper.hxx>
+@@ -1348,11 +1349,32 @@ void WorksheetGlobals::finalizeDrawings()
+     maDrawPageSize.Width = lclClampToNonNegativeInt32( aPageSize.Width() );
+     maDrawPageSize.Height = lclClampToNonNegativeInt32( aPageSize.Height() );
+ 
++#ifdef __EMSCRIPTEN__
++    // WASM: importing xl/drawings/ used to be skipped unconditionally here, which
++    // meant every picture in every XLSX was silently dropped (an import-side loss:
++    // the objects never entered the model at all). The evidenced abort that the
++    // skip was written for (2025-12-07) involved CHARTS; pictures and shapes were
++    // only collateral damage, and Calc's ODF path — which builds the same
++    // SdrGrafObj on the same draw page — exports images to PDF correctly in this
++    // build. So the default is now to import.
++    //
++    // SC_WASM_SKIP_DRAWING_IMPORT is a kill switch that restores the old
++    // behaviour WITHOUT a rebuild (the worker can set it via Module.ENV), so a
++    // regression here costs a JS change rather than a 90-minute WASM build.
++    if( std::getenv( "SC_WASM_SKIP_DRAWING_IMPORT" ) != nullptr )
++    {
++        SAL_WARN( "sc.filter", "WASM: SC_WASM_SKIP_DRAWING_IMPORT is set - "
++                               "skipping all drawing/chart import for this sheet" );
++    }
++    else
++#endif
++    {
+     // import DML and VML
+     if( !maDrawingPath.isEmpty() )
+         importOoxFragment( new DrawingFragment( *this, maDrawingPath ) );
+     if( !maVmlDrawingPath.isEmpty() )
+         importOoxFragment( new VmlDrawingFragment( *this, maVmlDrawingPath ) );
++    }
+ 
+     // comments (after callout shapes have been imported from VML/DFF)
+     maComments.finalizeImport();
