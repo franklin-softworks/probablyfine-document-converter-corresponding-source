@@ -1,0 +1,22 @@
+diff --git a/svx/source/sdr/primitive2d/sdrattributecreator.cxx b/svx/source/sdr/primitive2d/sdrattributecreator.cxx
+--- a/svx/source/sdr/primitive2d/sdrattributecreator.cxx	2026-01-29 12:35:46.761360179 +0000
++++ b/svx/source/sdr/primitive2d/sdrattributecreator.cxx	2026-01-29 12:35:46.761477980 +0000
+@@ -625,9 +625,18 @@
+             {
+                 const SdrTextAniKind eAniKind(rTextObj.GetTextAniKind());
+ 
++#ifdef __EMSCRIPTEN__
++                // WASM/LOK optimization: Skip expensive GetDrawOutliner() call.
++                // This function is only called to check if spell checking is enabled,
++                // which is never needed for headless PDF export. Each call triggers
++                // a full Outliner::Init() reinitialize - eliminating 6000+ calls
++                // reduces table-heavy PPTX export from >10 min to <2 min.
++                const bool bWrongSpell = false;
++#else
+                 // #i107346#
+                 const SdrOutliner& rDrawTextOutliner(rText.GetObject().getSdrModelFromSdrObject().GetDrawOutliner(&rTextObj));
+                 const bool bWrongSpell(rDrawTextOutliner.GetControlWord() & EEControlBits::ONLINESPELLING);
++#endif
+ 
+                 return attribute::SdrTextAttribute(
+                     rText,
