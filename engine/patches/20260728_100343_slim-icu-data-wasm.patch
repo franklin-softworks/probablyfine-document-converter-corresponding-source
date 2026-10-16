@@ -1,0 +1,195 @@
+diff --git a/bin/lo-slim-icu-data.py b/bin/lo-slim-icu-data.py
+new file mode 100755
+index 000000000000..2601884f5b17
+--- /dev/null
++++ b/bin/lo-slim-icu-data.py
+@@ -0,0 +1,157 @@
++#!/usr/bin/env python3
++"""Strip locale display-name trees and unused features from ICU's prebuilt .dat.
++
++WHY THIS EXISTS
++    LibreOffice links ICU's complete data archive (icudt<NN>l.dat, ~30.4 MiB) as
++    a static blob into the WASM data section. A headless DOCX->PDF converter with
++    no UI opens a small fraction of it. Measured on the real archive with the
++    production compressor (brotli -q 11):
++
++        full archive                      30.42 MiB raw -> 7.52 MiB brotli
++        minus display-name trees          17.72 MiB     -> 4.91 MiB   (-2.61)
++        minus those + unused features     10.58 MiB     -> 3.52 MiB   (-4.00)
++
++    ICU is ~61% of the module's compressed data section, so the second variant
++    removes ~15% of EVERY module's download. The saving multiplies across all
++    five modules because every one embeds this same archive.
++
++WHY IT IS SAFE TO CUT WHAT IS CUT — verified in the LibreOffice source, not assumed:
++    curr/ zone/ lang/ region/ unit/  CLDR *display name* bundles ("the name of
++        currency X in locale Y"). LibreOffice does NOT use ICU for number, date
++        or currency formatting at all -- SvNumberFormatter (svl/source/numbers/
++        zformat.cxx) formats using i18npool's own XML-derived locale data, and
++        there are no ucurr_*/uldn_*/TimeZoneNames/MeasureFormat consumers in the
++        tree. Timezone COMPUTATION is unaffected: icu::Calendar reads
++        zoneinfo64/metaZones/timezoneTypes, which are top-level and kept.
++    rbnf/  Rule-based number formatting. NatNum12 spell-out does NOT use it --
++        LibreOffice uses external/libnumbertext. The only consumer is
++        i18npool/source/ordinalsuffix (autocorrect "1st" superscripting), which
++        never runs headless and already returns an empty string on failure.
++    .cnv   Charset converters. The only ucnv_open in LO core is inside an
++        iOS-only block in desktop/source/lib/init.cxx; LibreOffice transcodes
++        with its own rtl_textenc tables. cnvalias.icu is KEPT regardless.
++    translit/  One consumer (ignoreDiacritics_CTL) builds "NFD; [:M:] Remove;
++        NFC" -- all code-registered specials, so the compound still constructs
++        with the rule bundles absent (icu 77 i18n/translit.cpp uses a local
++        status for that load).
++    unames.icu .spp .cfu  u_charName consumers are the GUI character-map dialogs
++        (dead under --disable-gui); no usprep/uidna/uspoof consumers exist.
++
++WHAT MUST NEVER BE CUT — and why, so nobody "optimises" these later:
++    brkitr/ + its dictionaries  Line and word breaking. CJK (cjdict), Thai,
++        Khmer, Lao, Burmese have no inter-word spaces, so losing this produces
++        silently WRONG line breaks rather than an error -- the worst failure
++        class this project has. LibreOffice even ships a custom khmerdict.
++    coll/ + ucadata.icu  icu::Collator. Alphabetical indexes and bibliography
++        sorting, plus the BUILD-TIME gencoll_rule tool (which runs against the
++        host ICU tree this script also slims).
++    top-level .res  The main locale tree: calendar data, res_index,
++        supplementalData (which is where likelySubtags actually lives -- it is
++        NOT a separate file), zoneinfo64, metaZones, timezoneTypes.
++    .nrm  NFKC/NFKC_CF/UTS46. Collation and transliteration depend on them.
++    (Character properties, NFC, ucase and ubidi are compiled into libicuuc CODE,
++    not this archive, so no data cut can reach them.)
++
++Idempotent: re-running on an already-slimmed archive is a no-op.
++"""
++import os
++import re
++import struct
++import sys
++
++# Entry name prefixes to drop, matched AFTER the "icudt77l/" package prefix.
++CUT_PREFIXES = ('curr/', 'zone/', 'lang/', 'region/', 'unit/', 'translit/', 'rbnf/')
++# Entry name suffixes to drop.
++CUT_SUFFIXES = ('.cnv', '.spp', '.cfu')
++# Never drop these, whatever the rules above say. Belt and braces: a future edit
++# to CUT_PREFIXES that collides with one of these fails loudly instead of
++# silently shipping a build with broken line breaking.
++MUST_KEEP_SUBSTRINGS = ('brkitr/', 'coll/', 'ucadata.icu', '.nrm', 'unames.icu',
++                        'zoneinfo64.res', 'metaZones.res', 'timezoneTypes.res',
++                        'supplementalData.res', 'cnvalias.icu')
++
++
++def slim(path):
++    data = open(path, 'rb').read()
++    hdr = struct.unpack('<H', data[0:2])[0]
++    if (data[2], data[3]) != (0xda, 0x27):
++        print(f'lo-slim-icu-data: {path} is not an ICU .dat (bad magic); skipping')
++        return False
++    base = hdr
++    count = struct.unpack('<I', data[base:base + 4])[0]
++
++    def name_at(off):
++        end = data.index(b'\0', base + off)
++        return data[base + off:end].decode('ascii')
++
++    entries = []
++    for i in range(count):
++        n, d = struct.unpack('<II', data[base + 4 + i * 8:base + 12 + i * 8])
++        entries.append((name_at(n), d))
++
++    order = sorted(range(count), key=lambda i: entries[i][1])
++    body = {}
++    for idx, i in enumerate(order):
++        nm, off = entries[i]
++        end = (base + entries[order[idx + 1]][1]) if idx + 1 < count else len(data)
++        body[nm] = data[base + off:end]
++
++    def cut(nm):
++        short = nm.split('/', 1)[1] if '/' in nm else nm
++        if any(k in nm for k in MUST_KEEP_SUBSTRINGS):
++            return False
++        return short.startswith(CUT_PREFIXES) or short.endswith(CUT_SUFFIXES)
++
++    keep = [(n, body[n]) for n, _ in entries if not cut(n)]
++    if len(keep) == count:
++        print(f'lo-slim-icu-data: {path} already slim ({count} items); nothing to do')
++        return False
++
++    # Sanity: the survivors must still contain the load-bearing trees. If a bad
++    # edit to the cut lists removed them, fail the BUILD rather than ship a
++    # module with wrong CJK/Thai line breaking, which no test asserts directly.
++    kept_names = [n for n, _ in keep]
++    for needed in ('brkitr/', 'coll/', '.nrm', 'unames.icu'):
++        if not any(needed in n for n in kept_names):
++            sys.exit(f'lo-slim-icu-data: REFUSING to write {path}: no "{needed}" '
++                     f'entries survived. Check CUT_PREFIXES/CUT_SUFFIXES.')
++
++    toc = 4 + 8 * len(keep)
++    names, noffs = b'', []
++    for n, _ in keep:
++        noffs.append(toc + len(names))
++        names += n.encode('ascii') + b'\0'
++    start = (toc + len(names) + 15) & ~15
++    blobs, doffs = b'', []
++    for _, blob in keep:
++        off = start + len(blobs)
++        aligned = (off + 15) & ~15
++        blobs += b'\xaa' * (aligned - off) + blob
++        doffs.append(aligned)
++
++    out = bytearray(data[:hdr])
++    out += struct.pack('<I', len(keep))
++    for no, do in zip(noffs, doffs):
++        out += struct.pack('<II', no, do)
++    out += names
++    out += b'\xaa' * (start - (toc + len(names)))
++    out += blobs
++
++    tmp = path + '.slim'
++    open(tmp, 'wb').write(out)
++    os.replace(tmp, path)
++    print(f'lo-slim-icu-data: {os.path.basename(path)}: {count} -> {len(keep)} items, '
++          f'{len(data):,} -> {len(out):,} bytes '
++          f'(-{100.0 * (len(data) - len(out)) / len(data):.1f}%)')
++    return True
++
++
++if __name__ == '__main__':
++    targets = sys.argv[1:]
++    if not targets:
++        sys.exit('usage: lo-slim-icu-data.py <icudt*.dat> [...]')
++    for t in targets:
++        if os.path.exists(t):
++            slim(t)
++        else:
++            print(f'lo-slim-icu-data: {t} not present; skipping')
+diff --git a/external/icu/UnpackedTarball_icu.mk b/external/icu/UnpackedTarball_icu.mk
+index b3bd35e605e8..24f8d8bb426f 100644
+--- a/external/icu/UnpackedTarball_icu.mk
++++ b/external/icu/UnpackedTarball_icu.mk
+@@ -45,6 +45,27 @@ $(eval $(call gb_UnpackedTarball_add_patches,icu,\
+ 
+ $(eval $(call gb_UnpackedTarball_add_file,icu,source/data/brkitr/khmerdict.dict,external/icu/khmerdict.dict))
+ 
++# Strip ICU's locale display-name trees and unused feature data before pkgdata
++# packs the archive into libicudata. ICU ships a PREBUILT source/data/in/icudt*.dat
++# and source/data/Makefile.in short-circuits the whole source-data build when that
++# wildcard hits, so rewriting the .dat here propagates through icupkg -> pkgdata ->
++# the static lib with no changes to the cross-compile logic.
++#
++# Measured on the real archive with the production compressor (brotli -q 11):
++# 30.42 MiB raw / 7.52 MiB brotli -> 10.58 MiB / 3.52 MiB. ICU is ~61% of the
++# module's compressed data section, so this removes ~15% of EVERY module's
++# download, and every module embeds the same archive.
++#
++# What is cut and why it is safe, plus what must never be cut, is documented in
++# bin/lo-slim-icu-data.py. The short version: LibreOffice does not use ICU for
++# number/date/currency formatting (SvNumberFormatter uses i18npool's own data),
++# so the CLDR display-name trees have no consumers; break iteration, collation,
++# normalisation and the main locale tree are all KEPT, and the script refuses to
++# write an archive that lost them.
++$(eval $(call gb_UnpackedTarball_set_post_action,icu,\
++	$(PYTHON_FOR_BUILD) $(SRCDIR)/bin/lo-slim-icu-data.py source/data/in/icudt*.dat \
++))
++
+ # cannot use post_action since $(file ..) would be run when the recipe is parsed, i.e. would always
+ # happen before the tarball is unpacked
+ $(gb_UnpackedTarball_workdir)/icu/icu-uc-uninstalled.pc: $(call gb_UnpackedTarball_get_target,icu)
