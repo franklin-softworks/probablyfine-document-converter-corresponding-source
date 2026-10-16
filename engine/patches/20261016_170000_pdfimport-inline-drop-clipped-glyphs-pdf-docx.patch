@@ -1,0 +1,163 @@
+--- a/sdext/source/pdfimport/tree/pdfiprocessor.cxx
++++ b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+@@ -41,6 +41,11 @@
+ #include <i18nutil/unicode.hxx>
+ #include <o3tl/string_view.hxx>
+ #include <algorithm>
++#ifdef __EMSCRIPTEN__
++#include <cmath>
++#include <basegfx/point/b2dpoint.hxx>
++#include <basegfx/range/b2drange.hxx>
++#endif
+ 
+ #ifdef __EMSCRIPTEN__
+ #include <stdio.h>  // for fprintf diagnostics
+@@ -311,6 +316,39 @@
+     totalTextMatrix1 *= getCurrentContext().Transformation;
+     totalTextMatrix2 *= getCurrentContext().Transformation;
+ 
++#ifdef __EMSCRIPTEN__
++    // FG-157: drop a glyph that lies wholly outside the current clip. Paths are
++    // clipped against getCurrentContext().Clip (fillPath, strokePath, ...), glyphs
++    // never were, so text the PDF draws but clips away came back as text boxes.
++    // StarOffice 9 writes every page's drawing objects into every page's content
++    // stream, offset by the page pitch and hidden by the page clip: book.pdf's
++    // sidebar text came back once per page (Draw import) or once per page up to
++    // its own (Writer import). PowerPoint posters keep pasteboard text beyond the
++    // slide the same way. A viewer shows none of it, and pdftotext and MuPDF do
++    // not extract it. The test is on the glyph origin against the clip's bounding
++    // box grown by twice the glyph size, so text that is partly visible, or bleeds
++    // over the clip edge, is kept.
++    {
++        const basegfx::B2DPolyPolygon& rClip = getCurrentContext().Clip;
++        if (rClip.count())
++        {
++            basegfx::B2DTuple aGlyphScale, aGlyphOrigin;
++            double fGlyphRotate, fGlyphShearX;
++            totalTextMatrix1.decompose(aGlyphScale, aGlyphOrigin, fGlyphRotate, fGlyphShearX);
++            basegfx::B2DRange aVisible(rClip.getB2DRange());
++            aVisible.grow(2.0 * std::max(std::abs(aGlyphScale.getX()), std::abs(aGlyphScale.getY())));
++            if (!aVisible.isInside(basegfx::B2DPoint(aGlyphOrigin)))
++            {
++                // close the line before it, so the next visible glyph starts a new one
++                processGlyphLine();
++                prevTextMatrix = totalTextMatrix1;
++                prevCharWidth = 0.0;
++                return;
++            }
++        }
++    }
++#endif
++
+     basegfx::B2DHomMatrix invMatrix(totalTextMatrix1);
+     basegfx::B2DHomMatrix invPrevMatrix(prevTextMatrix);
+     invMatrix.invert();
+@@ -462,6 +500,11 @@
+                        true, /* bInside, keep parts inside the clip */
+                        false /* bStroke, filled not stroked */ );
+     }
++#ifdef __EMSCRIPTEN__
++    // FG-157: wholly clipped away -> no element (it would be an empty draw:path)
++    if( !aB2DPoly.count() )
++        return;
++#endif
+     // TODO: That clipping might shift the fill pattern offsets
+ 
+     double transformedxStep = nxStep * rMat.m00 + nyStep * rMat.m01;
+@@ -663,6 +706,11 @@
+                     true, /* bInside, keep parts inside the clip */
+                     !aPoly.isClosed() /* bStroke */ );
+     }
++#ifdef __EMSCRIPTEN__
++    // FG-157: wholly clipped away -> no element (it would be an empty draw:path)
++    if( !aPoly.count() )
++        return;
++#endif
+ 
+     PolyPolyElement* pPoly = ElementFactory::createPolyPolyElement(
+         m_pCurElement,
+@@ -687,6 +735,11 @@
+                     true, /* bInside, keep parts inside the clip */
+                     false /* bStroke, filled not stroked */ );
+     }
++#ifdef __EMSCRIPTEN__
++    // FG-157: wholly clipped away -> no element (it would be an empty draw:path)
++    if( !aPoly.count() )
++        return;
++#endif
+ 
+     PolyPolyElement* pPoly = ElementFactory::createPolyPolyElement(
+         m_pCurElement,
+@@ -709,6 +762,11 @@
+                     true, /* bInside, keep parts inside the clip */
+                     false /* bStroke, filled not stroked */ );
+     }
++#ifdef __EMSCRIPTEN__
++    // FG-157: wholly clipped away -> no element (it would be an empty draw:path)
++    if( !aPoly.count() )
++        return;
++#endif
+ 
+     PolyPolyElement* pPoly = ElementFactory::createPolyPolyElement(
+         m_pCurElement,
+@@ -720,6 +778,30 @@
+     pPoly->ZOrder = m_nNextZOrder++;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++namespace
++{
++    // FG-157: an empty intersection means NOTHING is visible, but every reader
++    // of GraphicsContext::Clip here takes an empty B2DPolyPolygon to mean "no
++    // clip", and so does the next intersect (`if( aCurClip.count() )`), which
++    // then adopted the new path unclipped. StarOffice 9 clips each page to the
++    // page and then to an object's own (off-page) area; the empty intersection
++    // turned into "the off-page area is visible", and that text came back.
++    // Keep the state instead: a closed one-point polygon far off any page. It is
++    // non-empty, so the next intersection stays empty; it has no area, so paths
++    // and shadings clip to nothing; and no glyph origin lies near it.
++    void lcl_keepEmptyClip(basegfx::B2DPolyPolygon& rClip)
++    {
++        if (rClip.count())
++            return;
++        basegfx::B2DPolygon aNowhere;
++        aNowhere.append(basegfx::B2DPoint(-1.0e7, -1.0e7));
++        aNowhere.setClosed(true);
++        rClip = basegfx::B2DPolyPolygon(aNowhere);
++    }
++}
++#endif
++
+ void PDFIProcessor::intersectClip(const uno::Reference< rendering::XPolyPolygon2D >& rPath)
+ {
+     // TODO(F3): interpret fill mode
+@@ -730,6 +812,9 @@
+     if( aCurClip.count() )  // #i92985# adapted API from (..., false, false) to (..., true, false)
+         aNewClip = basegfx::utils::clipPolyPolygonOnPolyPolygon( aCurClip, aNewClip, true, false );
+ 
++#ifdef __EMSCRIPTEN__
++    lcl_keepEmptyClip(aNewClip);
++#endif
+     getCurrentContext().Clip = std::move(aNewClip);
+ }
+ 
+@@ -743,6 +828,9 @@
+     if( aCurClip.count() )  // #i92985# adapted API from (..., false, false) to (..., true, false)
+         aNewClip = basegfx::utils::clipPolyPolygonOnPolyPolygon( aCurClip, aNewClip, true, false );
+ 
++#ifdef __EMSCRIPTEN__
++    lcl_keepEmptyClip(aNewClip);
++#endif
+     getCurrentContext().Clip = std::move(aNewClip);
+ }
+ 
+@@ -785,6 +873,9 @@
+     if( aCurClip.count() )  // #i92985# adapted API from (..., false, false) to (..., true, false)
+         aNewClip = basegfx::utils::clipPolyPolygonOnPolyPolygon( aCurClip, aNewClip, true, false );
+ 
++#ifdef __EMSCRIPTEN__
++    lcl_keepEmptyClip(aNewClip);
++#endif
+     getCurrentContext().Clip = std::move(aNewClip);
+ }
+ 
