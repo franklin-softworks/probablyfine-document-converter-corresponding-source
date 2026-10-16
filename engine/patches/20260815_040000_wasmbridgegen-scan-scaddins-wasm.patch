@@ -1,0 +1,94 @@
+From: Claude <claude@anthropic.com>
+Subject: [PATCH] WASM: let the UNO bridge generator see scaddins' interfaces
+
+bugs/bug_addin_double_args.md: 11 analysis add-in functions return #VALUE! when a
+formula carries no cached value. The report's signature table was right -- returns
+`double` with more than one argument fails -- but its prose attributed that to
+"double argument marshalling", which is not what happens.
+
+The WASM UNO bridge does not dispatch generically. static/source/wasmbridgegen
+emits one callVirtualFunction_<sig> thunk per signature it SEES, plus a dispatcher
+that ends in
+
+    throw RuntimeException("Wasm bridge cannot call virtual function with
+                            signature " + signature)
+
+and bridges/CustomTarget_gcc3_wasm.mk invoked it with only +udkapi +offapi.
+com.sun.star.sheet.addin.XAnalysis lives in scaddins/idl, so the generator never
+saw it and never emitted thunks for the signatures its methods need.
+
+Measured, with the inner exception printed rather than the outer wrapper:
+
+    getQuotient(double,double)  -> signature didd     MISSING
+    getMround(double,double)    -> signature didd     MISSING
+    getErf(XPropertySet&,...)   -> signature diidi    MISSING
+    getSeriesSum(...)           -> signature didddi   MISSING
+    ... and diiii, diiiii
+
+The generated set contained only di, did, dii, diid, diii for double returns.
+
+This also explains why SOME add-in functions worked: getWorkday and getDelta return
+sal_Int32 and getDec2Bin returns OUString, and their signatures happen to coincide
+with ones offapi already required. Coincidence, not design -- which is why the
+failure looked like an arbitrary "double with 2+ arguments" rule. The decisive
+control is getYearFrac vs getWorkday: identical argument sequences
+[XInterface, long, long, void], differing only in return type, one fails and one
+works.
+
+Fix: pass scaddins' InternalUnoApi to the generator as a third registry, so the
+
+AMENDED 2026-09-20 -- GATED ON ENABLE_WASM_STRIP_CALC. The original form of this
+patch referenced scaddins UNCONDITIONALLY, and that broke every build on a
+machine with an empty workdir -- which is every fresh CI runner, on every run.
+
+scaddins is a CALC add-in. RepositoryModule_host.mk gates it behind
+`$(if $(ENABLE_WASM_STRIP_CALC),, ... sc scaddins sccomp ... )`, so in a writer
+or impress build the module is excluded, scaddins/InternalUnoApi_scaddins.mk's
+`gb_InternalUnoApi_InternalUnoApi` registration never runs, and the order-only
+`.dir` prerequisite that creates workdir/InternalUnoApi/ is never declared. make
+then falls back to the bare pattern rule in solenv/gbuild/InternalUnoApi.mk
+(`touch $@`, no directory) and the build dies with
+
+    touch: cannot touch 'workdir/InternalUnoApi/scaddins.done': No such file or directory
+
+4 of the 5 shipped modules are writer or impress (only `spreadsheets` is calc),
+and `documents` is built FIRST -- so a cold build failed on module one, always.
+
+WHY NOBODY SAW IT FOR A MONTH. engine/build/orchestrator.sh cleans only `instdir`
+and `workdir/Rdb`, deliberately (1eb4c25d, 2026-01-31), and `git clean -fd` does
+not remove `workdir` because it is gitignored. So on a developer machine
+workdir/InternalUnoApi/scaddins.done persists from an earlier SPREADSHEETS build
+-- where Calc is not stripped and scaddins really is built -- and the writer
+build succeeds by touching a file another module left behind. The same failure
+was hit on 2026-08-30 after a manual `rm -rf workdir` and is recorded in
+bugs/BUG-28-pdf-import-parser-handoff-crash.md:1164, but it was attributed to the
+deletion rather than to this patch, and the connection was never made.
+
+The guard is the SAME EXPRESSION RepositoryModule_host.mk uses, deliberately: one
+file said scaddins was conditional while this one said it was mandatory, and the
+two must not be able to drift apart again.
+
+This does not weaken the original fix. The defect it addresses
+(bugs/bug_addin_double_args.md) is in Calc's analysis add-in functions, which do
+not exist in a writer or impress build -- so where the guard suppresses the
+dependency, there are no scaddins signatures to emit thunks for.
+diff --git a/bridges/CustomTarget_gcc3_wasm.mk b/bridges/CustomTarget_gcc3_wasm.mk
+index 15506e0d124b..004be554ab19 100644
+--- a/bridges/CustomTarget_gcc3_wasm.mk
++++ b/bridges/CustomTarget_gcc3_wasm.mk
+@@ -20,11 +20,13 @@ $(gb_CustomTarget_workdir)/bridges/gcc3_wasm/generated-cxx.cxx \
+ $(gb_CustomTarget_workdir)/bridges/gcc3_wasm/exports: \
+         $(call gb_Executable_get_target_for_build,wasmbridgegen) \
+         $(call gb_UnoApi_get_target,udkapi) \
+-        $(call gb_UnoApi_get_target,offapi)
++        $(call gb_UnoApi_get_target,offapi) \
++        $(if $(ENABLE_WASM_STRIP_CALC),,$(call gb_InternalUnoApi_get_target,scaddins))
+ 	$(call gb_Executable_get_command,wasmbridgegen) \
+         $(gb_CustomTarget_workdir)/bridges/gcc3_wasm/generated-cxx.cxx \
+         $(gb_CustomTarget_workdir)/bridges/gcc3_wasm/generated-asm.s \
+         $(gb_CustomTarget_workdir)/bridges/gcc3_wasm/exports \
+-        +$(call gb_UnoApi_get_target,udkapi) +$(call gb_UnoApi_get_target,offapi)
++        +$(call gb_UnoApi_get_target,udkapi) +$(call gb_UnoApi_get_target,offapi) \
++        $(if $(ENABLE_WASM_STRIP_CALC),,+$(call gb_UnoApiTarget_get_target,scaddins))
+ 
+ # vim: set noet sw=4 ts=4:

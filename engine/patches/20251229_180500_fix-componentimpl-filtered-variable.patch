@@ -1,0 +1,12 @@
+diff --git a/solenv/gbuild/ComponentTarget.mk b/solenv/gbuild/ComponentTarget.mk
+index d317f1b05ae7..dd4142e6b780 100644
+--- a/solenv/gbuild/ComponentTarget.mk
++++ b/solenv/gbuild/ComponentTarget.mk
+@@ -102,6 +102,7 @@ endef
+ # call gb_ComponentTarget_add_componentimpl,componentfile,implid
+ define gb_ComponentTarget_add_componentimpl
+ $(call gb_ComponentTarget_get_target,$(1)) : COMPONENTIMPL += $(call gb_ComponentTarget_get_source,$(1)).$(2)
++$(call gb_ComponentTarget_get_target,$(1)).filtered : COMPONENTIMPL += $(call gb_ComponentTarget_get_source,$(1)).$(2)
+ $(call gb_ComponentTarget_get_target,$(1)).filtered : $(call gb_ComponentTarget_get_source,$(1)).$(2)
+ 
+ endef
