@@ -1,0 +1,329 @@
+diff --git a/sdext/source/pdfimport/tree/drawtreevisiting.cxx b/sdext/source/pdfimport/tree/drawtreevisiting.cxx
+index d99d32b..66303dd 100644
+--- a/sdext/source/pdfimport/tree/drawtreevisiting.cxx
++++ b/sdext/source/pdfimport/tree/drawtreevisiting.cxx
+@@ -37,6 +37,12 @@
+ #include <string.h>
+ #include <string_view>
+ 
++#ifdef __EMSCRIPTEN__
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#endif
++
+ using namespace ::com::sun::star;
+ using namespace ::com::sun::star::lang;
+ using namespace ::com::sun::star::i18n;
+@@ -45,6 +51,43 @@ using namespace ::com::sun::star::uno;
+ namespace pdfi
+ {
+ 
++#ifdef __EMSCRIPTEN__
++namespace
++{
++// FG-141 / CB-005: progress heartbeat for the Draw/Impress emitting visit
++// (pdf-pptx). Same reasoning as EmitHeartbeat in writertreevisiting.cxx: the
++// optimizing and style-collecting visitors have already driven the LOK
++// StatusIndicator to 100 %, and it drops any lower value, so the per-page
++// setValue(PageNumber) here was dropped for every page but the last. The
++// visit restarts the indicator and advances it over one work unit per page
++// child. Names differ from the Writer file's so the two can share a
++// translation unit.
++struct DrawEmitHeartbeat
++{
++    static constexpr sal_Int32 nRange = 10000;
++    sal_Int64 nTotal = 0;
++    sal_Int64 nDone = 0;
++    bool bActive = false; // only between the document visit's start() and its end
++    std::chrono::steady_clock::time_point aStart;
++
++    void beat(const EmitContext& rCtx) const
++    {
++        if (!bActive || !rCtx.xStatusIndicator.is() || nTotal <= 0)
++            return;
++        rCtx.xStatusIndicator->setValue(static_cast<sal_Int32>(
++            std::min(nDone, nTotal) * nRange / nTotal));
++    }
++    long long elapsedMs() const
++    {
++        return std::chrono::duration_cast<std::chrono::milliseconds>(
++                   std::chrono::steady_clock::now() - aStart).count();
++    }
++};
++DrawEmitHeartbeat g_aDrawEmitBeat;
++constexpr size_t nDrawEmitBeatEvery = 500;
++}
++#endif
++
+ const Reference< XBreakIterator >& DrawXmlOptimizer::GetBreakIterator()
+ {
+     if ( !mxBreakIter.is() )
+@@ -360,14 +403,30 @@ void DrawXmlEmitter::visit( PageElement& elem, const std::list< std::unique_ptr<
+ 
+     m_rEmitContext.rEmitter.beginTag("draw:page", aPageProps);
+ 
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[EMIT] page %d elements=%zu t=%lldms\n",
++            static_cast<int>(elem.PageNumber), elem.Children.size(),
++            g_aDrawEmitBeat.elapsedMs());
++    g_aDrawEmitBeat.beat(m_rEmitContext);
++    size_t nSinceBeat = 0;
++#else
+     if( m_rEmitContext.xStatusIndicator.is() )
+         m_rEmitContext.xStatusIndicator->setValue( elem.PageNumber );
++#endif
+ 
+     auto this_it = elem.Children.begin();
+     while( this_it != elem.Children.end() && this_it->get() != &elem )
+     {
+         (*this_it)->visitedBy( *this, this_it );
+         ++this_it;
++#ifdef __EMSCRIPTEN__
++        ++g_aDrawEmitBeat.nDone;
++        if (++nSinceBeat == nDrawEmitBeatEvery)
++        {
++            nSinceBeat = 0;
++            g_aDrawEmitBeat.beat(m_rEmitContext);
++        }
++#endif
+     }
+ 
+     m_rEmitContext.rEmitter.endTag("draw:page");
+@@ -379,6 +438,28 @@ void DrawXmlEmitter::visit( DocumentElement& elem, const std::list< std::unique_
+     m_rEmitContext.rEmitter.beginTag( m_bWriteDrawDocument ? "office:drawing" : "office:presentation",
+                                       PropertyMap() );
+ 
++#ifdef __EMSCRIPTEN__
++    // FG-141: size the work (one unit per page child) and restart the indicator.
++    {
++        sal_Int64 nUnits = 0;
++        int nPages = 0;
++        for (const auto& rxChild : elem.Children)
++            if (PageElement* pPage = dynamic_cast<PageElement*>(rxChild.get()))
++            {
++                ++nPages;
++                nUnits += static_cast<sal_Int64>(pPage->Children.size());
++            }
++        g_aDrawEmitBeat.nTotal = std::max<sal_Int64>(1, nUnits);
++        g_aDrawEmitBeat.nDone = 0;
++        g_aDrawEmitBeat.aStart = std::chrono::steady_clock::now();
++        fprintf(stderr, "[EMIT] draw document visit: pages=%d page-children=%lld\n",
++                nPages, static_cast<long long>(nUnits));
++        if (m_rEmitContext.xStatusIndicator.is())
++            m_rEmitContext.xStatusIndicator->start(u" "_ustr, DrawEmitHeartbeat::nRange);
++        g_aDrawEmitBeat.bActive = true;
++    }
++#endif
++
+     auto this_it = elem.Children.begin();
+     while( this_it != elem.Children.end() && this_it->get() != &elem )
+     {
+@@ -386,6 +467,11 @@ void DrawXmlEmitter::visit( DocumentElement& elem, const std::list< std::unique_
+         ++this_it;
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[EMIT] draw document visit done t=%lldms\n", g_aDrawEmitBeat.elapsedMs());
++    g_aDrawEmitBeat.bActive = false;
++#endif
++
+     m_rEmitContext.rEmitter.endTag( m_bWriteDrawDocument ? "office:drawing" : "office:presentation" );
+     m_rEmitContext.rEmitter.endTag( "office:body" );
+ }
+diff --git a/sdext/source/pdfimport/tree/writertreevisiting.cxx b/sdext/source/pdfimport/tree/writertreevisiting.cxx
+index 1c5e4c9..114884d 100644
+--- a/sdext/source/pdfimport/tree/writertreevisiting.cxx
++++ b/sdext/source/pdfimport/tree/writertreevisiting.cxx
+@@ -35,6 +35,12 @@
+ #include <com/sun/star/i18n/DirectionProperty.hpp>
+ #include <comphelper/string.hxx>
+ 
++#ifdef __EMSCRIPTEN__
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#endif
++
+ using namespace ::com::sun::star;
+ using namespace ::com::sun::star::lang;
+ using namespace ::com::sun::star::i18n;
+@@ -43,6 +49,53 @@ using namespace ::com::sun::star::uno;
+ namespace pdfi
+ {
+ 
++#ifdef __EMSCRIPTEN__
++namespace
++{
++// FG-141 / CB-005: progress heartbeat for the emitting visit.
++//
++// WriterXmlEmitter::visit(DocumentElement) streams the whole document into
++// Writer synchronously (SaxEmitter -> SvXMLImport); for a large PDF that is
++// minutes (vision2030: 596 s) in which nothing reported progress, so the web
++// driver's 45 s no-progress watchdog stopped a conversion that was working.
++//
++// Calling setValue(PageNumber) is not enough. The indicator is the framework
++// StatusIndicator that LoadEnv put into the MediaDescriptor; under LOK it
++// forwards a value only if its percentage is >= the last one forwarded, and
++// the optimizing and style-collecting visitors have already driven it to
++// 100 % (page n of n) before emitting starts. So the emitting visit restarts
++// it (start() resets that high-water mark) with a fixed range and advances it
++// over "work units" (pass 1: one per page-anchored draw element; pass 2: one
++// per child of each page), which is monotonic and stays within the range.
++//
++// File-local state is safe: the emitting visitor is not re-entrant and the
++// WASM build runs it on one thread.
++struct EmitHeartbeat
++{
++    static constexpr sal_Int32 nRange = 10000;
++    sal_Int64 nTotal = 0;
++    sal_Int64 nDone = 0;
++    bool bActive = false; // only between the document visit's start() and its end
++    std::chrono::steady_clock::time_point aStart;
++
++    void beat(const EmitContext& rCtx) const
++    {
++        if (!bActive || !rCtx.xStatusIndicator.is() || nTotal <= 0)
++            return;
++        rCtx.xStatusIndicator->setValue(static_cast<sal_Int32>(
++            std::min(nDone, nTotal) * nRange / nTotal));
++    }
++    long long elapsedMs() const
++    {
++        return std::chrono::duration_cast<std::chrono::milliseconds>(
++                   std::chrono::steady_clock::now() - aStart).count();
++    }
++};
++EmitHeartbeat g_aEmitBeat;
++constexpr size_t nEmitBeatEvery = 500;
++}
++#endif
++
+ const Reference<XBreakIterator>& WriterXmlOptimizer::GetBreakIterator()
+ {
+     if (!mxBreakIter.is())
+@@ -377,14 +430,38 @@ void WriterXmlEmitter::visit( ImageElement& elem, const std::list< std::unique_p
+ 
+ void WriterXmlEmitter::visit( PageElement& elem, const std::list< std::unique_ptr<Element> >::const_iterator&   )
+ {
++#ifdef __EMSCRIPTEN__
++    // FG-141: pass 2 of the document visit. Visits every child of the page,
++    // including the DrawElements pass 1 already emitted page-anchored.
++    {
++        size_t nDraw = 0;
++        for (const auto& rxChild : elem.Children)
++            if (dynamic_cast<DrawElement*>(rxChild.get()) != nullptr)
++                ++nDraw;
++        fprintf(stderr, "[EMIT] pass2 page %d children=%zu draw-elements=%zu t=%lldms\n",
++                static_cast<int>(elem.PageNumber), elem.Children.size(), nDraw,
++                g_aEmitBeat.elapsedMs());
++    }
++    g_aEmitBeat.beat(m_rEmitContext);
++    size_t nSinceBeat = 0;
++#else
+     if( m_rEmitContext.xStatusIndicator.is() )
+         m_rEmitContext.xStatusIndicator->setValue( elem.PageNumber );
++#endif
+ 
+     auto this_it =  elem.Children.begin();
+     while( this_it != elem.Children.end() && this_it->get() != &elem )
+     {
+         (*this_it)->visitedBy( *this, this_it );
+         ++this_it;
++#ifdef __EMSCRIPTEN__
++        ++g_aEmitBeat.nDone;
++        if (++nSinceBeat == nEmitBeatEvery)
++        {
++            nSinceBeat = 0;
++            g_aEmitBeat.beat(m_rEmitContext);
++        }
++#endif
+     }
+ }
+ 
+@@ -393,21 +470,73 @@ void WriterXmlEmitter::visit( DocumentElement& elem, const std::list< std::uniqu
+     m_rEmitContext.rEmitter.beginTag( "office:body", PropertyMap() );
+     m_rEmitContext.rEmitter.beginTag( "office:text", PropertyMap() );
+ 
++#ifdef __EMSCRIPTEN__
++    // FG-141: size the work (see EmitHeartbeat) and restart the indicator.
++    {
++        sal_Int64 nPass1 = 0, nPass2 = 0;
++        int nPages = 0;
++        for (const auto& rxChild : elem.Children)
++        {
++            if (PageElement* pPage = dynamic_cast<PageElement*>(rxChild.get()))
++            {
++                ++nPages;
++                for (const auto& rxPageChild : pPage->Children)
++                    if (dynamic_cast<DrawElement*>(rxPageChild.get()) != nullptr)
++                        ++nPass1;
++                nPass2 += static_cast<sal_Int64>(pPage->Children.size());
++            }
++        }
++        g_aEmitBeat.nTotal = std::max<sal_Int64>(1, nPass1 + nPass2);
++        g_aEmitBeat.nDone = 0;
++        g_aEmitBeat.aStart = std::chrono::steady_clock::now();
++        fprintf(stderr, "[EMIT] writer document visit: pages=%d pass1-draw-elements=%lld pass2-page-children=%lld\n",
++                nPages, static_cast<long long>(nPass1), static_cast<long long>(nPass2));
++        if (m_rEmitContext.xStatusIndicator.is())
++            m_rEmitContext.xStatusIndicator->start(u" "_ustr, EmitHeartbeat::nRange);
++        g_aEmitBeat.bActive = true;
++    }
++#endif
++
+     for( const auto& rxChild : elem.Children )
+     {
+         PageElement* pPage = dynamic_cast<PageElement*>(rxChild.get());
+         if( pPage )
+         {
++#ifdef __EMSCRIPTEN__
++            size_t nPageDraw = 0;
++            for (const auto& rxPageChild : pPage->Children)
++                if (dynamic_cast<DrawElement*>(rxPageChild.get()) != nullptr)
++                    ++nPageDraw;
++            fprintf(stderr, "[EMIT] page %d draw-elements=%zu t=%lldms\n",
++                    static_cast<int>(pPage->PageNumber), nPageDraw, g_aEmitBeat.elapsedMs());
++            g_aEmitBeat.beat(m_rEmitContext);
++            size_t nSinceBeat = 0;
++#endif
+             // emit only page anchored objects
+             // currently these are only DrawElement types
+             for( auto child_it = pPage->Children.begin(); child_it != pPage->Children.end(); ++child_it )
+             {
+                 if( dynamic_cast<DrawElement*>(child_it->get()) != nullptr )
++                {
+                     (*child_it)->visitedBy( *this, child_it );
++#ifdef __EMSCRIPTEN__
++                    ++g_aEmitBeat.nDone;
++                    if (++nSinceBeat == nEmitBeatEvery)
++                    {
++                        nSinceBeat = 0;
++                        g_aEmitBeat.beat(m_rEmitContext);
++                    }
++#endif
++                }
+             }
+         }
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[EMIT] pass1 (page-anchored draw elements) done t=%lldms\n",
++            g_aEmitBeat.elapsedMs());
++#endif
++
+     // do not emit page anchored objects, they are emitted before
+     // (must precede all pages in writer document) currently these are
+     // only DrawElement types
+@@ -417,6 +546,11 @@ void WriterXmlEmitter::visit( DocumentElement& elem, const std::list< std::uniqu
+             (*it)->visitedBy( *this, it );
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[EMIT] pass2 (pages) done t=%lldms\n", g_aEmitBeat.elapsedMs());
++    g_aEmitBeat.bActive = false;
++#endif
++
+     m_rEmitContext.rEmitter.endTag( "office:text" );
+     m_rEmitContext.rEmitter.endTag( "office:body" );
+ }

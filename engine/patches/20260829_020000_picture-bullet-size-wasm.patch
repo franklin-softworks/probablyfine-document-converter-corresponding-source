@@ -1,0 +1,110 @@
+--- a/oox/source/drawingml/shape.cxx
++++ b/oox/source/drawingml/shape.cxx
+@@ -43,6 +43,7 @@
+ #include <oox/drawingml/shapepropertymap.hxx>
+ #include <drawingml/textbody.hxx>
+ #include <drawingml/textparagraph.hxx>
++#include <svtools/unitconv.hxx>   // TransformMetric — picture-bullet sizing (WASM path)
+ #include <drawingml/textparagraphproperties.hxx>
+ #include <drawingml/textliststyle.hxx>
+ #include <drawingml/ThemeOverrideFragmentHandler.hxx>
+@@ -2567,6 +2568,13 @@
+                                     // from the runs as it inserts them; this path
+                                     // inserted the text up front, so derive it here.
+                                     sal_Int32 nCharHeight = 0;
++                                    // A PICTURE BULLET is sized from the FIRST run's
++                                    // height, not the paragraph's largest
++                                    // (textparagraph.cxx:158 uses nCharHeightFirst,
++                                    // while nCharHeight is a max). The two differ on any
++                                    // paragraph whose runs are not all one size, so the
++                                    // max cannot stand in for it.
++                                    sal_Int32 nCharHeightFirst = 0;
+                                     if (rRuns.empty())
+                                     {
+                                         // A paragraph with NO runs takes its WHOLE
+@@ -2588,7 +2596,8 @@
+                                         TextCharacterProperties aEndProps(aTextCharacterStyle);
+                                         aEndProps.assignUsed(paragraph->getEndProperties());
+                                         if (aEndProps.moHeight.has_value())
+-                                            nCharHeight = aEndProps.moHeight.value();
++                                            nCharHeight = nCharHeightFirst
++                                                = aEndProps.moHeight.value();
+                                         PropertySet aEndPropSet(xCursor);
+                                         aEndProps.pushToPropSetWasm(aEndPropSet, rFilterBase);
+                                     }
+@@ -2599,8 +2608,13 @@
+                                             const TextCharacterProperties aRunHeightProps(
+                                                 aEffectiveRunProps(iRun));
+                                             if (aRunHeightProps.moHeight.has_value())
++                                            {
+                                                 nCharHeight = std::max(
+                                                     nCharHeight, aRunHeightProps.moHeight.value());
++                                                if (iRun == 0)
++                                                    nCharHeightFirst
++                                                        = aRunHeightProps.moHeight.value();
++                                            }
+                                         }
+                                     }
+ 
+@@ -2635,6 +2649,61 @@
+                                                     rFirst.maFillProperties.getBestSolidColor().getColor(
+                                                         rFilterBase.getGraphicHelper()));
+                                         }
++                                        // PICTURE BULLET SIZING. <a:buBlip> bullets are
++                                        // inserted at their INTRINSIC size unless a
++                                        // GraphicSize is supplied, so a 512 px source
++                                        // image draws as a 512 px bullet beside 14 pt
++                                        // text. Upstream computes it in
++                                        // TextParagraph::insertAt (textparagraph.cxx:
++                                        // 155-178) — a function this loop bypasses
++                                        // entirely, which is why the BulletColor seeding
++                                        // above had to be ported too.
++                                        //
++                                        // Mirrored EXACTLY, including the unit handling
++                                        // that looks odd in isolation: moHeight is in
++                                        // hundredths of a point and is handed to
++                                        // TransformMetric as FieldUnit::POINT, with 1200
++                                        // (= 12 pt) as the fallback. Reproducing
++                                        // LibreOffice's geometry is the goal here, so
++                                        // this follows upstream rather than correcting
++                                        // it; changing the arithmetic would make our
++                                        // bullets a different size from the reference's.
++                                        if (!aBulletList.hasProperty(PROP_GraphicSize)
++                                            && !rRuns.empty()
++                                            && aParaProp.getBulletList().maGraphic.hasValue())
++                                        {
++                                            tools::Long nFirstCharHeightMm = TransformMetric(
++                                                nCharHeightFirst > 0 ? nCharHeightFirst : 1200,
++                                                FieldUnit::POINT, FieldUnit::MM);
++                                            float fBulletSizeRel = 1.f;
++                                            double fBulletAspectRatio = 1.0;
++
++                                            if (aParaProp.getBulletList().mnSize.hasValue())
++                                                fBulletSizeRel
++                                                    = aParaProp.getBulletList().mnSize.get<sal_Int16>()
++                                                      / 100.f;
++
++                                            if (aParaProp.getBulletList().mnAspectRatio.hasValue())
++                                                fBulletAspectRatio
++                                                    = aParaProp.getBulletList().mnAspectRatio.get<double>();
++
++                                            css::awt::Size aBulletSize;
++                                            if (fBulletAspectRatio != 1.0)
++                                            {
++                                                aBulletSize.Height = std::lround(
++                                                    fBulletSizeRel * nFirstCharHeightMm
++                                                    * OOX_BULLET_LIST_SCALE_FACTOR);
++                                                aBulletSize.Width
++                                                    = aBulletSize.Height * fBulletAspectRatio;
++                                            }
++                                            else
++                                                aBulletSize.Width = aBulletSize.Height = std::lround(
++                                                    fBulletSizeRel * nFirstCharHeightMm
++                                                    * OOX_BULLET_LIST_SCALE_FACTOR);
++
++                                            aBulletList.setProperty(PROP_GraphicSize, aBulletSize);
++                                        }
++
+                                         Reference<beans::XPropertySet> xParaProps(xCursor, UNO_QUERY);
+                                         if (xParaProps.is())
+                                         {
