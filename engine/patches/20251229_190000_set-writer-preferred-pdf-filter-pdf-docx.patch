@@ -1,0 +1,13 @@
+diff --git a/sdext/source/pdfimport/config/pdf_types.xcu b/sdext/source/pdfimport/config/pdf_types.xcu
+index d8128741ec03..ab6003c75598 100644
+--- a/sdext/source/pdfimport/config/pdf_types.xcu
++++ b/sdext/source/pdfimport/config/pdf_types.xcu
+@@ -25,7 +25,7 @@
+         <prop oor:name="Extensions"><value>pdf</value></prop>
+         <prop oor:name="MediaType"><value>application/pdf</value></prop>
+         <prop oor:name="Preferred"><value>true</value></prop>
+-        <prop oor:name="PreferredFilter"><value>draw_pdf_import</value></prop>
++        <prop oor:name="PreferredFilter"><value>writer_pdf_import</value></prop>
+         <prop oor:name="UIName">
+             <value>PDF - Portable Document Format (Draw)</value>
+         </prop>
