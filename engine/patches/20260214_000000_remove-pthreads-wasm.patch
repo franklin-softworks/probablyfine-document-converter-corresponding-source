@@ -1,0 +1,53 @@
+Remove pthreads from WASM builds
+
+LibreOffice WASM is forced single-threaded at runtime (SAL_LOK_OPTIONS=unipoll,
+8 threading-disable patches, env vars). The pthread runtime adds unnecessary
+overhead: ~591KB extra JS glue per module, soffice.worker.js files, and
+requires COOP/COEP headers for SharedArrayBuffer.
+
+Emscripten provides stub pthread implementations (mutexes as no-ops, etc.)
+even without -pthread, so SAL layer compiles and links fine.
+
+Changes:
+- Remove -pthread -s USE_PTHREADS=1 from compiler flags
+- Override gb_CXX_LINKFLAGS to remove -pthread inherited from unxgcc.mk
+- Filter -pthread from gb_CXXFLAGS and gb_LinkTarget_CXXFLAGS
+  (both use := immediate expansion, so -pthread is baked in before our override)
+- Remove PROXY_TO_PTHREAD and PTHREAD_POOL_SIZE linker flags
+- Remove DEFAULT_PTHREAD_STACK_SIZE (no worker threads)
+
+diff --git a/solenv/gbuild/platform/EMSCRIPTEN_INTEL_GCC.mk b/solenv/gbuild/platform/EMSCRIPTEN_INTEL_GCC.mk
+--- a/solenv/gbuild/platform/EMSCRIPTEN_INTEL_GCC.mk
++++ b/solenv/gbuild/platform/EMSCRIPTEN_INTEL_GCC.mk
+@@ -9,21 +9,24 @@
+
+ include $(GBUILDDIR)/platform/unxgcc.mk
+
++# Override unxgcc.mk's -pthread: clear link flag AND strip from compile flags.
++# Both gb_CXXFLAGS and gb_LinkTarget_CXXFLAGS use := (immediate expansion),
++# so -pthread from gb_CXX_LINKFLAGS is already baked in before this file runs.
++gb_CXX_LINKFLAGS :=
++gb_CXXFLAGS := $(filter-out -pthread,$(gb_CXXFLAGS))
++gb_LinkTarget_CXXFLAGS := $(filter-out -pthread,$(gb_LinkTarget_CXXFLAGS))
++
+ gb_RUN_CONFIGURE := $(SRCDIR)/solenv/bin/run-configure
+ # avoid -s SAFE_HEAP=1 - c.f. gh#8584 this breaks source maps
+ # WASM SIMD for faster string/memory ops; profiling preserves function names for DevTools
+-gb_EMSCRIPTEN_CPPFLAGS := -pthread -s USE_PTHREADS=1 -msimd128 -D_LARGEFILE64_SOURCE -D_LARGEFILE_SOURCE -s SUPPORT_LONGJMP=wasm --profiling --profiling-funcs
++gb_EMSCRIPTEN_CPPFLAGS := -msimd128 -D_LARGEFILE64_SOURCE -D_LARGEFILE_SOURCE -s SUPPORT_LONGJMP=wasm --profiling --profiling-funcs
+ gb_EMSCRIPTEN_LDFLAGS := $(gb_EMSCRIPTEN_CPPFLAGS)
+
+ # Memory growth: 256MB initial, up to 4GB for large files
+ gb_EMSCRIPTEN_LDFLAGS += -s INITIAL_MEMORY=256MB -s MAXIMUM_MEMORY=4GB -s ALLOW_MEMORY_GROWTH=1
+
+-ifeq ($(ENABLE_EMSCRIPTEN_PROXY_TO_PTHREAD),)
+-gb_EMSCRIPTEN_LDFLAGS += -sPTHREAD_POOL_SIZE=7 -s PROXY_TO_PTHREAD=1
+-endif
+-
+-# Double the main thread stack size, but keep the default value for other threads:
+-gb_EMSCRIPTEN_LDFLAGS += -sSTACK_SIZE=131072 -sDEFAULT_PTHREAD_STACK_SIZE=65536
++# Stack size for main thread
++gb_EMSCRIPTEN_LDFLAGS += -sSTACK_SIZE=131072
+
+ # To keep the link time (and memory) down, prevent all rewriting options from wasm-emscripten-finalize
+ # See emscripten.py, finalize_wasm, modify_wasm = True
