@@ -1,0 +1,37 @@
+diff --git a/sw/source/core/doc/doclay.cxx b/sw/source/core/doc/doclay.cxx
+index 1e185b2d22dd..fda630a073fe 100644
+--- a/sw/source/core/doc/doclay.cxx
++++ b/sw/source/core/doc/doclay.cxx
+@@ -544,6 +544,32 @@ SwPosFlyFrames SwDoc::GetAllFlyFormats( const SwPaM* pCmpRange, bool bDrawAlso,
+     // Also, page anchored FlyFrames are only returned if no range is specified.
+     if( !getIDocumentLayoutAccess().GetCurrentViewShell() || pCmpRange )
+     {
++#ifdef __EMSCRIPTEN__
++        // In WASM headless mode there is no layout, but page-anchored frames
++        // (e.g. from PDF import) still need to be collected for export.
++        // Associate them with the first body content node.
++        if (!pCmpRange)
++        {
++            SwNodeIndex aBodyStart(GetNodes().GetEndOfExtras(), 1);
++            SwContentNode* pFirstBodyNode = GetNodes().GoNext(&aBodyStart);
++            if (pFirstBodyNode)
++            {
++                for (sw::SpzFrameFormat* pFly : *GetSpzFrameFormats())
++                {
++                    bool bDrawFormat = bDrawAlso && RES_DRAWFRMFMT == pFly->Which();
++                    bool bFlyFormat = RES_FLYFRMFMT == pFly->Which();
++                    if (bFlyFormat || bDrawFormat)
++                    {
++                        const SwFormatAnchor& rAnchor = pFly->GetAnchor();
++                        if (rAnchor.GetAnchorId() == RndStdIds::FLY_AT_PAGE)
++                        {
++                            aRetval.insert(SwPosFlyFrame(*pFirstBodyNode, pFly, aRetval.size()));
++                        }
++                    }
++                }
++            }
++        }
++#endif
+         return aRetval;
+     }
+ 

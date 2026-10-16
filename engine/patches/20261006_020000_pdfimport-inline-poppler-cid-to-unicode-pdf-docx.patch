@@ -1,0 +1,90 @@
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+@@ -44,6 +44,16 @@
+ #include <assert.h>
+ #include <math.h>
+ 
++#ifdef EMSCRIPTEN_INLINE_PDFIMPORT
++// For locating the poppler_data directory in the VFS (lcl_getPopplerDataDir)
++#include <config_folders.h>
++#include <osl/file.hxx>
++#include <osl/thread.h>
++#include <rtl/bootstrap.hxx>
++#include <rtl/ustring.hxx>
++#include <string>
++#endif
++
+ #include <memory>
+ #include <vector>
+ 
+@@ -1397,6 +1407,26 @@ poppler_bool PDFOutDev::tilingPatternFill(GfxState *state, Gfx *, Catalog *,
+ }
+ 
+ #ifdef EMSCRIPTEN_INLINE_PDFIMPORT
++// The poppler_data directory, as a system path. Stock LibreOffice's xpdfimport
++// computes it from its own executable path (wrapper_gpl.cxx); inline there is no
++// executable, so resolve the same install location through $BRAND_BASE_DIR.
++// An empty result leaves poppler on its compiled-in POPPLER_DATADIR, which does
++// not exist in the VFS -- the behaviour before this directory was passed.
++static std::string lcl_getPopplerDataDir()
++{
++    OUString aURL(u"$BRAND_BASE_DIR/" LIBO_SHARE_FOLDER "/xpdfimport/poppler_data"_ustr);
++    rtl::Bootstrap::expandMacros(aURL);
++    OUString aSysPath;
++    if (osl::FileBase::getSystemPathFromFileURL(aURL, aSysPath) != osl::FileBase::E_None)
++    {
++        fprintf(stderr, "[PDFIMPORT] poppler_data: cannot convert %s to a system path\n",
++                OUStringToOString(aURL, RTL_TEXTENCODING_UTF8).getStr());
++        return std::string();
++    }
++    const OString aPath = OUStringToOString(aSysPath, osl_getThreadTextEncoding());
++    return std::string(aPath.getStr(), aPath.getLength());
++}
++
+ // WASM-specific: C-style wrapper for inline PDF processing
+ // This function can be called from wrapper.cxx without including pdfioutdev_gpl.hxx
+ // Note: g_binary_out is defined at the top of this file (not inside extern "C")
+@@ -1433,9 +1463,13 @@ bool pdfi_process_pdf_inline(
+ #if POPPLER_CHECK_VERSION(0, 83, 0)
+             // Poppler >= 22.x: GlobalParams takes const std::string&. Passing
+             // nullptr constructs std::string(nullptr) -- UB: it throws on
+-            // libstdc++ and calls strlen(NULL) on libc++/Emscripten. Use the
+-            // default (empty) poppler-data dir instead.
+-            globalParams = std::make_unique<GlobalParams>();
++            // libstdc++ and calls strlen(NULL) on libc++/Emscripten.
++            // Pass the poppler_data directory shipped in the VFS, as stock
++            // xpdfimport does: without its cidToUnicode tables, CJK text set in
++            // a CID font with no /ToUnicode map is dropped.
++            const std::string aPopplerDataDir = lcl_getPopplerDataDir();
++            fprintf(stderr, "[PDFIMPORT] poppler_data dir: '%s'\n", aPopplerDataDir.c_str());
++            globalParams = std::make_unique<GlobalParams>(aPopplerDataDir);
+ #else
+             globalParams = new GlobalParams(nullptr);
+ #endif
+diff --git a/static/CustomTarget_emscripten_fs_image.mk b/static/CustomTarget_emscripten_fs_image.mk
+--- a/static/CustomTarget_emscripten_fs_image.mk
++++ b/static/CustomTarget_emscripten_fs_image.mk
+@@ -2042,6 +2042,22 @@ endif
+ gb_emscripten_fs_image_filelists += $(call gb_Package_get_target,liblangtag_data)
+ gb_emscripten_fs_image_filelists += $(call gb_Package_get_target,fontconfig_data)
+ 
++# PDF import: the poppler cidToUnicode tables, at the path stock LibreOffice
++# installs them (external/poppler/ExternalPackage_poppler_data.mk). Without them
++# poppler drops every glyph of a CJK CID font that has no /ToUnicode map
++# (GfxFont.cc, "Missing language pack"). Only these four files are listed, not
++# the whole poppler_data package: its cMap directory alone is ~12 MB.
++ifeq ($(ENABLE_POPPLER),TRUE)
++ifeq ($(SYSTEM_POPPLER),)
++gb_emscripten_fs_image_files += \
++    $(INSTROOT)/$(LIBO_SHARE_FOLDER)/xpdfimport/poppler_data/cidToUnicode/Adobe-CNS1 \
++    $(INSTROOT)/$(LIBO_SHARE_FOLDER)/xpdfimport/poppler_data/cidToUnicode/Adobe-GB1 \
++    $(INSTROOT)/$(LIBO_SHARE_FOLDER)/xpdfimport/poppler_data/cidToUnicode/Adobe-Japan1 \
++    $(INSTROOT)/$(LIBO_SHARE_FOLDER)/xpdfimport/poppler_data/cidToUnicode/Adobe-Korea1 \
++
++endif
++endif
++
+ #
+ # Ruleset
+ #
