@@ -1,0 +1,292 @@
+diff --git a/oox/inc/drawingml/textcharacterproperties.hxx b/oox/inc/drawingml/textcharacterproperties.hxx
+index 2ee1f1b5b4c2..d10ab3421474 100644
+--- a/oox/inc/drawingml/textcharacterproperties.hxx
++++ b/oox/inc/drawingml/textcharacterproperties.hxx
+@@ -93,6 +93,13 @@ struct TextCharacterProperties
+                             PropertySet& rPropSet,
+                             const ::oox::core::XmlFilterBase& rFilter ) const;
+ 
++#ifdef __EMSCRIPTEN__
++    /** WASM: Writes safe properties (colors, bold, italic) without VCL operations. */
++    void                pushToPropSetWasm(
++                            PropertySet& rPropSet,
++                            const ::oox::core::XmlFilterBase& rFilter ) const;
++#endif
++
+     /** Get effect properties. */
+     EffectProperties& getEffectProperties() const { return *mpEffectPropertiesPtr; }
+ 
+diff --git a/oox/source/drawingml/textcharacterproperties.cxx b/oox/source/drawingml/textcharacterproperties.cxx
+index a32512743085..4a359bd7897f 100644
+--- a/oox/source/drawingml/textcharacterproperties.cxx
++++ b/oox/source/drawingml/textcharacterproperties.cxx
+@@ -253,6 +253,269 @@ void TextCharacterProperties::pushToPropSet( PropertySet& rPropSet, const XmlFil
+     pushToGrabBag(rPropSet, maTextEffectsProperties);
+ }
+ 
++#ifdef __EMSCRIPTEN__
++void TextCharacterProperties::pushToPropSetWasm( PropertySet& rPropSet, const XmlFilterBase& rFilter ) const
++{
++    // WASM: Apply only "safe" properties that don't trigger VCL operations.
++    // Skip font names/sizes (require font lookup/metrics) to avoid hangs.
++    // This preserves basic formatting: colors, bold, italic, underline, strikeout.
++    PropertyMap aPropMap;
++
++    // Color (safe - just integer value)
++    if ( maFillProperties.moFillType.has_value() )
++    {
++        Color aColor = maFillProperties.getBestSolidColor();
++        bool bContoured = false;
++
++        // noFill doesn't exist for characters. Map noFill to 99% transparency
++        if (maFillProperties.moFillType.value() == XML_noFill)
++            aColor.addTransformation(XML_alpha, 1000);
++
++        // Handle text outline color
++        if (moTextOutlineProperties.has_value()
++            && moTextOutlineProperties.value().maLineFill.moFillType.has_value()
++            && moTextOutlineProperties.value().maLineFill.moFillType.value() != XML_noFill)
++        {
++            Color aLineColor = moTextOutlineProperties.value().maLineFill.getBestSolidColor();
++            sal_Int16 nLineTransparency = aLineColor.getTransparency();
++
++            // tdf#127696. This half was missing, and its absence is not
++            // cosmetic: WHITE text carrying a coloured outline stayed WHITE and
++            // was drawn with no contour, so on a light page it put no ink on
++            // the page AT ALL. Not faint, not miscoloured -- absent, while the
++            // text layer went on reporting it, which is why no text metric and
++            // no colour check could ever see it.
++            //
++            // Note the shape of upstream's condition, which is easy to mirror
++            // wrongly: bContoured is ASSIGNED inside it, and short-circuit
++            // evaluation means the assignment only happens when the first
++            // clause is false. That is deliberate -- if the outline already
++            // dominates on transparency there is nothing to contour, the
++            // outline colour simply wins. Writing it as two independent tests
++            // changes the behaviour.
++            //
++            // Measured on the fixture built for this, whose colours are copied
++            // from the one real instance in the corpus
++            // (documents/libreoffice_tests/tdf143476_lockedCanvas_position.docx
++            // -- white fill, 33CC33 outline, both opaque, so the transparency
++            // clause is FALSE and COL_WHITE is the only thing that can fire):
++            // 0 ink before, against 5685 in the native LibreOffice reference.
++            if (nLineTransparency < aColor.getTransparency()
++                || (bContoured = aColor.getColor(rFilter.getGraphicHelper()) == COL_WHITE))
++                aColor = aLineColor;
++        }
++        aPropMap.setProperty(PROP_CharColor, aColor.getColor(rFilter.getGraphicHelper()));
++
++        // Set unconditionally, exactly where upstream sets it. Setting it only
++        // when true would leave a previously-contoured run's attribute standing
++        // over text that follows it, the same way escapement's else branch has
++        // to reset rather than skip.
++        aPropMap.setProperty(PROP_CharContoured, bContoured);
++
++        if (aColor.hasTransparency())
++        {
++            aPropMap.setProperty(PROP_CharTransparence, aColor.getTransparency());
++        }
++    }
++
++    // Bold (safe - just float value)
++    float fWeight = moBold.value_or( false ) ? awt::FontWeight::BOLD : awt::FontWeight::NORMAL;
++    aPropMap.setProperty( PROP_CharWeight, fWeight);
++    aPropMap.setProperty( PROP_CharWeightAsian, fWeight);
++    aPropMap.setProperty( PROP_CharWeightComplex, fWeight);
++
++    // Italic (safe - just enum value)
++    awt::FontSlant eSlant = moItalic.value_or( false ) ? awt::FontSlant_ITALIC : awt::FontSlant_NONE;
++    aPropMap.setProperty( PROP_CharPosture, eSlant);
++    aPropMap.setProperty( PROP_CharPostureAsian, eSlant);
++    aPropMap.setProperty( PROP_CharPostureComplex, eSlant);
++
++    // Underline (safe - just integer values)
++    aPropMap.setProperty( PROP_CharUnderline, GetFontUnderline( moUnderline.value_or( XML_none ) ));
++    if( moUnderline.has_value() && maUnderlineColor.isUsed() && !moUnderlineFillFollowText.value_or(false) )
++    {
++        aPropMap.setProperty( PROP_CharUnderlineHasColor, true);
++        aPropMap.setProperty( PROP_CharUnderlineColor, maUnderlineColor.getColor( rFilter.getGraphicHelper() ));
++    }
++
++    // Strikeout (safe - just integer value)
++    aPropMap.setProperty( PROP_CharStrikeout, GetFontStrikeout( moStrikeout.value_or( XML_noStrike ) ));
++
++    // Highlight/background color (safe - just integer)
++    if (maHighlightColor.isUsed() && maHighlightColor.getTransparency() != 100)
++    {
++        aPropMap.setProperty(PROP_CharBackColor, maHighlightColor.getColor( rFilter.getGraphicHelper() ));
++    }
++
++    // Font HEIGHT is applied. The original rationale skipped names and sizes
++    // together because both "require font lookup/metrics". That is true of a
++    // NAME and false of a HEIGHT: this is a plain float going into a property
++    // map, touching no font list.
++    //
++    // Skipping it collapsed every DrawingML document to the presentation-level
++    // default size. Measured on PPT Understanding Analysis.pptx: 4 distinct font
++    // sizes across 43 pages against 16 in the LibreOffice reference, a title
++    // whose slide states sz="3500" drawn at 24pt (the presentation.xml
++    // defaultTextStyle), and a subtitle rendering LARGER than its own title.
++    if( moHeight.has_value() )
++    {
++        float fSize = GetFontHeight( moHeight.value() );
++        aPropMap.setProperty( PROP_CharHeight, fSize);
++        aPropMap.setProperty( PROP_CharHeightAsian, fSize);
++        aPropMap.setProperty( PROP_CharHeightComplex, fSize);
++    }
++
++    // Font NAMES are applied. getFontData() resolves the declared typeface (and
++    // falls back to the theme reference) and yields a string plus two enums; it
++    // does not rasterise or measure anything. Setting CharFontName is what the
++    // WordprocessingML path already does for ordinary body text on this same
++    // build, without incident.
++    //
++    // Skipping it meant a DrawingML run's typeface was discarded outright.
++    // Measured: a slide run declaring <a:latin typeface="DejaVu Sans"/> — a
++    // family this build ships and renders correctly from body text — came out
++    // as LiberationSans. Every pptx therefore drew in the fallback face
++    // regardless of what it asked for, which fits the measured fidelity profile
++    // of that format (ssimMean 0.673 with textCov 0.892: the text is right and
++    // the appearance is not).
++    //
++    // NOTE this does NOT affect glyph coverage. Non-Latin text is unaffected by
++    // the name being dropped, because FontResolver loads fonts from the
++    // document's CONTENT and LibreOffice's fallback then supplies the glyphs —
++    // verified: a CJK run whose name was skipped still drew in BIZUDMincho.
++    {
++        OUString aFontName;
++        sal_Int16 nFontPitch = 0;
++        sal_Int16 nFontFamily = 0;
++
++        bool bRet = maLatinFont.getFontData( aFontName, nFontPitch, nFontFamily, nullptr, rFilter );
++        if (!bRet)
++            bRet = maLatinThemeFont.getFontData( aFontName, nFontPitch, nFontFamily, nullptr, rFilter );
++        if (bRet)
++        {
++            aPropMap.setProperty( PROP_CharFontName, aFontName);
++            aPropMap.setProperty( PROP_CharFontPitch, nFontPitch);
++            aPropMap.setProperty( PROP_CharFontFamily, nFontFamily);
++        }
++
++        bRet = maAsianFont.getFontData( aFontName, nFontPitch, nFontFamily, nullptr, rFilter );
++        if (!bRet)
++            bRet = maAsianThemeFont.getFontData( aFontName, nFontPitch, nFontFamily, nullptr, rFilter );
++        if (bRet)
++        {
++            aPropMap.setProperty( PROP_CharFontNameAsian, aFontName);
++            aPropMap.setProperty( PROP_CharFontPitchAsian, nFontPitch);
++            aPropMap.setProperty( PROP_CharFontFamilyAsian, nFontFamily);
++        }
++
++        bRet = maComplexFont.getFontData( aFontName, nFontPitch, nFontFamily, nullptr, rFilter );
++        if (!bRet)
++            bRet = maComplexThemeFont.getFontData( aFontName, nFontPitch, nFontFamily, nullptr, rFilter );
++        if (bRet)
++        {
++            aPropMap.setProperty( PROP_CharFontNameComplex, aFontName);
++            aPropMap.setProperty( PROP_CharFontPitchComplex, nFontPitch);
++            aPropMap.setProperty( PROP_CharFontFamilyComplex, nFontFamily);
++        }
++    }
++
++    // Escapement is applied. It was in the skip list from the beginning, but not
++    // for a reason of its own: the list was written as one sentence about font
++    // lookup and metrics ("Skips properties that cause hangs: font names
++    // (require font lookup), font heights (trigger metrics calculation),
++    // kerning, locale, case mapping, escapement") and escapement was its tail.
++    // The word "deliberately" arrived later, as a header for what was left after
++    // font HEIGHT was taken out of that same list. The rationale has already
++    // been falsified on the two members it fitted best -- CharHeight and
++    // CharFontName both came back without a hang -- and nothing anywhere
++    // attributes a crash or deadlock to escapement. These are a sal_Int16 and a
++    // sal_Int8 going into a PropertyMap; they reach no font list, no metrics and
++    // no locale machinery.
++    //
++    // Both halves are set, because setting the offset alone gives full-size
++    // raised text, which looks worse than the bug it replaces. The else branch
++    // is upstream's and is load-bearing rather than tidy: it RESETS escapement,
++    // so a run following a superscript cannot inherit one.
++    //
++    // Skipping it meant x^2 printed as x2, H_2O as H2O -- full size, on the
++    // baseline, inline with the sentence. 98 runs across 8 pptx fixtures.
++    // (BUG-26 says 650 across 14; that counts baseline="0", which is a no-op.)
++    if( moBaseline.has_value() ) {
++        aPropMap.setProperty( PROP_CharEscapement, sal_Int16(moBaseline.value_or( 0 ) / 1000));
++        aPropMap.setProperty( PROP_CharEscapementHeight, sal_Int8(DFLT_ESC_PROP));
++    } else {
++        aPropMap.setProperty( PROP_CharEscapement, sal_Int16(0));
++        aPropMap.setProperty( PROP_CharEscapementHeight, sal_Int8(100)); // 100%
++    }
++
++    // Letter-spacing is applied. Same story as escapement: it was in the skip
++    // list from the beginning as the tail of one sentence about font lookup and
++    // metrics, and that rationale does not fit it. `spc` is
++    // ST_TextSpacingPoint (1/100 pt), GetTextSpacingPoint converts it to the
++    // 1/100 mm CharKerning wants (drawingmltypes.cxx:104), and the whole chain
++    // is o3tl integer arithmetic into a PropertyMap -- no font list, no
++    // metrics, no locale.
++    //
++    // Skipping it meant a title tracked out to fill its box ran short and text
++    // tracked negative to fit ran wide. 319 spc= across 6 pptx fixtures, and
++    // unlike item 3's baseline= there is NO no-op value here: all 319 are
++    // non-zero. Measured on Gabriela -Organizational Support Structure_
++    // 9.25.20.pptx, whose slide-1 title carries spc="-113" over 32 characters:
++    // 567.43 pt wide against the native LibreOffice reference's 532.91, with a
++    // control phrase elsewhere in the same document agreeing with that
++    // reference to three decimals.
++    //
++    // Set UNCONDITIONALLY, exactly where and how upstream sets it
++    // (textcharacterproperties.cxx:189). value_or(0) is not defensive padding
++    // -- it is the reset. Pushing this only when moSpacing is present would
++    // leave a tracked run's kerning standing over the text that follows it, the
++    // same way escapement needs its else branch and CharContoured is pushed
++    // even when false.
++    aPropMap.setProperty( PROP_CharKerning,
++                          static_cast<sal_Int16>(GetTextSpacingPoint( moSpacing.value_or( 0 ) )));
++
++    // Case mapping is applied. GetCaseMap is a three-arm switch over a token
++    // returning a sal_Int16 (drawingmltypes.cxx:156); like kerning it was in
++    // the skip list only as a member of that one sentence about font lookup.
++    //
++    // Skipping it meant a heading meant to read OVERVIEW printed Overview.
++    //
++    // BUG-26 records this as "1 occurrence in the corpus" and that is a count
++    // of ppt/slides/ ALONE. <a:defRPr cap="all"> in a slideLayout or a
++    // slideMaster reaches the run through exactly the merged character style
++    // the WASM loop in shape.cxx already builds -- and that is where the corpus
++    // keeps them: 55 cap="all" plus 3 cap="small" across 13 of the 27 pptx
++    // fixtures, of which precisely ONE is in a slide. Measured as the rendered
++    // consequence rather than as attributes -- words the native LibreOffice
++    // reference draws upper-case and we do not -- it is 49 on
++    // "201808 AU Faculty Institute...", 17 on OCE-workshop-for-website-1 and 6
++    // on static-analysis, against 0 on all four fixtures with no cap= at all.
++    //
++    // Unconditional and value_or(XML_none) for the same reason as kerning
++    // above: this is the reset, without which an upper-cased run's CaseMap
++    // stands over the text after it.
++    aPropMap.setProperty( PROP_CharCaseMap, GetCaseMap( moCaseMap.value_or( XML_none ) ));
++
++    // STILL skipped:
++    // - Locale (CharLocale/Asian/Complex). NOT an oversight, and the one item
++    //   here that would be actively RISKY to implement blind: it decides
++    //   line-breaking for CJK, Thai and Arabic, and nothing in the corpus
++    //   exercises it. 11,446 lang= attributes across the pptx slides span 12
++    //   values, all Latin-script but one: 4 ja-JP, and every one of those sits
++    //   on ENGLISH text or a smart quote in static-analysis.pptx -- the usual
++    //   PowerPoint artefact of an East-Asian tag on Latin runs. So the only
++    //   thing this code would do on the corpus we have is set CharLocaleAsian
++    //   = ja-JP on English punctuation, unverifiably. The 22 organic non-Latin
++    //   documents PR #70 added do not help: 6 Arabic, 2 Japanese, 3 Thai, all
++    //   PDFs, 0 PPTX. What it needs is one PPTX with ja-JP/th-TH/ar-SA runs
++    //   long enough to wrap; see bugs/pptx_kerning_casemap_criteria.md.
++    // - <a:buBlip> picture-bullet sizing (textparagraph.cxx:155-178, and a
++    //   paragraph property rather than a character one). 0 in the corpus.
++
++    rPropSet.setProperties( aPropMap );
++}
++#endif
++
+ float TextCharacterProperties::getCharHeightPoints( float fDefault ) const
+ {
+     return moHeight.has_value() ? GetFontHeight( moHeight.value() ) : fDefault;

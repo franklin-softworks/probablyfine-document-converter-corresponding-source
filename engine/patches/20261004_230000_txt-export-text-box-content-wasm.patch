@@ -1,0 +1,300 @@
+diff --git a/sw/source/filter/ascii/wrtasc.cxx b/sw/source/filter/ascii/wrtasc.cxx
+index 6b7ada9bd87e..12969a79f904 100644
+--- a/sw/source/filter/ascii/wrtasc.cxx
++++ b/sw/source/filter/ascii/wrtasc.cxx
+@@ -33,6 +33,20 @@
+ 
+ #include <strings.hrc>
+ 
++#ifdef __EMSCRIPTEN__
++#include <algorithm>
++#include <editeng/editeng.hxx>
++#include <editeng/outliner.hxx>
++#include <editeng/outlobj.hxx>
++#include <svx/svdmodel.hxx>
++#include <svx/svdobj.hxx>
++#include <svx/svdotext.hxx>
++#include <svx/svdoutl.hxx>
++#include <svx/svdpage.hxx>
++#include <fmtanchr.hxx>
++#include <textboxhelper.hxx>
++#endif
++
+ SwASCWriter::SwASCWriter( std::u16string_view rFltNm )
+ {
+     SwAsciiOptions aNewOpts;
+@@ -88,6 +102,165 @@ SwASCWriter::SwASCWriter( std::u16string_view rFltNm )
+ 
+ SwASCWriter::~SwASCWriter() {}
+ 
++#ifdef __EMSCRIPTEN__
++namespace
++{
++// FG-147: Writer's plain-text export walks only the body text, so the text of
++// text boxes, frames and shapes was silently dropped (stock LibreOffice too;
++// only the one-frame clipboard case was written). For a whole-document export
++// this writes, right after a paragraph, the text of everything anchored to it,
++// in anchor order:
++//  - a text frame (RES_FLYFRMFMT with a content section): one line per frame
++//    paragraph; frames anchored to one of those paragraphs follow it (the
++//    recursion), and frames anchored TO THE FRAME (FLY_AT_FLY, registered on
++//    the content section's start node) follow the frame's own text;
++//  - a draw shape (RES_DRAWFRMFMT) carrying its own outliner text: one line per
++//    outliner paragraph, a Shift+Enter line break starting a new line, group
++//    members in order. The text is read through the document's draw outliner,
++//    as painting reads it, so a tab is a tab and a field is the value the page
++//    shows (SwDoc::CalcFieldValueHdl); the raw EditTextObject keeps all three as
++//    U+0001 feature characters, which must never reach the file. A shape whose
++//    text lives in an attached text frame (SwTextBoxHelper) is skipped: that
++//    frame is anchored to the same paragraph and is written as a frame, so the
++//    text appears once.
++// At-page frames have no anchor paragraph; WriteStream writes them as a
++// trailing block in page order. Frames on a hidden paragraph are not written
++// (the layout hides them with the paragraph, SwTextFrame::HideAndShowObjects)
++// unless hidden text is exported, in which case the paragraph hook runs anyway.
++//
++// Line ends. The writer reads its position from m_pCurrentPam, so it is pointed
++// at each frame paragraph in turn and restored afterwards. Each frame paragraph
++// is written as its own one-node range, and OutASC_SwTextNode writes no line
++// end after the last node of a range unless it is empty, so the line end is
++// written here (with the writer's own suppression switched on, so an empty
++// paragraph does not get two). Body mode: a line end after every line, and one
++// before the first if the anchor line was written without its own (bNeedLineEnd:
++// the anchor is the last line of the range). Table-cell mode (bPrefix):
++// WriteTable blanks m_sLineEnd and separates a cell's paragraphs with a line
++// end BEFORE each further one, so frame lines do the same and none follows.
++struct AscFlyWriter
++{
++    SwASCWriter& rWrt;
++    SwDoc& rDoc;
++    bool bIncludeHidden;
++    OUString aLineEnd;
++    bool bPrefix;
++    bool bNeedLineEnd;
++    int nDepth = 0;
++
++    void BeginLine()
++    {
++        if (bPrefix || bNeedLineEnd)
++        {
++            rWrt.Strm().WriteUnicodeOrByteText(aLineEnd);
++            bNeedLineEnd = false;
++        }
++    }
++
++    void EndLine()
++    {
++        if (!bPrefix)
++            rWrt.Strm().WriteUnicodeOrByteText(aLineEnd);
++    }
++
++    void WriteAnchored(const std::vector<SwFrameFormat*>& rFlys)
++    {
++        if (nDepth > 8)
++            return;
++        ++nDepth;
++        for (const SwFrameFormat* pFormat : rFlys)
++            WriteFormat(pFormat);
++        --nDepth;
++    }
++
++    void WriteFormat(const SwFrameFormat* pFormat)
++    {
++        if (!pFormat)
++            return;
++        if (pFormat->Which() == RES_FLYFRMFMT)
++        {
++            const SwNodeIndex* pIdx = pFormat->GetContent().GetContentIdx();
++            if (!pIdx)
++                return;
++            const SwNodeOffset nEnd = pIdx->GetNode().EndOfSectionIndex();
++            for (SwNodeOffset n = pIdx->GetIndex() + 1; n < nEnd; ++n)
++            {
++                SwTextNode* pNd = rDoc.GetNodes()[n]->GetTextNode();
++                if (pNd && (!pNd->IsHidden() || bIncludeHidden))
++                    WriteTextNode(*pNd, n);
++            }
++            // Frames anchored to this frame (FLY_AT_FLY).
++            WriteAnchored(pIdx->GetNode().GetAnchoredFlys());
++        }
++        else if (pFormat->Which() == RES_DRAWFRMFMT)
++            WriteSdrObject(pFormat, pFormat->FindSdrObject());
++    }
++
++    void WriteTextNode(SwTextNode& rNd, SwNodeOffset n)
++    {
++        BeginLine();
++        auto pSaved = rWrt.m_pCurrentPam;
++        const bool bSavedNoLast = rWrt.m_bASCII_NoLastLineEnd;
++        rWrt.m_bASCII_NoLastLineEnd = true;
++        rWrt.m_pCurrentPam = Writer::NewUnoCursor(rDoc, n, n);
++        rWrt.m_pCurrentPam->Exchange();
++        Out(aASCNodeFnTab, rNd, rWrt);
++        rWrt.m_pCurrentPam = pSaved;
++        rWrt.m_bASCII_NoLastLineEnd = bSavedNoLast;
++        EndLine();
++        WriteAnchored(rNd.GetAnchoredFlys());
++    }
++
++    void WriteSdrObject(const SwFrameFormat* pFormat, const SdrObject* pObj)
++    {
++        if (!pObj)
++            return;
++        if (const SdrObjList* pSub = pObj->GetSubList())
++        {
++            for (size_t i = 0; i < pSub->GetObjCount(); ++i)
++                WriteSdrObject(pFormat, pSub->GetObj(i));
++            return;
++        }
++        // The text of a shape with an attached text frame is in that frame.
++        if (SwTextBoxHelper::isTextBox(pFormat, RES_DRAWFRMFMT, pObj))
++            return;
++        const SdrTextObj* pText = DynCastSdrTextObj(pObj);
++        if (!pText || !pText->HasText())
++            return;
++        const OutlinerParaObject* pPara = pText->GetOutlinerParaObject();
++        if (!pPara)
++            return;
++        // Load the text into the model's draw outliner (what painting does):
++        // EditEngine::GetText then expands the features the EditTextObject
++        // stores as CH_FEATURE (U+0001) -- a tab to '\t', a line break to
++        // '\n', a field to its computed value (ContentNode::GetExpandedText).
++        SdrOutliner& rOutl = pObj->getSdrModelFromSdrObject().GetDrawOutliner(pText);
++        rOutl.SetText(*pPara);
++        const EditEngine& rEE = rOutl.GetEditEngine();
++        const sal_Int32 nParas = rOutl.GetParagraphCount();
++        for (sal_Int32 i = 0; i < nParas; ++i)
++        {
++            // A feature the outliner left unexpanded is dropped, never written.
++            const OUString aPara = rEE.GetText(i).replaceAll(u"\x01"_ustr, u""_ustr);
++            sal_Int32 nStart = 0;
++            for (;;)
++            {
++                const sal_Int32 nBreak = aPara.indexOf(u'\n', nStart);
++                BeginLine();
++                rWrt.Strm().WriteUnicodeOrByteText(
++                    nBreak < 0 ? aPara.subView(nStart) : aPara.subView(nStart, nBreak - nStart));
++                EndLine();
++                if (nBreak < 0)
++                    break;
++                nStart = nBreak + 1;
++            }
++        }
++        rOutl.Clear();
++    }
++};
++}
++#endif
++
+ ErrCode SwASCWriter::WriteStream()
+ {
+     static constexpr OUString STR_CR = u"\015"_ustr;
+@@ -115,6 +288,12 @@ ErrCode SwASCWriter::WriteStream()
+         ::StartProgress( STR_STATSTR_W4WWRITE, 0, sal_Int32(nMaxNode), m_pDoc->GetDocShell() );
+ 
+     SwPaM* pPam = m_pOrigPam;
++#ifdef __EMSCRIPTEN__
++    // FG-147: was the last body line written without its line end, and did the
++    // one-frame clipboard case below already write the document's only frame?
++    bool bLastLineOpen = false;
++    bool bFrameOnlyDoc = false;
++#endif
+ 
+     bool bWriteSttTag = m_bUCS2_WithStartChar &&
+         (RTL_TEXTENCODING_UCS2 == GetAsciiOptions().GetCharSet() ||
+@@ -155,6 +334,9 @@ ErrCode SwASCWriter::WriteStream()
+                         m_pCurrentPam = NewUnoCursor(*m_pDoc, pIdx->GetIndex(),
+                                     pIdx->GetNode().EndOfSectionIndex() );
+                         m_pCurrentPam->Exchange();
++#ifdef __EMSCRIPTEN__
++                        bFrameOnlyDoc = true;
++#endif
+                         continue;       // reset while loop!
+                     }
+                 }
+@@ -194,6 +376,23 @@ ErrCode SwASCWriter::WriteStream()
+                         WriteTable(pTableNd, pNd);
+                     else
+                         Out( aASCNodeFnTab, *pNd, *this );
++#ifdef __EMSCRIPTEN__
++                    if (pTableNd && m_bWriteAll)
++                        bLastLineOpen = false; // WriteTable wrote the cells' frames; ends with a line end
++                    else if (m_bWriteAll)
++                    {
++                        // Mirrors OutASC_SwTextNode's line-end rule for the anchor
++                        // line: the last node of the range gets one only when empty.
++                        const bool bAnchorLast = m_pCurrentPam->GetPoint()->GetNode()
++                                                 == m_pCurrentPam->GetMark()->GetNode();
++                        AscFlyWriter aFly{*this, *m_pDoc, bIncludeHidden, m_sLineEnd, false,
++                                          bAnchorLast
++                                              && !(pNd->GetText().isEmpty() && !m_bWriteClipboardDoc
++                                                   && !m_bASCII_NoLastLineEnd)};
++                        aFly.WriteAnchored(pNd->GetAnchoredFlys());
++                        bLastLineOpen = aFly.bNeedLineEnd;
++                    }
++#endif
+                 }
+                 bTstFly = false;        // Testing once is enough
+             }
+@@ -208,6 +407,24 @@ ErrCode SwASCWriter::WriteStream()
+         }
+     } while( CopyNextPam( &pPam ) ); // Until all pams are processed
+ 
++#ifdef __EMSCRIPTEN__
++    // FG-147: at-page frames have no anchor paragraph. Write them as a trailing
++    // block, in page order (stable: frames on one page keep document order).
++    if (m_bWriteAll && !bFrameOnlyDoc)
++    {
++        std::vector<SwFrameFormat*> aPageFlys;
++        for (SwFrameFormat* pFormat : *m_pDoc->GetSpzFrameFormats())
++            if (pFormat->GetAnchor().GetAnchorId() == RndStdIds::FLY_AT_PAGE)
++                aPageFlys.push_back(pFormat);
++        std::stable_sort(aPageFlys.begin(), aPageFlys.end(),
++                         [](const SwFrameFormat* pA, const SwFrameFormat* pB) {
++                             return pA->GetAnchor().GetPageNum() < pB->GetAnchor().GetPageNum();
++                         });
++        AscFlyWriter aFly{*this, *m_pDoc, bIncludeHidden, m_sLineEnd, false, bLastLineOpen};
++        aFly.WriteAnchored(aPageFlys);
++    }
++#endif
++
+     Strm().SetStreamCharSet( eOld );
+ 
+     if( m_bShowProgress )
+@@ -232,6 +449,16 @@ void SwASCWriter::WriteTable(SwTableNode* pTableNd, SwTextNode* pNd)
+ {
+     OUString sPreLineEnd = this->m_sLineEnd;
+     m_sLineEnd = u""_ustr;
++#ifdef __EMSCRIPTEN__
++    // FG-147: a frame or shape anchored in a cell is written right after its
++    // cell paragraph, as further lines of that cell (the way a cell's own
++    // further paragraphs are written below: a line end before each).
++    const bool bIncludeHidden = GetAsciiOptions().GetIncludeHidden();
++    auto aWriteCellFlys = [&](const SwTextNode* pCellNd) {
++        AscFlyWriter aFly{*this, *m_pDoc, bIncludeHidden, sPreLineEnd, true, false};
++        aFly.WriteAnchored(pCellNd->GetAnchoredFlys());
++    };
++#endif
+ 
+     const SwTableLine* pEndTabLine = pTableNd->GetTable().GetTabLines().back();
+     const SwTableBox* pEndTabBox = pEndTabLine->GetTabBoxes().back();
+@@ -241,6 +468,9 @@ void SwASCWriter::WriteTable(SwTableNode* pTableNd, SwTextNode* pNd)
+         for( const SwTableBox* pBox : pLine->GetTabBoxes() )
+         {
+             Out( aASCNodeFnTab, *pNd, *this );
++#ifdef __EMSCRIPTEN__
++            aWriteCellFlys(pNd);
++#endif
+ 
+             Point aPrevBoxPoint;
+             const SwTableBox* pTableBox = pNd->GetTableBox();
+@@ -257,6 +487,9 @@ void SwASCWriter::WriteTable(SwTableNode* pTableNd, SwTextNode* pNd)
+             {
+                 Strm().WriteUnicodeOrByteText(sPreLineEnd);
+                 Out(aASCNodeFnTab, *pNd, *this);
++#ifdef __EMSCRIPTEN__
++                aWriteCellFlys(pNd);
++#endif
+ 
+                 m_pCurrentPam->Move(fnMoveForward, GoInNode);
+                 pNd = m_pCurrentPam->GetPoint()->GetNode().GetTextNode();
