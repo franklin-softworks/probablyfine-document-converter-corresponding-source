@@ -1,0 +1,147 @@
+diff --git a/sw/source/uibase/uno/unotxdoc.cxx b/sw/source/uibase/uno/unotxdoc.cxx
+index b2aaa103df37..4d09575e0ac0 100644
+--- a/sw/source/uibase/uno/unotxdoc.cxx
++++ b/sw/source/uibase/uno/unotxdoc.cxx
+@@ -49,6 +49,15 @@
+ #include <wrtsh.hxx>
+ #include <pview.hxx>
+ #include <viewsh.hxx>
++#ifdef __EMSCRIPTEN__
++#include <IDocumentLayoutAccess.hxx>
++#include <vcl/virdev.hxx>
++#include <iostream>
++// WASM headless PDF export: ViewShell must persist across getRendererCount()/render() calls.
++// Single-threaded WASM makes file-scope statics safe. Cleaned up after last rendered page.
++static VclPtr<VirtualDevice> s_pWasmPdfVirtualDev;
++static std::unique_ptr<SwViewShell> s_pWasmHeadlessViewShell;
++#endif
+ #include <pvprtdat.hxx>
+ #include <printdata.hxx>
+ #include <pagefrm.hxx>
+@@ -2639,9 +2648,18 @@ sal_Int32 SAL_CALL SwXTextDocument::getRendererCount(
+     bool bFormat = m_pPrintUIOptions->processPropertiesAndCheckFormat( rxOptions );
+ 
+     SwDoc *pDoc = GetRenderDoc( pView, rSelection, bIsPDFExport );
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[PDF-EXPORT] getRendererCount: pDoc=" << (void*)pDoc
++              << " pView=" << (void*)pView
++              << " LOK=" << comphelper::LibreOfficeKit::isActive()
++              << " isPDF=" << bIsPDFExport << std::endl;
++    if (!pDoc || (!pView && !comphelper::LibreOfficeKit::isActive()))
++        return 0;
++#else
+     OSL_ENSURE( pDoc && pView, "doc or view shell missing!" );
+     if (!pDoc || !pView)
+         return 0;
++#endif
+ 
+     // save current UI options from the print dialog for the next call to that dialog
+     lcl_SavePrintUIOptionsToDocumentPrintData( *pDoc, *m_pPrintUIOptions, bIsPDFExport );
+@@ -2660,6 +2678,35 @@ sal_Int32 SAL_CALL SwXTextDocument::getRendererCount(
+         // TODO/mba: we really need a generic way to get the SwViewShell!
+         SwViewShell* pViewShell = nullptr;
+         SwView* pSwView = dynamic_cast<SwView*>( pView );
++#ifdef __EMSCRIPTEN__
++        // WASM headless: create SwViewShell directly from SwDoc for PDF export.
++        // The ViewShell must persist across getRendererCount() and render() calls.
++        // File-scope statics declared near top of file, safe in single-threaded WASM.
++        if (comphelper::LibreOfficeKit::isActive() && !pSwView && bIsPDFExport)
++        {
++            SwViewShell* pExisting = pDoc->getIDocumentLayoutAccess().GetCurrentViewShell();
++            std::cerr << "[PDF-EXPORT] WASM headless path: existingVS=" << (void*)pExisting << std::endl;
++            if (pExisting)
++            {
++                pViewShell = pExisting;
++            }
++            else
++            {
++                // Clean up any previous headless shell
++                s_pWasmHeadlessViewShell.reset();
++                s_pWasmPdfVirtualDev.disposeAndClear();
++                s_pWasmPdfVirtualDev = VclPtr<VirtualDevice>::Create(DeviceFormat::WITHOUT_ALPHA);
++                std::cerr << "[PDF-EXPORT] Creating headless SwViewShell with VirtualDevice..." << std::endl;
++                s_pWasmHeadlessViewShell.reset(new SwViewShell(*pDoc, nullptr, nullptr, s_pWasmPdfVirtualDev.get()));
++                pViewShell = s_pWasmHeadlessViewShell.get();
++                std::cerr << "[PDF-EXPORT] SwViewShell created, layout=" << (void*)pViewShell->GetLayout()
++                          << " pageCount=" << pViewShell->GetPageCount() << std::endl;
++            }
++            std::cerr << "[PDF-EXPORT] pViewShell=" << (void*)pViewShell
++                      << " hasLayout=" << (pViewShell && pViewShell->GetLayout() ? 1 : 0) << std::endl;
++        }
++        else
++#endif
+         if ( pSwView )
+         {
+             pViewShell = pSwView->GetWrtShellPtr();
+@@ -2823,9 +2870,14 @@ uno::Sequence< beans::PropertyValue > SAL_CALL SwXTextDocument::getRenderer(
+     const bool bPrintPaperFromSetup = m_pPrintUIOptions->getBoolValue( "PrintPaperFromSetup" );
+ 
+     SwDoc *pDoc = GetRenderDoc( pView, rSelection, bIsPDFExport );
++#ifdef __EMSCRIPTEN__
++    if (!pDoc || (!pView && !comphelper::LibreOfficeKit::isActive()))
++        return uno::Sequence< beans::PropertyValue >();
++#else
+     OSL_ENSURE( pDoc && pView, "doc or view shell missing!" );
+     if (!pDoc || !pView)
+         return uno::Sequence< beans::PropertyValue >();
++#endif
+ 
+     // due to #110067# (document page count changes sometimes during
+     // PDF export/printing) we can not check for the upper bound properly.
+@@ -2873,6 +2925,10 @@ uno::Sequence< beans::PropertyValue > SAL_CALL SwXTextDocument::getRenderer(
+         SwView* pSwView = dynamic_cast<SwView*>( pView );
+         if ( pSwView )
+             pVwSh = pSwView->GetWrtShellPtr();
++#ifdef __EMSCRIPTEN__
++        else if (comphelper::LibreOfficeKit::isActive() && !pView)
++            pVwSh = pDoc->getIDocumentLayoutAccess().GetCurrentViewShell();
++#endif
+         else
+             pVwSh = static_cast<SwPagePreview*>(pView)->GetViewShell();
+ 
+@@ -3139,8 +3195,14 @@ void SAL_CALL SwXTextDocument::render(
+     const bool bLastPage        = m_pPrintUIOptions->getBoolValue( "IsLastPage" );
+ 
+     SwDoc *pDoc = GetRenderDoc( pView, rSelection, bIsPDFExport );
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[PDF-EXPORT] render: pDoc=" << (void*)pDoc
++              << " pView=" << (void*)pView << std::endl;
++    if (pDoc && (pView || comphelper::LibreOfficeKit::isActive()))
++#else
+     OSL_ENSURE( pDoc && pView, "doc or view shell missing!" );
+     if (pDoc && pView)
++#endif
+     {
+         sal_Int32 nMaxRenderer = 0;
+         if (!bIsSwSrcView)
+@@ -3169,6 +3231,14 @@ void SAL_CALL SwXTextDocument::render(
+                 const SwView* pSwView = dynamic_cast<const SwView*>(pView);
+                 if (pSwView)
+                     pVwSh = pSwView->GetWrtShellPtr();
++#ifdef __EMSCRIPTEN__
++                else if (comphelper::LibreOfficeKit::isActive() && !pView)
++                {
++                    // WASM headless: get SwViewShell from doc directly
++                    pVwSh = pDoc->getIDocumentLayoutAccess().GetCurrentViewShell();
++                    std::cerr << "[PDF-EXPORT] render headless: pVwSh=" << (void*)pVwSh << std::endl;
++                }
++#endif
+                 else
+                     pVwSh = static_cast<SwPagePreview*>(pView)->GetViewShell();
+ 
+@@ -3257,6 +3327,15 @@ void SAL_CALL SwXTextDocument::render(
+     }
+     if( bLastPage )
+     {
++#ifdef __EMSCRIPTEN__
++        // Clean up headless ViewShell created for WASM PDF export
++        if (s_pWasmHeadlessViewShell)
++        {
++            std::cerr << "[PDF-EXPORT] Cleaning up headless ViewShell..." << std::endl;
++            s_pWasmHeadlessViewShell.reset();
++            s_pWasmPdfVirtualDev.disposeAndClear();
++        }
++#endif
+         // tdf#144989 enable DoIdleJobs() again after last page
+         // Related: tdf#163126 on macOS, if the "print selection only"
+         // checkbox is changed and then the restarted print dialog is
