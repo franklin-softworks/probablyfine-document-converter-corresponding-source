@@ -1,0 +1,30 @@
+--- a/comphelper/source/container/embeddedobjectcontainer.cxx
++++ b/comphelper/source/container/embeddedobjectcontainer.cxx
+@@ -1207,7 +1207,27 @@ bool EmbeddedObjectContainer::StoreAsChildren(bool _bOasisFormat,bool _bCreateEm
+                         xStream = GetGraphicStream(xObj, &aMediaType);
+                     }
+ 
++#ifdef __EMSCRIPTEN__
++                    // FG-066: regenerate a missing replacement for an EMBEDDED object
++                    // even when link updates are not allowed. The flag guards
++                    // refreshing a LINKED object from outside the document; an
++                    // embedded chart's replacement is rendered from its own data.
++                    // This is upstream's own rule in EmbeddedObjectRef::GetGraphicStream
++                    // (svtools/source/misc/embedhlp.cxx, the isLink() test), which
++                    // regenerates for non-links regardless of the flag and caches the
++                    // result. Desktop LibreOffice reaches it when the object is painted;
++                    // a headless Calc document without a view never paints, so the
++                    // cache was empty here. Like that code, this also ignores the flag
++                    // when it is false only because of DisableActiveContent.
++                    // Without this, an XLSX chart (RUNNING, no cached replacement,
++                    // link updates off: measured) was saved to ODS with a
++                    // draw:image pointing at ObjectReplacements/<name>, which was
++                    // never written. Stock LibreOffice 25.8.7.3 writes it.
++                    if (!xStream.is()
++                        && (getUserAllowsLinkUpdate() || !(xLink.is() && xLink->isLink())))
++#else
+                     if (!xStream.is() && getUserAllowsLinkUpdate())
++#endif
+                     {
+                         // the image must be regenerated
+                         // TODO/LATER: another aspect could be used
