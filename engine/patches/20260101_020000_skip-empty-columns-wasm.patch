@@ -1,0 +1,32 @@
+diff --git a/sc/source/core/data/documentimport.cxx b/sc/source/core/data/documentimport.cxx
+index a6c25a1bd5ec..170e6d096001 100644
+--- a/sc/source/core/data/documentimport.cxx
++++ b/sc/source/core/data/documentimport.cxx
+@@ -30,6 +30,9 @@
+ #include <svl/languageoptions.hxx>
+ #include <comphelper/configuration.hxx>
+ #include <unordered_map>
++#ifdef __EMSCRIPTEN__
++#include <iostream>
++#endif
+
+ namespace {
+
+@@ -768,8 +771,17 @@ void ScDocumentImport::finalize()
+
+         ScTable& rTab = *rxTab;
+         SCCOL nNumCols = rTab.aCol.size();
++#ifdef __EMSCRIPTEN__
++        // WASM optimization: Skip empty columns to avoid processing all 16384 Excel columns.
++        for (SCCOL nColIdx = 0; nColIdx < nNumCols; ++nColIdx)
++        {
++            if (!rTab.aCol[nColIdx].IsEmptyData())
++                initColumn(rTab.aCol[nColIdx]);
++        }
++#else
+         for (SCCOL nColIdx = 0; nColIdx < nNumCols; ++nColIdx)
+             initColumn(rTab.aCol[nColIdx]);
++#endif
+     }
+
+     mpImpl->mrDoc.finalizeOutlineImport();

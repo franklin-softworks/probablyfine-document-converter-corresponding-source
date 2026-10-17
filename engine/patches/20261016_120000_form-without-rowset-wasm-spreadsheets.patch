@@ -1,0 +1,104 @@
+--- a/forms/source/component/DatabaseForm.cxx
++++ b/forms/source/component/DatabaseForm.cxx
+@@ -354,11 +354,40 @@ void ODatabaseForm::impl_construct()
+ {
+     // aggregate a row set
+     osl_atomic_increment(&m_refCount);
++#ifdef __EMSCRIPTEN__
++    // The row set is OPTIONAL in this build (FG-165; this patch reaches the
++    // `spreadsheets` module only).
++    //
++    // com.sun.star.sdb.RowSet lives in dbaccess, which WASM does not build
++    // (DISABLE_DYNLOADING forces --disable-database-connectivity). So this
++    // createInstance returns null, UNO_QUERY_THROW throws, and constructing
++    // com.sun.star.form.component.Form fails: Calc could not import a form, and
++    // every form control (button, check box, scroll bar) was lost.
++    //
++    // A form used as a CONTROL CONTAINER, which is all a converter needs, does
++    // not need a row set; that is for data binding. Most of this class tests
++    // `m_xAggregateSet.is()`, or reaches the row set only through interfaces
++    // that queryAggregation() withholds without one. The places that did not
++    // are guarded under __EMSCRIPTEN__ below: the forwarded ActiveConnection
++    // property, DataSourceName (read and write) and getConnection().
++    //
++    // Deliberately NOT solved by enabling DBCONNECTIVITY: that pulls dbaccess
++    // into every download to make an edge case work, and this costs nothing.
++    {
++        m_xAggregate.set( m_xContext->getServiceManager()->createInstanceWithContext(SRV_SDB_ROWSET, m_xContext), UNO_QUERY );
++        if ( m_xAggregate.is() )
++        {
++            m_xAggregateAsRowSet.set( m_xAggregate, UNO_QUERY );
++            setAggregation( m_xAggregate );
++        }
++    }
++#else
+     {
+         m_xAggregate.set( m_xContext->getServiceManager()->createInstanceWithContext(SRV_SDB_ROWSET, m_xContext), UNO_QUERY_THROW );
+         m_xAggregateAsRowSet.set( m_xAggregate, UNO_QUERY_THROW );
+         setAggregation( m_xAggregate );
+     }
++#endif
+ 
+     // listen for the properties, important for Parameters
+     if ( m_xAggregateSet.is() )
+@@ -382,7 +411,20 @@ void ODatabaseForm::impl_construct()
+         m_aFilterManager.initialize( m_xAggregateSet );
+         m_aParameterManager.initialize( this, m_xAggregate );
+ 
++#ifdef __EMSCRIPTEN__
++        // ActiveConnection is FORWARDED to the row set: reading or writing it
++        // calls m_xAggregateSet->getPropertyValue/setPropertyValue, which is a
++        // null call when the row set is absent (above). Calc's form layer resets
++        // ActiveConnection on every form when the document closes
++        // (FmXUndoEnvironment::RemoveElement), and that trapped with "null
++        // function" after the PDF had been written (FG-165, measured
++        // 2026-10-16). Undeclared, the property reads as void and a write of
++        // void is "not modified", so nothing reaches the missing row set.
++        if ( m_xAggregateSet.is() )
++            declareForwardedProperty( PROPERTY_ID_ACTIVE_CONNECTION );
++#else
+         declareForwardedProperty( PROPERTY_ID_ACTIVE_CONNECTION );
++#endif
+     }
+     osl_atomic_decrement( &m_refCount );
+ 
+@@ -1244,6 +1286,11 @@ void ODatabaseForm::disposing()
+ Reference< XConnection > ODatabaseForm::getConnection()
+ {
+     Reference< XConnection > xConn;
++#ifdef __EMSCRIPTEN__
++    // No row set (see impl_construct): no connection.
++    if ( !m_xAggregateSet.is() )
++        return xConn;
++#endif
+     m_xAggregateSet->getPropertyValue( PROPERTY_ACTIVE_CONNECTION ) >>= xConn;
+     return xConn;
+ }
+@@ -1454,6 +1501,16 @@ void ODatabaseForm::getFastPropertyValue( Any& rValue, sal_Int32 nHandle ) const
+             break;
+ 
+         case PROPERTY_ID_DATASOURCE:
++#ifdef __EMSCRIPTEN__
++            // No row set (see impl_construct): the data source name is empty.
++            // Unguarded, importing a form bound to a data source
++            // (form:datasource) made a null call here.
++            if ( !m_xAggregateSet.is() )
++            {
++                rValue <<= OUString();
++                break;
++            }
++#endif
+             rValue = m_xAggregateSet->getPropertyValue( PROPERTY_DATASOURCENAME );
+             break;
+ 
+@@ -1652,6 +1709,10 @@ void ODatabaseForm::setFastPropertyValue_NoBroadcast( sal_Int32 nHandle, const A
+             }
+             try
+             {
++#ifdef __EMSCRIPTEN__
++                // No row set (see impl_construct): nothing to bind to.
++                if ( m_xAggregateSet.is() )
++#endif
+                 m_xAggregateSet->setPropertyValue(PROPERTY_DATASOURCENAME, rValue);
+             }
+             catch(const Exception&)
