@@ -1,0 +1,136 @@
+diff --git a/filter/source/pdf/pdfexport.cxx b/filter/source/pdf/pdfexport.cxx
+index b89244fa0242..48e7311a7ec4 100644
+--- a/filter/source/pdf/pdfexport.cxx
++++ b/filter/source/pdf/pdfexport.cxx
+@@ -30,6 +30,7 @@
+ #include <vcl/graphic/GraphicMetadata.hxx>
+ #include <vcl/pdf/PDFEncryptionInitialization.hxx>
+ #include <rtl/ustring.hxx>
++#include <iostream>
+ #include <comphelper/propertyvalue.hxx>
+ #include <comphelper/sequence.hxx>
+ #include <comphelper/string.hxx>
+@@ -181,7 +182,9 @@ bool PDFExport::ExportSelection( vcl::PDFWriter& rPDFWriter,
+                     if ( pLastPage && aIter == aEnd )
+                         *pLastPage <<= true;
+ 
++                    std::cerr << "[PDF_EXPORT] Rendering page " << nCurrentRenderer << "..." << std::endl;
+                     rRenderable->render( nCurrentRenderer, rSelection, rRenderOptions );
++                    std::cerr << "[PDF_EXPORT] Page " << nCurrentRenderer << " rendered" << std::endl;
+ 
+                     aMtf.Stop();
+                     aMtf.WindStart();
+@@ -383,6 +386,7 @@ PDFExport::GetCertificateFromSubjectName(std::u16string_view rSubjectName) const
+ 
+ bool PDFExport::Export( const OUString& rFile, const Sequence< PropertyValue >& rFilterData )
+ {
++    std::cerr << "[PDF_EXPORT] Export() called" << std::endl;
+     INetURLObject   aURL( rFile );
+     bool        bRet = false;
+ 
+@@ -1093,6 +1097,7 @@ bool PDFExport::Export( const OUString& rFile, const Sequence< PropertyValue >&
+ 
+                 if ( aCreator == "Writer" )
+                 {
++                    std::cerr << "[PDF_EXPORT] Writer: adjusting view settings..." << std::endl;
+                     // #i92835: if Writer is in web layout mode this has to be switched to normal view and back to web view in the end
+                     try
+                     {
+@@ -1113,11 +1118,14 @@ bool PDFExport::Export( const OUString& rFile, const Sequence< PropertyValue >&
+                     }
+                     catch( const uno::Exception& )
+                     {
++                        std::cerr << "[PDF_EXPORT] Writer: view settings exception (OK)" << std::endl;
+                     }
+ 
+                 }
+ 
++                std::cerr << "[PDF_EXPORT] Calling getRendererCount..." << std::endl;
+                 const sal_Int32 nPageCount = xRenderable->getRendererCount( aSelection, aRenderOptions );
++                std::cerr << "[PDF_EXPORT] getRendererCount returned: " << nPageCount << std::endl;
+ 
+                 if ( bExportNotesPages && aCreator == "Impress" )
+                 {
+@@ -1146,7 +1154,11 @@ bool PDFExport::Export( const OUString& rFile, const Sequence< PropertyValue >&
+                 bRet = nPageCount > 0;
+ 
+                 if ( bRet && bExportPages )
++                {
++                    std::cerr << "[PDF_EXPORT] Calling ExportSelection for " << nPageCount << " pages..." << std::endl;
+                     bRet = ExportSelection( aPDFWriter, xRenderable, aSelection, aRangeEnum, aRenderOptions, nPageCount );
++                    std::cerr << "[PDF_EXPORT] ExportSelection returned: " << bRet << std::endl;
++                }
+ 
+                 if ( bRet && bExportNotesPages )
+                 {
+@@ -1163,8 +1175,11 @@ bool PDFExport::Export( const OUString& rFile, const Sequence< PropertyValue >&
+ 
+                 if( bRet )
+                 {
++                    std::cerr << "[PDF_EXPORT] Playing global actions..." << std::endl;
+                     aPDFExtOutDevData.PlayGlobalActions( aPDFWriter );
++                    std::cerr << "[PDF_EXPORT] Emitting PDF..." << std::endl;
+                     bRet = aPDFWriter.Emit();
++                    std::cerr << "[PDF_EXPORT] Emit returned: " << bRet << std::endl;
+                     aErrors = aPDFWriter.GetErrors();
+                 }
+                 pOut->SetExtOutDevData( nullptr );
+@@ -1265,6 +1280,14 @@ void PDFExport::ImplExportPage( vcl::PDFWriter& rWriter, vcl::PDFExtOutDevData&
+ 
+     vcl::PDFWriter::PlayMetafileContext aCtx;
+     GDIMetaFile aMtf;
++#ifdef __EMSCRIPTEN__
++    // WASM/LOK optimization: Skip expensive transparency removal for headless export.
++    // RemoveTransparenciesFromMetaFile() re-renders the entire page as a bitmap to
++    // remove transparencies. This is extremely slow for complex presentations.
++    // Modern PDF viewers handle transparency fine, so we skip this step.
++    aMtf = rMtf;
++    aCtx.m_bTransparenciesWereRemoved = false;
++#else
+     if( mbRemoveTransparencies )
+     {
+         aCtx.m_bTransparenciesWereRemoved = rWriter.GetReferenceDevice()->
+@@ -1281,6 +1304,7 @@ void PDFExport::ImplExportPage( vcl::PDFWriter& rWriter, vcl::PDFExtOutDevData&
+     {
+         aMtf = rMtf;
+     }
++#endif
+     aCtx.m_nMaxImageResolution      = mbReduceImageResolution ? mnMaxImageResolution : 0;
+     aCtx.m_bOnlyLosslessCompression = mbUseLosslessCompression;
+     aCtx.m_nJPEGQuality             = mnQuality;
+diff --git a/filter/source/pdf/pdffilter.cxx b/filter/source/pdf/pdffilter.cxx
+index da0c907649e8..cdcef1423cb5 100644
+--- a/filter/source/pdf/pdffilter.cxx
++++ b/filter/source/pdf/pdffilter.cxx
+@@ -37,6 +37,8 @@
+ 
+ #include <boost/property_tree/json_parser/error.hpp>
+ 
++#include <iostream>
++
+ using namespace ::com::sun::star::io;
+ 
+ PDFFilter::PDFFilter( const Reference< XComponentContext > &rxContext ) :
+@@ -52,6 +54,7 @@ PDFFilter::~PDFFilter()
+ 
+ bool PDFFilter::implExport( const Sequence< PropertyValue >& rDescriptor )
+ {
++    std::cerr << "[PDF_FILTER] implExport() called" << std::endl;
+     Reference< XOutputStream >  xOStm;
+     Sequence< PropertyValue >   aFilterData;
+     OUString aFilterOptions;
+@@ -175,11 +178,14 @@ bool PDFFilter::implExport( const Sequence< PropertyValue >& rDescriptor )
+ 
+     if( mxSrcDoc.is() && xOStm.is() )
+     {
++        std::cerr << "[PDF_FILTER] Creating PDFExport..." << std::endl;
+         PDFExport       aExport( mxSrcDoc, xStatusIndicator, xIH, mxContext );
+         ::utl::TempFileNamed aTempFile;
+ 
+         aTempFile.EnableKillingFile();
++        std::cerr << "[PDF_FILTER] Calling aExport.Export()..." << std::endl;
+         bRet = aExport.Export( aTempFile.GetURL(), aFilterData );
++        std::cerr << "[PDF_FILTER] aExport.Export() returned: " << bRet << std::endl;
+ 
+         if( bRet )
+         {

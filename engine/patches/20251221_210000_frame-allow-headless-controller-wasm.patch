@@ -1,0 +1,61 @@
+From: Claude <claude@anthropic.com>
+Date: Sat, 21 Dec 2024 21:00:00 +0000
+Subject: [PATCH] WASM: Allow headless controllers without windows (25.8)
+
+Ported for LibreOffice 25.8.
+
+In WASM/LOK headless mode, allow HeadlessController to be set without a window.
+This is needed for document conversion which uses headless mode.
+Without this patch, setComponent() rejects headless controllers causing conversion failures.
+
+diff --git a/framework/source/services/frame.cxx b/framework/source/services/frame.cxx
+index 8d1dbb331e01..a6f15aaa51ec 100644
+--- a/framework/source/services/frame.cxx
++++ b/framework/source/services/frame.cxx
+@@ -57,6 +57,10 @@
+ #include <com/sun/star/frame/FrameSearchFlag.hpp>
+ #include <com/sun/star/lang/DisposedException.hpp>
+ #include <com/sun/star/task/StatusIndicatorFactory.hpp>
++#include <comphelper/lok.hxx>
++#ifdef __EMSCRIPTEN__
++#include <iostream>
++#endif
+ #include <com/sun/star/task/theJobExecutor.hpp>
+ #include <com/sun/star/task/XJobExecutor.hpp>
+ #include <com/sun/star/util/CloseVetoException.hpp>
+@@ -1430,8 +1434,34 @@ sal_Bool SAL_CALL XFrameImpl::setComponent(const css::uno::Reference< css::awt::
+
+     // Ignore this HACK of sfx2!
+     // It calls us with a valid controller without a valid window - that's not allowed!
+-    if  ( xController.is() && ! xComponentWindow.is() )
++#ifdef __EMSCRIPTEN__
++    // WASM/LOK headless mode: Allow headless controllers without windows
++    // HeadlessController is used for document conversion and needs to be stored
++    if (xController.is() && !xComponentWindow.is())
++    {
++        if (!comphelper::LibreOfficeKit::isActive())
++        {
++            // Non-LOK mode: ignore as before
++            return true;
++        }
++
++        std::cerr << "[FRAME] LOK headless mode: fast path for setComponent" << std::endl << std::flush;
++
++        // LOK headless mode: Fast path - just store controller and skip window ops
++        // This avoids hangs from VCLUnoHelper::GetWindow, implts_stopWindowListening, etc.
++        checkDisposed();
++        {
++            SolarMutexGuard aWriteLock;
++            m_xController = xController;
++            m_bConnected = true;
++        }
++        std::cerr << "[FRAME] LOK headless setComponent completed" << std::endl << std::flush;
++        return true;
++    }
++#else
++    if (xController.is() && !xComponentWindow.is())
+         return true;
++#endif
+
+     checkDisposed();
+
