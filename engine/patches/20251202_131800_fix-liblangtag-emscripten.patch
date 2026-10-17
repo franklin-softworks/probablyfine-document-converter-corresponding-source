@@ -1,0 +1,13 @@
+diff --git a/external/liblangtag/ExternalProject_liblangtag.mk b/external/liblangtag/ExternalProject_liblangtag.mk
+index abc123..def456 100644
+--- a/external/liblangtag/ExternalProject_liblangtag.mk
++++ b/external/liblangtag/ExternalProject_liblangtag.mk
+@@ -30,7 +30,7 @@ $(call gb_ExternalProject_get_state_target,liblangtag,build):
+ 		$(if $(verbose),--disable-silent-rules,--enable-silent-rules) \
+ 		$(if $(filter TRUE,$(HAVE_GCC_BUILTIN_ATOMIC)),"lt_cv_has_atomic=yes","lt_cv_has_atomic=no") \
+ 		$(if $(filter -fsanitize=undefined,$(CC)),CC='$(CC) -fno-sanitize=function') \
+-		CFLAGS='$(CFLAGS) -pthread \
++		CFLAGS='$(CFLAGS) -pthread $(gb_EMSCRIPTEN_CPPFLAGS) \
+ 			$(call gb_ExternalProject_get_build_flags,liblangtag)' \
+ 		$(gb_CONFIGURE_PLATFORMS) \
+ 		$(if $(CROSS_COMPILING),$(if $(filter WNT,$(OS)),"lt_cv_c99_vsnprintf=yes" "ac_cv_va_copy=yes","ac_cv_va_copy=no")) \
