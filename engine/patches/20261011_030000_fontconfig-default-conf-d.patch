@@ -1,0 +1,59 @@
+diff --git a/external/fontconfig/ExternalPackage_fontconfig_data.mk b/external/fontconfig/ExternalPackage_fontconfig_data.mk
+index e7d78142f456..e9d0b3422878 100644
+--- a/external/fontconfig/ExternalPackage_fontconfig_data.mk
++++ b/external/fontconfig/ExternalPackage_fontconfig_data.mk
+@@ -15,33 +15,21 @@ $(eval $(call gb_ExternalPackage_add_files,fontconfig_data,$(LIBO_SHARE_FOLDER)/
+     fonts.conf \
+ ))
+ 
+-# The list below is created with
+-# find workdir/UnpackedTarball/fontconfig/conf.d/ -name "*.conf" | LC_COLLATE=C sort | sed -e 's/^/    /' -e 's/$/ \\/' -e 's/workdir\/UnpackedTarball\/fontconfig\///'
++# Install fontconfig's DEFAULT conf.d set, not every file in its source conf.d/. That
++# directory is fontconfig's catalogue of AVAILABLE configs (conf.avail): its own install
++# links only the defaults below (conf.d/meson.build `conf_links`, plus the preferred
++# hinting `slight`, sub-pixel `none` and bitmap `no-except-emoji` choices of
++# meson.options; 35-lang-normalize.conf is a template, not linked). Installing all of them
++# enabled 05-reset-dirs-sample.conf, whose <reset-dirs/> discards every <dir> in
++# fonts.conf, and contradictory pairs (hinting full AND none, bitmaps yes AND no).
+ $(eval $(call gb_ExternalPackage_add_unpacked_files,fontconfig_data,$(LIBO_SHARE_FOLDER)/fontconfig/conf.d,\
+-    conf.d/05-reset-dirs-sample.conf \
+-    conf.d/09-autohint-if-no-hinting.conf \
+-    conf.d/10-autohint.conf \
+-    conf.d/10-hinting-full.conf \
+-    conf.d/10-hinting-medium.conf \
+-    conf.d/10-hinting-none.conf \
+     conf.d/10-hinting-slight.conf \
+-    conf.d/10-no-antialias.conf \
+     conf.d/10-scale-bitmap-fonts.conf \
+-    conf.d/10-sub-pixel-bgr.conf \
+     conf.d/10-sub-pixel-none.conf \
+-    conf.d/10-sub-pixel-rgb.conf \
+-    conf.d/10-sub-pixel-vbgr.conf \
+-    conf.d/10-sub-pixel-vrgb.conf \
+-    conf.d/10-unhinted.conf \
+     conf.d/10-yes-antialias.conf \
+     conf.d/11-lcdfilter-default.conf \
+-    conf.d/11-lcdfilter-legacy.conf \
+-    conf.d/11-lcdfilter-light.conf \
+-    conf.d/11-lcdfilter-none.conf \
+     conf.d/20-unhint-small-vera.conf \
+-    conf.d/25-unhint-nonlatin.conf \
+     conf.d/30-metric-aliases.conf \
+-    conf.d/35-lang-normalize.conf \
+     conf.d/40-nonlatin.conf \
+     conf.d/45-generic.conf \
+     conf.d/45-latin.conf \
+@@ -52,13 +40,9 @@ $(eval $(call gb_ExternalPackage_add_unpacked_files,fontconfig_data,$(LIBO_SHARE
+     conf.d/60-generic.conf \
+     conf.d/60-latin.conf \
+     conf.d/65-fonts-persian.conf \
+-    conf.d/65-khmer.conf \
+     conf.d/65-nonlatin.conf \
+     conf.d/69-unifont.conf \
+-    conf.d/70-no-bitmaps-and-emoji.conf \
+     conf.d/70-no-bitmaps-except-emoji.conf \
+-    conf.d/70-no-bitmaps.conf \
+-    conf.d/70-yes-bitmaps.conf \
+     conf.d/80-delicious.conf \
+     conf.d/90-synthetic.conf \
+ ))
