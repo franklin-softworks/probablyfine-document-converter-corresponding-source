@@ -1,0 +1,50 @@
+--- a/sc/source/ui/view/output2.cxx
++++ b/sc/source/ui/view/output2.cxx
+@@ -2069,6 +2069,47 @@
+                                 aAreaParam.maClipRect.SetBottom( nScrY+nScrH );
+                             }
+ 
++#ifdef __EMSCRIPTEN__
++                            // Item 11: move a LEFT page-clip to a glyph boundary.
++                            //
++                            // A long string in the last data column overflows into
++                            // empty columns; ExtendPrintArea gives those their own
++                            // pages, and the tail is drawn from an anchor off-page to
++                            // the left. The clip then fell mid-glyph, slicing one
++                            // leading character per row (an 'O' rendering as ')').
++                            //
++                            // Trimming the STRING was tried first and is wrong: the
++                            // drawn text IS the PDF text layer, so shortening it made
++                            // the complete cell value unextractable (measured: p9 lost
++                            // 'pWy KKo5G...' from its text layer, and extractable
++                            // source values across the file went 331 -> 0). That trades
++                            // a cosmetic defect for a real one.
++                            //
++                            // Moving the CLIP instead keeps the full string drawn — and
++                            // therefore fully extractable — while the cut lands between
++                            // glyphs rather than through one.
++                            if ( bHClip && aAreaParam.mbLeftClip && !bCellIsValue
++                                 && eOutHorJust == SvxCellHorJustify::Left )
++                            {
++                                const OUString& aClipStr = aVars.GetString();
++                                const tools::Long nClipL = aAreaParam.maClipRect.Left();
++                                if ( !aClipStr.isEmpty() && nJustPosX < nClipL )
++                                {
++                                    sal_Int32 nCh = 0;
++                                    const sal_Int32 nChLen = aClipStr.getLength();
++                                    while ( nCh < nChLen &&
++                                            nJustPosX + aVars.GetFmtTextWidth(aClipStr.copy(0, nCh + 1)) < nClipL )
++                                        ++nCh;
++                                    if ( nCh < nChLen )
++                                    {
++                                        const tools::Long nBoundary = nJustPosX +
++                                            static_cast<tools::Long>(aVars.GetFmtTextWidth(aClipStr.copy(0, nCh + 1)));
++                                        if ( nBoundary > nClipL && nBoundary < aAreaParam.maClipRect.Right() )
++                                            aAreaParam.maClipRect.SetLeft( nBoundary );
++                                    }
++                                }
++                            }
++#endif
+                             //  aClipRect is not used after SetClipRegion/IntersectClipRegion,
+                             //  so it can be modified here
+                             if (bPixelToLogic)

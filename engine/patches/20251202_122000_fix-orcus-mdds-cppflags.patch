@@ -1,0 +1,14 @@
+diff --git a/external/liborcus/ExternalProject_liborcus.mk b/external/liborcus/ExternalProject_liborcus.mk
+index 7f2e5f24083f..fix456 100644
+--- a/external/liborcus/ExternalProject_liborcus.mk
++++ b/external/liborcus/ExternalProject_liborcus.mk
+@@ -53,6 +53,9 @@ liborcus_CPPFLAGS=$(CPPFLAGS)
+ ifeq ($(SYSTEM_ZLIB),)
+ liborcus_CPPFLAGS+=$(ZLIB_CFLAGS)
+ endif
++# Add mdds headers for Emscripten build (external mdds is unpacked to workdir)
++liborcus_CPPFLAGS+=-I$(WORKDIR)/UnpackedTarball/mdds/include
++
+ #
+ # OSes that use the GNU C++ library need to use -D_GLIBCXX_DEBUG in
+ # sync with the rest of LibreOffice, i.e. depending on
