@@ -1,0 +1,93 @@
+FG-051 cause 2 (owner decision 2026-10-18): match Excel, which plots a chart y value held
+in a text cell as 0.
+
+ScChart2DataSequence::BuildDataCache left a text cell's value NaN, and chart2 skips NaN
+points, so bubble_chart_simple.xlsx lost a bubble Excel draws: Excel trusts its
+<c:numCache>, which holds 0. Under __EMSCRIPTEN__, for a sequence with role values-y in a
+document loaded with one of Excel's filters (MS Excel*, Calc MS Excel*, Calc Office
+Open XML*), a text cell or a formula with a text result counts as 0. Empty cells stay
+gaps, and every other role and every other format (ODS, CSV, ...) is unchanged.
+
+diff --git a/sc/source/ui/unoobj/chart2uno.cxx b/sc/source/ui/unoobj/chart2uno.cxx
+index ddb2293233e5..c3ab17e38cee 100644
+--- a/sc/source/ui/unoobj/chart2uno.cxx
++++ b/sc/source/ui/unoobj/chart2uno.cxx
+@@ -28,6 +28,10 @@
+ #include <miscuno.hxx>
+ #include <document.hxx>
+ #include <docsh.hxx>
++#ifdef __EMSCRIPTEN__
++#include <sfx2/docfile.hxx>
++#include <sfx2/docfilt.hxx>
++#endif
+ #include <formulacell.hxx>
+ #include <unonames.hxx>
+ #include <globstr.hrc>
+@@ -2543,6 +2547,22 @@ void ScChart2DataSequence::RefChanged()
+     }
+ }
+ 
++#ifdef __EMSCRIPTEN__
++namespace {
++// FG-051: was this document loaded with one of Excel's filters (XLSX, XLSM, XLS)?
++bool lcl_isExcelDocument(const ScDocument* pDoc)
++{
++    const ScDocShell* pShell = pDoc ? pDoc->GetDocumentShell() : nullptr;
++    const SfxMedium* pMedium = pShell ? pShell->GetMedium() : nullptr;
++    if (!pMedium || !pMedium->GetFilter())
++        return false;
++    const OUString& rName = pMedium->GetFilter()->GetFilterName();
++    return rName.startsWith("MS Excel") || rName.startsWith("Calc MS Excel")
++        || rName.startsWith("Calc Office Open XML");
++}
++}
++#endif
++
+ void ScChart2DataSequence::BuildDataCache()
+ {
+     m_bExtDataRebuildQueued = false;
+@@ -2554,6 +2574,13 @@ void ScChart2DataSequence::BuildDataCache()
+ 
+     ::std::vector<sal_Int32> aHiddenValues;
+     sal_Int32 nDataCount = 0;
++#ifdef __EMSCRIPTEN__
++    // FG-051 (owner decision 2026-10-18): match Excel, which plots a y value held in a
++    // text cell as 0 (its <c:numCache> holds 0); Calc read NaN and dropped the point.
++    // Only for the y values of a document loaded with one of Excel's filters; empty
++    // cells stay gaps, and every other role and format is unchanged.
++    const bool bTextAsZero = m_aRole == u"values-y" && lcl_isExcelDocument(m_pDocument);
++#endif
+ 
+     for (const auto& rxToken : m_aTokens)
+     {
+@@ -2633,11 +2660,29 @@ void ScChart2DataSequence::BuildDataCache()
+                                     aItem.mfValue = pFCell->GetValue();
+                                     aItem.mbIsValue = true;
+                                 }
++#ifdef __EMSCRIPTEN__
++                                else if (bTextAsZero)
++                                {
++                                    aItem.mfValue = 0.0;
++                                    aItem.mbIsValue = true;
++                                }
++#endif
+                             }
+                             break;
++#ifdef __EMSCRIPTEN__
++                            case CELLTYPE_EDIT:
++                            case CELLTYPE_STRING:
++                                if (bTextAsZero)
++                                {
++                                    aItem.mfValue = 0.0;
++                                    aItem.mbIsValue = true;
++                                }
++                            break;
++#else
+                             case CELLTYPE_EDIT:
+-                            case CELLTYPE_NONE:
+                             case CELLTYPE_STRING:
++#endif
++                            case CELLTYPE_NONE:
+                             default:
+                                 ; // do nothing
+                         }
