@@ -1,0 +1,383 @@
+P3 (owner-approved 2026-10-18): backport of upstream LibreOffice's Calc data-provider
+hardening onto 25.8.7.3. The fixes are on libreoffice-26-2 / 26-2-5 and were never
+backported to 25-8. Applied in upstream history order:
+
+  6cc778595b7a  sc: only build the supported data providers when loading a document
+                (csv, html, xml only; any other provider name in the document is ignored)
+  c3355f20dcd5  don't bother loading exotic protocols for document-supplied data
+                (= 6b218b521d38 on libreoffice-26-2; sc/webservicelink, dataprovider,
+                sqldataprovider hunks only -- the forms/xforms hunk is carried separately
+                as a universal patch, since it touches every module)
+  a7c32cc2519d  sc: check the host when fetching an external data range
+  8b882d3e7bd0  put calc external data mappings under link update control
+                (conflict in sc/source/ui/view/tabvwsh4.cxx resolved by keeping 25.8's
+                DocumentLinkManager::hasDdeOrOleOrWebServiceLinks(), which 26-2 renamed
+                hasExternalLinks(), and adding the new rDoc.HasDataProviderMappings())
+
+Upstream's tests (sc/qa/...) are not included: the WASM build does not compile them.
+Unconditional, like upstream.
+
+diff --git a/sc/inc/datamapper.hxx b/sc/inc/datamapper.hxx
+index 984e6cc81219..32d610ac3c9b 100644
+--- a/sc/inc/datamapper.hxx
++++ b/sc/inc/datamapper.hxx
+@@ -96,7 +96,7 @@ public:
+ 
+ class SC_DLLPUBLIC ExternalDataMapper
+ {
+-    //ScDocument& mrDoc;
++    ScDocument& mrDoc;
+     std::vector<ExternalDataSource> maDataSources;
+ 
+ public:
+diff --git a/sc/inc/document.hxx b/sc/inc/document.hxx
+index d06114ac7e30..42bb26306b1e 100644
+--- a/sc/inc/document.hxx
++++ b/sc/inc/document.hxx
+@@ -888,6 +888,10 @@ public:
+     SC_DLLPUBLIC ScDBData*       GetDBAtArea(SCTAB nTab, SCCOL nCol1, SCROW nRow1, SCCOL nCol2, SCROW nRow2);
+     void                         RefreshDirtyTableColumnNames();
+     SC_DLLPUBLIC sc::ExternalDataMapper& GetExternalDataMapper();
++    /** True when the document holds at least one external data mapping. Checks
++        without creating the mapper, so it stays cheap for documents that have
++        none. */
++    SC_DLLPUBLIC bool HasDataProviderMappings() const;
+ 
+     SC_DLLPUBLIC const ScRangeData* GetRangeAtBlock( const ScRange& rBlock, OUString& rName,
+                                                      bool* pSheetLocal = nullptr ) const;
+diff --git a/sc/source/core/data/document10.cxx b/sc/source/core/data/document10.cxx
+index 4c6527304a7e..be8f08adaeaf 100644
+--- a/sc/source/core/data/document10.cxx
++++ b/sc/source/core/data/document10.cxx
+@@ -1021,6 +1021,11 @@ sc::ExternalDataMapper& ScDocument::GetExternalDataMapper()
+     return *mpDataMapper;
+ }
+ 
++bool ScDocument::HasDataProviderMappings() const
++{
++    return mpDataMapper && !mpDataMapper->getDataSources().empty();
++}
++
+ void ScDocument::StoreTabToCache(SCTAB nTab, SvStream& rStrm) const
+ {
+     const ScTable* pTab = FetchTable(nTab);
+diff --git a/sc/source/core/tool/ddelink.cxx b/sc/source/core/tool/ddelink.cxx
+index 6d9eab0775d0..fcfed762c61e 100644
+--- a/sc/source/core/tool/ddelink.cxx
++++ b/sc/source/core/tool/ddelink.cxx
+@@ -17,6 +17,7 @@
+  *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
+  */
+ 
++#include <comphelper/embeddedobjectcontainer.hxx>
+ #include <comphelper/fileformat.h>
+ #include <comphelper/string.hxx>
+ #include <osl/thread.h>
+@@ -29,6 +30,7 @@
+ 
+ #include <ddelink.hxx>
+ #include <brdcst.hxx>
++#include <docsh.hxx>
+ #include <document.hxx>
+ #include <scmatrix.hxx>
+ #include <patattr.hxx>
+@@ -125,6 +127,10 @@ void ScDdeLink::Store( SvStream& rStream, ScMultipleWriteHeader& rHdr ) const
+ sfx2::SvBaseLink::UpdateResult ScDdeLink::DataChanged(
+     const OUString& rMimeType, const css::uno::Any & rValue )
+ {
++    if (rDoc.GetDocumentShell()
++        && !rDoc.GetDocumentShell()->GetEmbeddedObjectContainer().getUserAllowsLinkUpdate())
++        return SUCCESS;
++
+     //  we only master strings...
+     if ( SotClipboardFormatId::STRING != SotExchange::GetFormatIdFromMimeType( rMimeType ))
+         return SUCCESS;
+diff --git a/sc/source/core/tool/webservicelink.cxx b/sc/source/core/tool/webservicelink.cxx
+index c30f34300edf..cbb226e240a8 100644
+--- a/sc/source/core/tool/webservicelink.cxx
++++ b/sc/source/core/tool/webservicelink.cxx
+@@ -7,6 +7,7 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+  */
+ 
++#include <comphelper/embeddedobjectcontainer.hxx>
+ #include <comphelper/processfactory.hxx>
+ #include <sfx2/linkmgr.hxx>
+ #include <sfx2/bindings.hxx>
+@@ -21,6 +22,7 @@
+ #include <utility>
+ #include <webservicelink.hxx>
+ #include <brdcst.hxx>
++#include <docsh.hxx>
+ #include <document.hxx>
+ #include <sc.hrc>
+ 
+@@ -36,10 +38,21 @@ ScWebServiceLink::~ScWebServiceLink() {}
+ 
+ sfx2::SvBaseLink::UpdateResult ScWebServiceLink::DataChanged(const OUString&, const css::uno::Any&)
+ {
++    if (pDoc && pDoc->GetDocumentShell()
++        && !pDoc->GetDocumentShell()->GetEmbeddedObjectContainer().getUserAllowsLinkUpdate())
++        return SUCCESS;
++
+     aResult.clear();
+     bHasResult = false;
+ 
+     INetURLObject aURLObject(aURL);
++    if (aURLObject.IsExoticProtocol())
++    {
++        SAL_WARN("sc.ui",
++                 "ScWebServiceLink::DataChanged: blocked exotic protocol: \"" << aURL << "\"");
++        return ERROR_GENERAL;
++    }
++
+     const OUString sHost = aURLObject.GetHost();
+     if (HostFilter::isForbidden(sHost))
+     {
+diff --git a/sc/source/filter/xml/xmlmappingi.cxx b/sc/source/filter/xml/xmlmappingi.cxx
+index 5ce0967762ff..809a3cd72560 100644
+--- a/sc/source/filter/xml/xmlmappingi.cxx
++++ b/sc/source/filter/xml/xmlmappingi.cxx
+@@ -14,6 +14,7 @@
+ #include <xmloff/xmltoken.hxx>
+ #include <xmloff/xmlnamespace.hxx>
+ 
++#include <sal/log.hxx>
+ #include <datamapper.hxx>
+ #include <document.hxx>
+ 
+@@ -102,6 +103,16 @@ ScXMLMappingContext::ScXMLMappingContext( ScXMLImport& rImport,
+ 
+     if (!aProvider.isEmpty())
+     {
++        // Only build the data providers we support. The sql provider is left
++        // out: it was never finished and was dropped from the dialog in tdf#169079.
++        if (aProvider != "org.libreoffice.calc.csv"
++            && aProvider != "org.libreoffice.calc.html"
++            && aProvider != "org.libreoffice.calc.xml")
++        {
++            SAL_WARN("sc", "ignoring document data mapping for provider \"" << aProvider << "\"");
++            return;
++        }
++
+         ScDocument* pDoc = GetScImport().GetDocument();
+         auto& rDataMapper = pDoc->GetExternalDataMapper();
+         sc::ExternalDataSource aSource(aURL, aProvider, pDoc);
+@@ -111,16 +122,6 @@ ScXMLMappingContext::ScXMLMappingContext( ScXMLImport& rImport,
+     }
+ }
+ 
+-ScXMLMappingContext::~ScXMLMappingContext()
+-{
+-    ScDocument* pDoc = GetScImport().GetDocument();
+-    auto& rDataMapper = pDoc->GetExternalDataMapper();
+-    auto& rDataSources = rDataMapper.getDataSources();
+-    if(!rDataSources.empty())
+-        rDataSources.back().refresh(pDoc, true);
+-
+-}
+-
+ uno::Reference<xml::sax::XFastContextHandler>
+     SAL_CALL ScXMLMappingContext::createFastChildContext(
+         sal_Int32 nElement, const uno::Reference<xml::sax::XFastAttributeList>& /*xAttrList*/)
+diff --git a/sc/source/filter/xml/xmlmappingi.hxx b/sc/source/filter/xml/xmlmappingi.hxx
+index cc38d40dbe93..98a74a7eff31 100644
+--- a/sc/source/filter/xml/xmlmappingi.hxx
++++ b/sc/source/filter/xml/xmlmappingi.hxx
+@@ -34,8 +34,6 @@ public:
+     ScXMLMappingContext( ScXMLImport& rImport,
+                         const rtl::Reference<sax_fastparser::FastAttributeList>& rAttrList );
+ 
+-    virtual ~ScXMLMappingContext() override;
+-
+     virtual css::uno::Reference<css::xml::sax::XFastContextHandler> SAL_CALL createFastChildContext(
+         sal_Int32 nElement,
+         const css::uno::Reference<css::xml::sax::XFastAttributeList>& xAttrList) override;
+diff --git a/sc/source/ui/dataprovider/dataprovider.cxx b/sc/source/ui/dataprovider/dataprovider.cxx
+index 1a31a1afddaf..bea50ee0f817 100644
+--- a/sc/source/ui/dataprovider/dataprovider.cxx
++++ b/sc/source/ui/dataprovider/dataprovider.cxx
+@@ -17,6 +17,8 @@
+ #include <unotools/charclass.hxx>
+ #include <tools/stream.hxx>
+ #include <comphelper/processfactory.hxx>
++#include <tools/hostfilter.hxx>
++#include <tools/urlobj.hxx>
+ 
+ #include "htmldataprovider.hxx"
+ #include "xmldataprovider.hxx"
+@@ -24,6 +26,10 @@
+ #include <datamapper.hxx>
+ #include <dbdata.hxx>
+ #include <docsh.hxx>
++#include <document.hxx>
++#include <comphelper/embeddedobjectcontainer.hxx>
++#include <sfx2/lnkbase.hxx>
++#include <sfx2/linkmgr.hxx>
+ #include <utility>
+ 
+ using namespace com::sun::star;
+@@ -32,6 +38,19 @@ namespace sc {
+ 
+ std::unique_ptr<SvStream> DataProvider::FetchStreamFromURL(const OUString& rURL, OStringBuffer& rBuffer)
+ {
++    INetURLObject aURLObject(rURL);
++    if (aURLObject.IsExoticProtocol())
++    {
++        SAL_WARN("sc.ui", "DataProvider::FetchStreamFromURL: blocked exotic protocol: \"" << rURL << "\"");
++        return nullptr;
++    }
++
++    if (HostFilter::isForbidden(aURLObject.GetHost()))
++    {
++        SAL_WARN("sc.ui", "DataProvider::FetchStreamFromURL: blocked host: \"" << rURL << "\"");
++        return nullptr;
++    }
++
+     try
+     {
+         uno::Reference< ucb::XSimpleFileAccess3 > xFileAccess = ucb::SimpleFileAccess::create( comphelper::getProcessComponentContext() );
+@@ -179,8 +198,46 @@ const std::vector<std::shared_ptr<sc::DataTransformation>>& ExternalDataSource::
+     return maDataTransformations;
+ }
+ 
+-ExternalDataMapper::ExternalDataMapper(ScDocument& /*rDoc*/)
+-    //mrDoc(rDoc)
++namespace {
++
++// A data mapping fetches external data (CSV, HTML, XML) into a sheet. It is
++// registered in the LinkManager so it passes through the same link update
++// control as sheet links, area links, and external references. The link holds
++// the index of its data source in the mapper. That index is stable because
++// data sources are only ever appended, never removed.
++class ScDataProviderLink final : public sfx2::SvBaseLink
++{
++    ScDocShell& mrDocShell;
++    size_t mnSourceIndex;
++
++public:
++    ScDataProviderLink(ScDocShell& rDocShell, size_t nSourceIndex)
++        : sfx2::SvBaseLink(SfxLinkUpdateMode::ONCALL, SotClipboardFormatId::SIMPLE_FILE)
++        , mrDocShell(rDocShell)
++        , mnSourceIndex(nSourceIndex)
++    {
++    }
++
++    virtual sfx2::SvBaseLink::UpdateResult DataChanged(const OUString&,
++                                                       const css::uno::Any&) override
++    {
++        if (!mrDocShell.GetEmbeddedObjectContainer().getUserAllowsLinkUpdate())
++            return SUCCESS;
++
++        ScDocument& rDoc = mrDocShell.GetDocument();
++        std::vector<sc::ExternalDataSource>& rSources
++            = rDoc.GetExternalDataMapper().getDataSources();
++        if (mnSourceIndex < rSources.size())
++            rSources[mnSourceIndex].refresh(&rDoc, true);
++
++        return SUCCESS;
++    }
++};
++
++}
++
++ExternalDataMapper::ExternalDataMapper(ScDocument& rDoc)
++    : mrDoc(rDoc)
+ {
+ }
+ 
+@@ -191,6 +248,19 @@ ExternalDataMapper::~ExternalDataMapper()
+ void ExternalDataMapper::insertDataSource(const sc::ExternalDataSource& rSource)
+ {
+     maDataSources.push_back(rSource);
++
++    ScDocShell* pDocShell = mrDoc.GetDocumentShell();
++    if (!pDocShell)
++        return;
++
++    sfx2::LinkManager* pLinkManager = mrDoc.GetLinkManager();
++    if (!pLinkManager)
++        return;
++
++    ScDataProviderLink* pLink = new ScDataProviderLink(*pDocShell, maDataSources.size() - 1);
++    const OUString& rProvider = rSource.getProvider();
++    pLinkManager->InsertFileLink(*pLink, sfx2::SvBaseLinkObjectType::ClientFile,
++                                 rSource.getURL(), &rProvider, nullptr);
+ }
+ 
+ const std::vector<sc::ExternalDataSource>& ExternalDataMapper::getDataSources() const
+diff --git a/sc/source/ui/dataprovider/sqldataprovider.cxx b/sc/source/ui/dataprovider/sqldataprovider.cxx
+index 05401075bf86..7521e340ca7a 100644
+--- a/sc/source/ui/dataprovider/sqldataprovider.cxx
++++ b/sc/source/ui/dataprovider/sqldataprovider.cxx
+@@ -9,6 +9,8 @@
+ 
+ #include "sqldataprovider.hxx"
+ #include <datatransformation.hxx>
++#include <sal/log.hxx>
++#include <tools/urlobj.hxx>
+ #include <salhelper/thread.hxx>
+ #include <com/sun/star/sdb/DatabaseContext.hpp>
+ #include <com/sun/star/sdb/XCompletedConnection.hpp>
+@@ -63,6 +65,13 @@ void SQLFetchThread::execute()
+     OUString aTable = maID.copy(0, nIndex);
+     OUString aDatabase = maID.copy(nIndex + 1);
+ 
++    if (INetURLObject(aDatabase).IsExoticProtocol())
++    {
++        SAL_WARN("sc.ui",
++                 "SQLFetchThread::execute: blocked exotic protocol: \"" << aDatabase << "\"");
++        return;
++    }
++
+     try
+     {
+         uno::Reference<sdb::XDatabaseContext> xContext
+diff --git a/sc/source/ui/docshell/docsh4.cxx b/sc/source/ui/docshell/docsh4.cxx
+index db07a6b93cbf..69aebfaef5eb 100644
+--- a/sc/source/ui/docshell/docsh4.cxx
++++ b/sc/source/ui/docshell/docsh4.cxx
+@@ -494,6 +494,7 @@ void ScDocShell::Execute( SfxRequest& rReq )
+                             rHelpBtn.set_label(GetStandardText(StandardButtonType::Help).replaceFirst("~", ""));
+                             rHelpBtn.connect_clicked(LINK(nullptr, LinkHelp, DispatchHelpLinksHdl));
+                             weld::Button& rBtn = pInfoBar->addButton();
++                            rBtn.set_buildable_name(u"allowupdating"_ustr);
+                             rBtn.set_label(ScResId(STR_ENABLE_CONTENT));
+                             rBtn.set_tooltip_text(ScResId(STR_ENABLE_CONTENT_TOOLTIP));
+                             rBtn.connect_clicked(LINK(this, ScDocShell, ReloadAllLinksHdl));
+diff --git a/sc/source/ui/docshell/tablink.cxx b/sc/source/ui/docshell/tablink.cxx
+index 4babed2103ed..27e8631a8678 100644
+--- a/sc/source/ui/docshell/tablink.cxx
++++ b/sc/source/ui/docshell/tablink.cxx
+@@ -35,6 +35,7 @@
+ #include <tools/urlobj.hxx>
+ #include <unotools/transliterationwrapper.hxx>
+ #include <comphelper/configuration.hxx>
++#include <comphelper/embeddedobjectcontainer.hxx>
+ #include <comphelper/processfactory.hxx>
+ 
+ #include <tablink.hxx>
+@@ -139,6 +140,9 @@ bool ScTableLink::Refresh(const OUString& rNewFile, const OUString& rNewFilter,
+     if (rNewFile.isEmpty() || rNewFilter.isEmpty())
+         return false;
+ 
++    if (!m_rDocSh.GetEmbeddedObjectContainer().getUserAllowsLinkUpdate())
++        return false;
++
+     OUString aNewUrl = ScGlobal::GetAbsDocName(rNewFile, &m_rDocSh);
+     bool bNewUrlName = aFileName != aNewUrl;
+ 
+diff --git a/sc/source/ui/view/tabvwsh4.cxx b/sc/source/ui/view/tabvwsh4.cxx
+index 86c0800c0204..ec870601de1f 100644
+--- a/sc/source/ui/view/tabvwsh4.cxx
++++ b/sc/source/ui/view/tabvwsh4.cxx
+@@ -1632,7 +1632,8 @@ void ScTabViewShell::Construct( TriState nForceDesignMode )
+             if (!bLink)
+             {
+                 const sc::DocumentLinkManager& rMgr = rDoc.GetDocLinkManager();
+-                if (rDoc.HasLinkFormulaNeedingCheck() || rDoc.HasAreaLinks() || rMgr.hasDdeOrOleOrWebServiceLinks())
++                if (rDoc.HasLinkFormulaNeedingCheck() || rDoc.HasAreaLinks()
++                        || rDoc.HasDataProviderMappings() || rMgr.hasDdeOrOleOrWebServiceLinks())
+                     bLink = true;
+             }
+             if (bLink)
