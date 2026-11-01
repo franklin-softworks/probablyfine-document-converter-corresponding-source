@@ -1,0 +1,55 @@
+diff --git a/sc/source/filter/xml/xmlcelli.cxx b/sc/source/filter/xml/xmlcelli.cxx
+index 5d1003d3f470..a7ba4f6afba7 100644
+--- a/sc/source/filter/xml/xmlcelli.cxx
++++ b/sc/source/filter/xml/xmlcelli.cxx
+@@ -865,9 +865,36 @@ void ScXMLTableRowCellContext::SetAnnotation(const ScAddress& rPos)
+         SdrObject* pObject = SdrObject::getSdrObjectFromXShape(mxAnnotationData->mxShape);
+         OSL_ENSURE( pObject, "ScXMLTableRowCellContext::SetAnnotation - cannot get SdrObject from shape" );
+ 
++#ifdef __EMSCRIPTEN__
++        /*  WASM: LibreOfficeKit is our CONVERSION engine, not the backend of an
++            interactive online client.
++
++            Upstream suppresses visible note captions whenever LOK is active,
++            which is right for LibreOffice Online: the client draws comments in
++            its own UI, so rendering a caption into the document would duplicate
++            them. A converter has no such client. Skipping the caption there does
++            not defer the comment to a UI, it DELETES it -- the note is created
++            hidden, so it is neither drawn into the PDF nor counted by
++            ScDrawLayer::GetPrintArea, which is why the annotated sheet also lost
++            a page.
++
++            Measured on spreadsheets/libreoffice_tests/ScAnnotationObj.ods: the
++            reference renders the caption and 2 pages, we rendered 1 page and no
++            comment text at all, in a document whose ONLY content is the
++            annotation. The note data survived perfectly (it round-trips into
++            xl/comments1.xml), so this was never an import failure -- the caption
++            was exported carrying visibility:hidden.
++
++            So on WASM, follow the desktop path and honour office:display.
++            bugs/video_poster_and_cell_annotations_not_rendered.md */
++        const bool bLokHidesNoteCaptions = false;
++#else
++        const bool bLokHidesNoteCaptions = comphelper::LibreOfficeKit::isActive();
++#endif
++
+         /*  Try to reuse the drawing object already created (but only if the
+             note is visible, and the object is a caption object). */
+-        if( mxAnnotationData->mbShown && mxAnnotationData->mbUseShapePos && !comphelper::LibreOfficeKit::isActive())
++        if( mxAnnotationData->mbShown && mxAnnotationData->mbUseShapePos && !bLokHidesNoteCaptions)
+         {
+             if( SdrCaptionObj* pCaption = dynamic_cast< SdrCaptionObj* >( pObject ) )
+             {
+@@ -901,7 +928,11 @@ void ScXMLTableRowCellContext::SetAnnotation(const ScAddress& rPos)
+             if (pOutlinerObj)
+             {
+                 // create cell note with all data from drawing object
+-                if(!comphelper::LibreOfficeKit::isActive())
++                /*  The second half of the same suppression: under LOK the
++                    note is created with bShown=false REGARDLESS of what the
++                    document asked for. Fixing only the branch above would leave
++                    the comment hidden by this one. */
++                if(!bLokHidesNoteCaptions)
+                 {
+                     pNote = ScNoteUtil::CreateNoteFromObjectData( *pDoc, rPos,
+                         std::move(aItemSet), aStyleName, *pOutlinerObj,
