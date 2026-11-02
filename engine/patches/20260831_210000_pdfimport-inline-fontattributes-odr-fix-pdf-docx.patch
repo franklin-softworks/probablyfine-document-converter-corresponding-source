@@ -1,0 +1,91 @@
+diff -ur a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx	2026-08-31 12:39:55.518917508 +0000
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx	2026-08-31 20:47:06.527688597 +0000
+@@ -511,7 +511,7 @@
+ 
+ int PDFOutDev::parseFont( long long nNewId, GfxFont* gfxFont, const GfxState* state ) const
+ {
+-    FontAttributes aNewFont;
++    XpdfInlineFontAttributes aNewFont;
+     int nSize = 0;
+ 
+ #if POPPLER_CHECK_VERSION(20, 12, 0)
+@@ -884,7 +884,7 @@
+     if( !gfxFont )
+         return;
+ 
+-    FontAttributes aFont;
++    XpdfInlineFontAttributes aFont;
+     int nEmbedSize=0;
+ 
+ #if POPPLER_CHECK_VERSION(0, 64, 0)
+@@ -893,7 +893,7 @@
+     Ref* pID = gfxFont->getID();
+     // TODO(Q3): Portability problem
+     long long fontID = static_cast<long long>(pID->gen) << 32 | static_cast<long long>(pID->num);
+-    std::unordered_map< long long, FontAttributes >::const_iterator it =
++    std::unordered_map< long long, XpdfInlineFontAttributes >::const_iterator it =
+         m_aFontMap.find( fontID );
+     if( it == m_aFontMap.end() )
+     {
+diff -ur a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx	2026-08-31 12:39:47.967348098 +0000
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx	2026-08-31 20:47:17.899133584 +0000
+@@ -63,9 +63,19 @@
+ 
+ namespace pdfi
+ {
+-    struct FontAttributes
++    // BUG-28 FIX: renamed from FontAttributes. The WASM inline-import build links
++    // this translation unit INTO soffice alongside the consumer (wrapper.cxx),
++    // whose contentsink.hxx defines a DIFFERENT pdfi::FontAttributes (OUString
++    // members). Under one name the two std::unordered_map<long long, FontAttributes>
++    // instantiations collide (ODR violation): the linker kept the consumer's node
++    // constructor, which OUString-constructs into this GooString-layout struct,
++    // planting the rtl empty-string singleton pointer where std::string expects
++    // its heap pointer -- the root cause of the BUG-28 memory corruption. Distinct
++    // names give distinct mangled instantiations, one per layout. Upstream builds
++    // this file into a separate xpdfimport process, so upstream is unaffected.
++    struct XpdfInlineFontAttributes
+     {
+-        FontAttributes() :
++        XpdfInlineFontAttributes() :
+             familyName(),
+             isEmbedded(false),
+             maFontWeight(GfxFont::W400),
+@@ -76,7 +86,7 @@
+ 
+         // xpdf goo stuff is so totally borked...
+         // ...need to hand-code assignment
+-        FontAttributes( const FontAttributes& rSrc ) :
++        XpdfInlineFontAttributes( const XpdfInlineFontAttributes& rSrc ) :
+             familyName(),
+             isEmbedded(rSrc.isEmbedded),
+             maFontWeight(rSrc.maFontWeight),
+@@ -87,7 +97,7 @@
+             familyName.append(&rSrc.getFamilyName());
+         }
+ 
+-        FontAttributes& operator=( const FontAttributes& rSrc )
++        XpdfInlineFontAttributes& operator=( const XpdfInlineFontAttributes& rSrc )
+         {
+             familyName.clear();
+             familyName.append(&rSrc.getFamilyName());
+@@ -101,7 +111,7 @@
+             return *this;
+         }
+ 
+-        bool operator==(const FontAttributes& rFont) const
++        bool operator==(const XpdfInlineFontAttributes& rFont) const
+         {
+             return getFamilyName().cmp(&rFont.getFamilyName())==0 &&
+                 isEmbedded == rFont.isEmbedded &&
+@@ -136,7 +146,7 @@
+         // not owned by this class
+         PDFDoc*                                 m_pDoc;
+         mutable std::unordered_map< long long,
+-                               FontAttributes > m_aFontMap;
++                               XpdfInlineFontAttributes > m_aFontMap;
+         std::unique_ptr<UnicodeMap>             m_pUtf8Map;
+         bool                                    m_bSkipImages;
+ 
