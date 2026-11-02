@@ -1,0 +1,296 @@
+BUG-38: documents with thousands of anchored objects (our own PDF -> DOCX output) --
+three superlinear costs made linear, measured with a named CPU profile and counters.
+
+1. SdrObjList order numbers stay valid (svx/source/svdraw/svdpage.cxx, svdpage.hxx).
+   Every insert and every move set mbObjOrdNumsDirty, so the next GetOrdNum() renumbered the
+   whole page (RecalcObjOrdNums) and the text-box z-order correction
+   (SdrObject::ensureSortedImmediatelyAfter) took its scan-the-page branch: per DOCX here,
+   29-204 M renumber steps and 99-898 M scan steps. Now an append to a valid list leaves it
+   valid (NbcInsertObject already meant to: the container call defeated it), and
+   SetObjectOrdNum / SetExistingObjectOrdNum renumber only the moved range on a valid list.
+   With upstream 22bffed4daf5 (tdf#125846, removing the last object does not renumber),
+   backported. The order numbers are the same numbers RecalcObjOrdNums would assign.
+2. GraphicZOrderHelper::findZOrder (writerfilter) searched its ordered std::map with a linear
+   std::find_if; now lower_bound / upper_bound (the same predicates). pdf-docx writes ascending
+   relativeHeight, so every shape walked the whole map: 12.3 s of a 16,762-shape import.
+3. SwSortedObjs::Insert ran is_sorted() (O(n), a heavy comparator) on every insert, so frame
+   creation for n objects anchored in one paragraph or on one page was O(n^2): 52 s, 53% of
+   view creation, for 5,878 anchors in one paragraph (the time the no-progress watchdog
+   stopped). SwSortedObjs::BulkInsertScope around AppendObjs: within it a list is checked once,
+   on its first insert; frame creation changes no sort criterion between inserts, and a sorted
+   list stays sorted under lower-bound insertion. When the outermost scope ends, every list it
+   touched is checked again and re-sorted if needed, as Insert() would have.
+
+Not WASM-specific (no #ifdef): correct on desktop too, and candidates for upstream (tdf#169116).
+Documents module only for now (where it is measured).
+
+diff --git a/include/svx/svdpage.hxx b/include/svx/svdpage.hxx
+index 3d6cc60..80059b9 100644
+--- a/include/svx/svdpage.hxx
++++ b/include/svx/svdpage.hxx
+@@ -100,6 +100,8 @@ public:
+     /// recalculate order numbers / ZIndex
+     void           RecalcObjOrdNums();
+     bool           IsObjOrdNumsDirty() const        { return mbObjOrdNumsDirty; }
++    /// Renumber only [nFrom, nTo] of a list whose numbers were valid before that range moved.
++    void           RenumberObjOrdNums(size_t nFrom, size_t nTo);
+     virtual void   NbcInsertObject(SdrObject* pObj, size_t nPos=SAL_MAX_SIZE);
+     virtual void   InsertObject(SdrObject* pObj, size_t nPos=SAL_MAX_SIZE);
+     SAL_DLLPRIVATE void           sort( std::vector<sal_Int32>& sortOrder );
+diff --git a/svx/source/svdraw/svdpage.cxx b/svx/source/svdraw/svdpage.cxx
+index 7fd0b3b..14a058a 100644
+--- a/svx/source/svdraw/svdpage.cxx
++++ b/svx/source/svdraw/svdpage.cxx
+@@ -227,6 +227,14 @@ void SdrObjList::CopyObjects(const SdrObjList& rSrcList)
+ #endif
+ }
+ 
++void SdrObjList::RenumberObjOrdNums(size_t nFrom, size_t nTo)
++{
++    // Only valid on a list whose order numbers were all correct before the change that
++    // moved the objects in [nFrom, nTo]; everything outside that range keeps its number.
++    for (size_t i = nFrom; i <= nTo && i < maList.size(); ++i)
++        maList[i]->SetOrdNum(i);
++}
++
+ void SdrObjList::RecalcObjOrdNums()
+ {
+     size_t no=0;
+@@ -535,6 +543,7 @@ SdrObject* SdrObjList::SetObjectOrdNum(size_t nOldObjNum, size_t nNewObjNum)
+     DBG_ASSERT(pObj!=nullptr,"SdrObjList::SetObjectOrdNum: Object not found.");
+     if (pObj!=nullptr) {
+         DBG_ASSERT(pObj->IsInserted(),"SdrObjList::SetObjectOrdNum: the object does not have status Inserted.");
++        const bool bWasValid = !mbObjOrdNumsDirty;
+         RemoveObjectFromContainer(nOldObjNum);
+         InsertObjectIntoContainer(*pObj,nNewObjNum);
+ 
+@@ -543,7 +552,15 @@ SdrObject* SdrObjList::SetObjectOrdNum(size_t nOldObjNum, size_t nNewObjNum)
+         pObj->ActionChanged();
+ 
+         pObj->SetOrdNum(nNewObjNum);
+-        mbObjOrdNumsDirty=true;
++        // Only the objects between the old and the new position moved: renumber those
++        // instead of every object in the list (thousands of shapes in a Writer document).
++        if (bWasValid)
++        {
++            RenumberObjOrdNums(std::min(nOldObjNum, nNewObjNum), std::max(nOldObjNum, nNewObjNum));
++            mbObjOrdNumsDirty=false;
++        }
++        else
++            mbObjOrdNumsDirty=true;
+ 
+         // TODO: We need a different broadcast here.
+         if (pObj->getSdrPageFromSdrObject()!=nullptr)
+@@ -579,6 +596,7 @@ void SdrObjList::SetExistingObjectOrdNum(SdrObject* pObj, size_t nNewObjNum)
+         pObj->SetNavigationPosition(mxNavigationOrder->size());
+         mxNavigationOrder->push_back(pObj);
+     }
++    const bool bWasValid = !mbObjOrdNumsDirty && nOldOrdNum < maList.size() && maList[nOldOrdNum] == pObj;
+     if (nOldOrdNum < maList.size() && maList[nOldOrdNum] == pObj)
+         maList.erase(maList.begin()+nOldOrdNum);
+     else
+@@ -589,12 +607,23 @@ void SdrObjList::SetExistingObjectOrdNum(SdrObject* pObj, size_t nNewObjNum)
+     // Insert object into object list.  Because the insert() method requires
+     // a valid iterator as insertion position, we have to use push_back() to
+     // insert at the end of the list.
++    size_t nNewPos = nNewObjNum;
+     if (nNewObjNum >= maList.size())
++    {
++        nNewPos = maList.size();
+         maList.push_back(pObj);
++    }
+     else
+         maList.insert(maList.begin()+nNewObjNum, pObj);
+ 
+-    mbObjOrdNumsDirty=true;
++    // Only the objects between the old and the new position moved (see SetObjectOrdNum).
++    if (bWasValid)
++    {
++        RenumberObjOrdNums(std::min<size_t>(nOldOrdNum, nNewPos), std::max<size_t>(nOldOrdNum, nNewPos));
++        mbObjOrdNumsDirty=false;
++    }
++    else
++        mbObjOrdNumsDirty=true;
+ 
+     // No need to delete visualisation data since same object
+     // gets inserted again. Also a single ActionChanged is enough
+@@ -1047,10 +1076,17 @@ void SdrObjList::InsertObjectIntoContainer (
+     // a valid iterator as insertion position, we have to use push_back() to
+     // insert at the end of the list.
+     if (nInsertPosition >= maList.size())
++    {
++        // Appended: every other object keeps its number. Callers set the new object's
++        // number; set it here too, so the list stays valid whoever inserts.
+         maList.push_back(&rObject);
++        rObject.SetOrdNum(maList.size() - 1);
++    }
+     else
++    {
+         maList.insert(maList.begin()+nInsertPosition, &rObject);
+-    mbObjOrdNumsDirty=true;
++        mbObjOrdNumsDirty=true;
++    }
+ #ifdef __EMSCRIPTEN__
+     svx::objnamelog::NoteInserted(rObject); // FG-141
+ #endif
+@@ -1118,7 +1154,9 @@ void SdrObjList::RemoveObjectFromContainer (
+     }
+ 
+     maList.erase(maList.begin()+nObjectPosition);
+-    mbObjOrdNumsDirty=true;
++    // Only the objects behind the removed one get a new position
++    if (nObjectPosition < maList.size())
++        mbObjOrdNumsDirty=true;
+ }
+ 
+ void SdrObjList::dumpAsXml(xmlTextWriterPtr pWriter) const
+diff --git a/sw/source/core/inc/sortedobjs.hxx b/sw/source/core/inc/sortedobjs.hxx
+index 4ffcd69..955e439 100644
+--- a/sw/source/core/inc/sortedobjs.hxx
++++ b/sw/source/core/inc/sortedobjs.hxx
+@@ -49,8 +49,26 @@ class SW_DLLPUBLIC SwSortedObjs
+ {
+     private:
+         std::vector< SwAnchoredObject* > maSortedObjLst;
+-
++        /// Verified sorted in the current BulkInsertScope (see there).
++        bool mbVerifiedInBulk = false;
+     public:
++        /** Frame creation appends the anchored objects of a range of nodes one after another,
++            and nothing changes a sort criterion of a listed object in between: a list that is
++            sorted stays sorted, because Insert() places each object at its lower bound. Within
++            this scope Insert() therefore checks a list for sortedness (is_sorted(), O(n)) only
++            on its first insert, instead of on every insert: O(n) instead of O(n^2) for n objects
++            anchored in one paragraph or on one page. When the outermost scope ends, every list
++            touched is checked again and re-sorted if needed, exactly as Insert() would have.
++        */
++        class SW_DLLPUBLIC BulkInsertScope
++        {
++        public:
++            BulkInsertScope();
++            ~BulkInsertScope();
++            BulkInsertScope(const BulkInsertScope&) = delete;
++            BulkInsertScope& operator=(const BulkInsertScope&) = delete;
++        };
++
+         typedef std::vector<SwAnchoredObject*>::const_iterator const_iterator;
+         SwSortedObjs();
+         ~SwSortedObjs();
+diff --git a/sw/source/core/layout/frmtool.cxx b/sw/source/core/layout/frmtool.cxx
+index be2f33c..cedfcad 100644
+--- a/sw/source/core/layout/frmtool.cxx
++++ b/sw/source/core/layout/frmtool.cxx
+@@ -1289,6 +1289,9 @@ void AppendObjsOfNode(sw::FrameFormats<sw::SpzFrameFormat*> const*const pTable,
+ void AppendObjs(const sw::FrameFormats<sw::SpzFrameFormat*> *const pTable, SwNodeOffset const nIndex,
+         SwFrame *const pFrame, SwPageFrame *const pPage, SwDoc& rDoc)
+ {
++    // Frame creation appends the node's objects one after another: their lists are checked
++    // for sortedness once, not once per inserted object (SwSortedObjs::BulkInsertScope).
++    SwSortedObjs::BulkInsertScope aBulkInsert;
+     if (pFrame->IsTextFrame())
+     {
+         SwTextFrame const*const pTextFrame(static_cast<SwTextFrame const*>(pFrame));
+diff --git a/sw/source/core/layout/sortedobjs.cxx b/sw/source/core/layout/sortedobjs.cxx
+index d15c4e7..92fd6c8 100644
+--- a/sw/source/core/layout/sortedobjs.cxx
++++ b/sw/source/core/layout/sortedobjs.cxx
+@@ -32,12 +32,52 @@
+ 
+ using namespace ::com::sun::star;
+ 
++namespace
++{
++// BulkInsertScope state: nesting depth, and the lists verified in the current scope.
++int s_nBulkInsertDepth = 0;
++std::vector<SwSortedObjs*>& BulkInsertTouched()
++{
++    static std::vector<SwSortedObjs*> aTouched;
++    return aTouched;
++}
++}
++
+ SwSortedObjs::SwSortedObjs()
+ {
+ }
+ 
+ SwSortedObjs::~SwSortedObjs()
+ {
++    if (mbVerifiedInBulk)
++    {
++        auto& rTouched = BulkInsertTouched();
++        std::erase(rTouched, this);
++    }
++}
++
++SwSortedObjs::BulkInsertScope::BulkInsertScope()
++{
++    ++s_nBulkInsertDepth;
++}
++
++SwSortedObjs::BulkInsertScope::~BulkInsertScope()
++{
++    if (--s_nBulkInsertDepth > 0)
++        return;
++    // The scope's promise is checked, not assumed: every list it touched is sorted, or is
++    // re-sorted here as the next Insert() would have done.
++    auto& rTouched = BulkInsertTouched();
++    for (SwSortedObjs* pList : rTouched)
++    {
++        pList->mbVerifiedInBulk = false;
++        if (!pList->is_sorted())
++        {
++            SAL_WARN("sw.core", "SwSortedObjs::BulkInsertScope: object list is not sorted");
++            pList->UpdateAll();
++        }
++    }
++    rTouched.clear();
+ }
+ 
+ size_t SwSortedObjs::size() const
+@@ -211,10 +251,19 @@ bool SwSortedObjs::is_sorted() const
+ 
+ bool SwSortedObjs::Insert( SwAnchoredObject& _rAnchoredObj )
+ {
+-    if (!is_sorted())
++    // In a BulkInsertScope a list already verified there is still sorted (see the scope).
++    if (!(s_nBulkInsertDepth > 0 && mbVerifiedInBulk))
+     {
+-        SAL_WARN("sw.core", "SwSortedObjs::Insert: object list is not sorted");
+-        UpdateAll();
++        if (!is_sorted())
++        {
++            SAL_WARN("sw.core", "SwSortedObjs::Insert: object list is not sorted");
++            UpdateAll();
++        }
++        if (s_nBulkInsertDepth > 0)
++        {
++            mbVerifiedInBulk = true;
++            BulkInsertTouched().push_back(this);
++        }
+     }
+ 
+     // #i51941#
+diff --git a/sw/source/writerfilter/dmapper/GraphicHelpers.cxx b/sw/source/writerfilter/dmapper/GraphicHelpers.cxx
+index 179d093..d8a2f61 100644
+--- a/sw/source/writerfilter/dmapper/GraphicHelpers.cxx
++++ b/sw/source/writerfilter/dmapper/GraphicHelpers.cxx
+@@ -338,14 +338,11 @@ void GraphicZOrderHelper::adjustRelativeHeight(sal_Int64& rRelativeHeight, bool
+ // Thus, getProperty PROP_Z_ORDER for relativeHeight "x" can return different values for itemZOrder.
+ sal_Int32 GraphicZOrderHelper::findZOrder(sal_Int64 relativeHeight, bool bOldStyle)
+ {
+-    // std::map is iterated sorted by key
+-    auto it = std::find_if(m_items.cbegin(), m_items.cend(),
+-        [relativeHeight, bOldStyle](const Items::value_type& rItem) {
+-            // Old-style ordering differs in what should happen when there is already an item with the same z-order:
+-            // we belong under it in case of new-style, but we belong above it in case of old-style.
+-            return bOldStyle ? (rItem.first > relativeHeight) : (rItem.first >= relativeHeight);
+-        }
+-    );
++    // The first item above us. Old-style ordering differs in what should happen when there is
++    // already an item with the same z-order: we belong under it in case of new-style, but we
++    // belong above it in case of old-style. m_items is ordered by key, so this is a binary
++    // search (upper_bound: key > relativeHeight; lower_bound: key >= relativeHeight), not a scan.
++    auto it = bOldStyle ? m_items.upper_bound(relativeHeight) : m_items.lower_bound(relativeHeight);
+     sal_Int32 itemZOrderOffset(0); // before the item
+     if( it == m_items.end()) // we're topmost
+     {
