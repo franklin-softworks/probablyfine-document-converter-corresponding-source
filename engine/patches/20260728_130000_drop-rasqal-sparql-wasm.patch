@@ -1,0 +1,277 @@
+fix(wasm): stop linking the rasqal SPARQL engine into every module
+
+Apply inside libreoffice/:   git apply -p1 B_drop-rasqal-sparql-wasm.patch
+Then save as an engine patch (engine/patches/) so apply_patches.sh replays it.
+
+SCOPE -- this is deliberately the SMALL cut, not the big one.
+The RDF stack cannot be removed wholesale.  raptor and redland are on the
+unconditional load path for ODT *and* DOCX/RTF, so cutting them would break
+document metadata:
+  sw/source/filter/xml/swxml.cxx                 -> loadMetadataFromStorage on
+                                                    every ODT import
+  sw/source/writerfilter/dmapper/DomainMapper.cxx-> same, UNGATED, in the
+                                                    constructor: every DOCX and
+                                                    every RTF import creates an
+                                                    rdf::Repository
+  sfx2/source/doc/DocumentMetadataAccess.cxx      -> manifest.rdf is parsed and
+                                                    serialised with raptor
+                                                    ("rdfxml"), not by hand
+  sw/source/core/text/porlay.cxx, itrform2.cxx    -> bookmark / content-control
+                                                    lookups, per text node
+Those all use getStatements() (triple matching).  None of them queries.
+
+WHAT IS ACTUALLY DEAD: the SPARQL engine.
+XRepository::querySelect / queryConstruct / queryAsk in
+unoxml/source/rdf/librdf_repository.cxx are the only SPARQL entry points in
+the whole tree, and a tree-wide search finds NO production caller -- only
+unoxml/qa/unit/rdftest.cxx, which is not built for WASM.  With
+--disable-scripting / --disable-gui / --disable-extensions the theoretical
+Basic and UI entry points are gone as well.
+
+WHY A PATCH IS NEEDED AT ALL
+There is no --disable-rasqal.  configure.ac's entire redland section is one
+libo_CHECK_SYSTEM_MODULE (system vs bundled); upstream LibreOffice has no way
+to turn RDF or SPARQL off.  And redland hard-wires the coupling:
+redland/src/rdf_query.c librdf_init_query() does
+    /* Always have rasqal implementation available */
+    rc = librdf_query_rasqal_constructor(world);
+That one call is what pulls rdf_query_rasqal.o into the link, and that object
+is the only referrer of librasqal (MEASURED with llvm-nm: 48 of the 51 rasqal
+symbols librdf needs; the other 3 are query-language / result-format
+enumeration in rdf_query.c and rdf_query_results.c, stubbed here too).
+
+Note this patch does NOT remove -lrasqal from RepositoryExternal.mk and does
+NOT stop rasqal being built.  It does not need to: once nothing references a
+rasqal symbol, static-archive semantics mean librasqal.a contributes zero
+bytes.  Leaving the build and the link line alone keeps the change minimal and
+keeps rasqal.h available for compilation.
+
+MEASURED SAVING (llvm-nm reachability closure over the built archives +
+llvm-size per member; brotli ratios measured on the shipped soffice.wasm
+sections -- 0.2284 code, 0.2803 data):
+    before: librdf 33 members + raptor2 44 + rasqal 73 = 530,034 code / 129,572 data
+    after : librdf 32 members + raptor2 44             = 270,590 code /  55,542 data
+    saving: 259,444 B code + 74,030 B data = 333,474 B raw  ->  ~78 KiB brotli
+Note librasqal.a (595 KB on disk) is the LARGEST of the three RDF archives.
+
+FAILURE MODE IF THIS IS WRONG
+librdf_get_query_factory() finds no factory -> librdf_new_query() returns NULL
+-> librdf_Repository::querySelect throws rdf::QueryException.  A clean,
+reported error; never a crash, never a silently wrong result.  librdf_world_-
+open() still succeeds (rdf_init.c only checks librdf_init_query's return code,
+which is now 0).
+
+REGRESSION TESTS THAT WOULD CATCH A MISTAKE
+ 1. ODT -> PDF on a document carrying metadata, then ODT -> ODT round-trip:
+    manifest.rdf must survive.  This is the raptor path; if this patch ever
+    over-reached into raptor, it breaks here.
+ 2. DOCX -> PDF and RTF -> PDF: DomainMapper's constructor builds an
+    rdf::Repository on every import.  librdf_world_open() must still succeed.
+ 3. A DOCX containing bookmarks / content controls -> PDF: exercises
+    porlay.cxx getRDFRepository()->getStatements() during layout.
+ 4. Existing tests/run_pipeline.sh text + structure validation for ODT/DOCX.
+None of these issues a SPARQL query, which is precisely the point.
+
+SIDE FINDING (not addressed here)
+external/redland/redland/redland-emscripten.patch.0 exists in the tree but is
+NOT listed in UnpackedTarball_redland.mk's add_patches -- it is untracked and
+inert, applied by nothing.  Worth a look separately.
+
+diff --git a/external/redland/redland/redland-drop-rasqal-wasm.patch.1 b/external/redland/redland/redland-drop-rasqal-wasm.patch.1
+new file mode 100644
+--- /dev/null
++++ b/external/redland/redland/redland-drop-rasqal-wasm.patch.1
+@@ -0,0 +1,182 @@
++WASM: do not link the rasqal SPARQL engine.
++
++redland's librdf_init_query() unconditionally registers the rasqal query
++factory ("Always have rasqal implementation available").  That single call is
++the only thing that drags rdf_query_rasqal.o into the link, and that object is
++in turn the only referrer of librasqal -- so with it gone the linker drops
++librasqal.a entirely.  Two more librdf objects touch rasqal, purely to
++enumerate query languages / result formats; they are stubbed here too.
++
++LibreOffice never issues a SPARQL query: XRepository::querySelect /
++queryConstruct / queryAsk (unoxml/source/rdf/librdf_repository.cxx) are the
++only SPARQL entry points in the tree and have no production caller -- only
++unoxml/qa/unit/rdftest.cxx, which is not built for WASM.
++
++raptor and redland itself are NOT touched and must not be: ODF and OOXML
++import genuinely need them.
++  - sfx2/source/doc/DocumentMetadataAccess.cxx reads and writes manifest.rdf
++    via importGraph/exportGraph -> librdf_new_parser("rdfxml"), i.e. raptor.
++  - sw/source/filter/xml/swxml.cxx calls loadMetadataFromStorage on every
++    ODT import; sw/source/writerfilter/dmapper/DomainMapper.cxx does the same,
++    ungated, in its constructor -- so every DOCX and RTF import builds an
++    rdf::Repository too.
++  - sw/source/core/text/porlay.cxx and itrform2.cxx read bookmark/content-
++    control metadata with getStatements(), not with a query.
++Cutting raptor/redland would break all of that.  Only the query engine goes.
++
++Failure mode if a SPARQL query is ever issued after this: librdf_get_query_-
++factory() finds no factory, librdf_new_query() returns NULL, and
++librdf_Repository::querySelect throws rdf::QueryException -- a clean, reported
++error, never a crash or a silently wrong answer.
++
++Saving, measured by llvm-nm reachability closure over the built archives plus
++llvm-size per member: 259,444 B code + 74,030 B data = 333,474 B of raw wasm
++per module, ~78 KiB after brotli.
++
++--- a/src/rdf_query.c
+++++ b/src/rdf_query.c
++@@ -62,6 +62,37 @@
++ int
++ librdf_init_query(librdf_world *world) 
++ {
+++#ifdef __EMSCRIPTEN__
+++  /* WASM: do not register the rasqal (SPARQL) query factory.
+++   *
+++   * This one call is the ONLY thing that pulls rdf_query_rasqal.o into the
+++   * link, and rdf_query_rasqal.o is in turn the only object that references
+++   * librasqal.  Removing it makes the whole SPARQL engine unreferenced, so
+++   * the linker drops librasqal.a entirely from the static archive -- worth
+++   * ~333 KB of raw wasm (~78 KiB brotli) per module.
+++   *
+++   * Why this is safe here: nothing in LibreOffice ever issues a SPARQL
+++   * query.  XRepository::querySelect/queryConstruct/queryAsk
+++   * (unoxml/source/rdf/librdf_repository.cxx) are the only SPARQL entry
+++   * points in the tree and they have no production caller -- only
+++   * unoxml/qa/unit/rdftest.cxx, which is not built for WASM.  Everything
+++   * that ODF/OOXML import and export actually needs from redland is triple
+++   * storage and RDF/XML parse+serialise (raptor), which are untouched:
+++   *   - sfx2/source/doc/DocumentMetadataAccess.cxx reads/writes manifest.rdf
+++   *     with importGraph/exportGraph -> librdf_new_parser("rdfxml") (raptor)
+++   *   - it enumerates with getStatements() -> librdf_model_find_statements,
+++   *     NOT with a query
+++   *   - sw/source/core/text/porlay.cxx bookmark lookups use getStatements()
+++   * So raptor and redland MUST stay; only the query engine goes.
+++   *
+++   * Failure mode if something ever does query: librdf_get_query_factory()
+++   * finds no factory, librdf_new_query() returns NULL, and
+++   * librdf_Repository::querySelect throws rdf::QueryException -- a clean,
+++   * reported error, not a crash or silent wrong answer.
+++   */
+++  (void)world;
+++  return 0;
+++#else
++   int rc;
++   
++   /* Always have rasqal implementation available */
++@@ -77,6 +108,7 @@
++ #endif
++ 
++   return 0;
+++#endif /* !__EMSCRIPTEN__ */
++ }
++ 
++ 
++@@ -90,7 +122,12 @@
++ void
++ librdf_finish_query(librdf_world *world) 
++ {
+++#ifndef __EMSCRIPTEN__
+++  /* WASM: the rasqal factory was never constructed (see librdf_init_query),
+++   * so there is nothing to tear down and calling the destructor would
+++   * re-introduce the librasqal dependency we just removed. */
++   librdf_query_rasqal_destructor(world);
+++#endif
++   librdf_delete_query_factories(world);
++ }
++ 
++@@ -310,10 +347,19 @@
++ librdf_query_language_get_description(librdf_world* world,
++                                       unsigned int counter)
++ {
+++#ifdef __EMSCRIPTEN__
+++  /* WASM: no query languages are registered, so the list is empty.  NULL is
+++   * the documented "counter is out of range" answer and every caller in
+++   * redland treats it as end-of-list. */
+++  (void)world;
+++  (void)counter;
+++  return NULL;
+++#else
++   librdf_world_open(world);
++ 
++   return rasqal_world_get_query_language_description(world->rasqal_world_ptr,
++                                                      counter);
+++#endif
++ }
++ 
++ /**
++--- a/src/rdf_query_results.c
+++++ b/src/rdf_query_results.c
++@@ -965,8 +965,18 @@
++                                    const char *name, librdf_uri* uri,
++                                    const char *mime_type)
++ {
+++#ifdef __EMSCRIPTEN__
+++  /* WASM: librasqal is not linked (see librdf_init_query in rdf_query.c), so
+++   * no query-results formatter exists.  0 == "no formatter", which is the
+++   * documented answer and what every caller already handles. */
+++  (void)world;
+++  (void)name;
+++  (void)uri;
+++  (void)mime_type;
+++  return 0;
+++#else
++   int flags = RASQAL_QUERY_RESULTS_FORMAT_FLAG_READER;
++-  
+++
++   librdf_world_open(world);
++ 
++   /* FIXME - this should use some kind of registration but for now
++@@ -975,6 +985,7 @@
++   return rasqal_query_results_formats_check(world->rasqal_world_ptr,
++                                             name, (raptor_uri*)uri, mime_type,
++                                             flags);
+++#endif
++ }
++ 
++ 
++@@ -1007,12 +1018,19 @@
++ {
++   const raptor_syntax_description *desc;
++ 
+++#ifdef __EMSCRIPTEN__
+++  /* WASM: librasqal is not linked -- the format list is empty. */
+++  (void)world;
+++  (void)counter;
+++  desc = NULL;
+++#else
++   librdf_world_open(world);
++ 
++   /* FIXME - this should use some kind of registration but for now
++    * it is safe to assume Rasqal does it all
++    */
++   desc = rasqal_world_get_query_results_format_description(world->rasqal_world_ptr, counter);
+++#endif
++   if(!desc)
++     return -1;
++   
++@@ -1048,8 +1066,15 @@
++ librdf_query_results_formats_get_description(librdf_world* world, 
++                                              unsigned int counter)
++ {
+++#ifdef __EMSCRIPTEN__
+++  /* WASM: librasqal is not linked -- the format list is empty. */
+++  (void)world;
+++  (void)counter;
+++  return NULL;
+++#else
++   librdf_world_open(world);
++ 
++   return rasqal_world_get_query_results_format_description(world->rasqal_world_ptr,
++                                                            counter);
+++#endif
++ }
+diff --git a/external/redland/UnpackedTarball_redland.mk b/external/redland/UnpackedTarball_redland.mk
+--- a/external/redland/UnpackedTarball_redland.mk
++++ b/external/redland/UnpackedTarball_redland.mk
+@@ -34,6 +34,7 @@
+ 	external/redland/redland/clang-cl.patch \
+ 	external/redland/redland/libtool.patch \
+ 	external/redland/redland/ubsan.patch \
++	$(if $(filter EMSCRIPTEN,$(OS)),external/redland/redland/redland-drop-rasqal-wasm.patch.1) \
+ ))
+ 
+ # vim: set noet sw=4 ts=4:
