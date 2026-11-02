@@ -1,0 +1,26 @@
+--with-wasm-module=impress
+--enable-pdfimport
+--enable-poppler
+--disable-pdfium
+--disable-gui
+--disable-scripting
+--disable-python
+--disable-database-connectivity
+--disable-extensions
+--without-webdav
+--disable-curl
+--without-fonts
+--enable-optimized
+--disable-debug
+--disable-dconf
+--disable-sdremote
+--disable-sdremote-bluetooth
+--disable-randr
+--disable-dbus
+--disable-avahi
+--without-java
+--disable-opencl
+--enable-wasm-exceptions
+--disable-emscripten-proxy-to-pthread
+CC="emcc -fwasm-exceptions -s SUPPORT_LONGJMP=wasm -msimd128"
+CXX="em++ -fwasm-exceptions -s SUPPORT_LONGJMP=wasm -msimd128"
