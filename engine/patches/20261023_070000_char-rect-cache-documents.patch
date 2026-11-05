@@ -1,0 +1,597 @@
+BUG-38, fix 1: SwAnchoredObject::CheckCharRectAndTopOfLine reuses its last answer while nothing
+it depends on has changed.
+
+SwContentNotify re-checks every at-character object of a paragraph after each MakeAll of it, and
+each check builds a text cursor (GetAutoPos, GetTopOfLine): in a document with thousands of
+anchored objects that was 26 s of a 54 s layout (cma), and over 262 documents 762.8 M checks of
+which 99.85% (char rect) and 99.99% (top of line) found the value unchanged.
+
+The check now keeps a key: the anchor character frame's format generation, its frame and print
+areas, whether it is a follow (first-line indent), its upper's frame and print areas (GetAutoPos
+limits the rectangle to the upper's print area), and the anchor position (node by identity as
+well as by index, and content index). While all are
+unchanged, the frame and its upper are valid, and the frame has its paragraph portion or is
+empty (then GetAutoPos/GetTopOfLine only read it, an empty one only its areas; otherwise they
+may format it, so nothing is cached), the check returns what it would have found: the same char
+rect and top of line, i.e. nothing to do.
+- SwTextFrame::mnFormatGeneration changes whenever the frame's line layout or what reading it
+  depends on may change: line formatting (Format_, FormatOnceMore, FormatQuick once it rebuilds
+  lines), lines truncated (SwTextIter::TruncLines) or a dummy line added, SetPara/ClearPara and
+  a new paragraph portion for a non-empty frame, SetEmpty, SetOffset_ and ManipOfst when the
+  value changes, SetMergedPara,
+  JoinFrame/SplitFrame, Prepare (except MustFit and WidowsOrphans, which only set preparation
+  flags), SwClientNotify, every path of Format() that changes the frame, and a FormatEmpty() that
+  changes the height. A Format() that finds the frame formatted, a FormatEmpty() that declines or
+  changes nothing, a flag-only Prepare, and CalcPreps applying preparations that change no line
+  leave it alone: on heavy round-trip documents those were ~98% of the checks the cache missed
+  (Prepare(MustFit) then CalcPreps alone 92 M on 16 documents), every one of which recomputed to
+  the cached value. Values come from ONE global counter, so a frame
+  allocated at a freed frame's address never starts at a value an old key holds.
+- Every writer of the cached values (AddLastCharY, ResetLastCharRectHeight, AddLastTopOfLineY,
+  ClearCharRectAndTopOfLine, sw_HideObj) clears the key.
+- One answer per anchor character frame: after a frame is formatted, every object anchored
+  there asks GetAutoPos/GetTopOfLine the same question of the same frame (round-trip documents
+  anchor thousands of objects in textless paragraphs that are formatted on every pass). The last
+  answer of each lookup is kept under the same key and in the same states, and reused by the
+  other objects (cma 67.6 -> 42.8 s; three documents that never finished now do).
+Not WASM-specific. Documents module only for now.
+
+diff --git a/sw/inc/anchoredobject.hxx b/sw/inc/anchoredobject.hxx
+--- a/sw/inc/anchoredobject.hxx
++++ b/sw/inc/anchoredobject.hxx
+@@ -20,6 +20,7 @@
+ 
+ #include "swtypes.hxx"
+ #include "swrect.hxx"
++#include "nodeoffset.hxx"
+ #include <svx/svdobj.hxx>
+ #include <libxml/xmlwriter.h>
+ 
+@@ -31,6 +32,7 @@
+ 
+ class SwFrameFormat;
+ class SwFormatAnchor;
++class SwNode;
+ enum class RndStdIds;
+ 
+ /** wrapper class for the positioning of Writer fly frames and drawing objects
+@@ -65,6 +67,24 @@
+         // has changed, and used to position object.
+         SwTwips mnLastTopOfLine;
+ 
++        // The state CheckCharRectAndTopOfLine last checked against: the anchor character
++        // frame's format generation (globally unique, see SwTextFrame::mnFormatGeneration),
++        // its frame and print areas, whether it is a follow, its upper's frame and print areas
++        // (GetAutoPos limits the rectangle to the upper's print area), and the anchor position.
++        // While all are unchanged and the frame and its upper are valid and the frame keeps its
++        // paragraph portion (or is empty: then they read only its areas), GetAutoPos and
++        // GetTopOfLine would return what they returned then, so the check is skipped.
++        // 0 = nothing cached.
++        sal_uInt64 mnCharRectCheckGeneration = 0;
++        SwRect maCharRectCheckFrameArea;
++        SwRect maCharRectCheckPrtArea;
++        SwRect maCharRectCheckUpperFrameArea;
++        SwRect maCharRectCheckUpperPrtArea;
++        bool mbCharRectCheckFollow = false;   // the frame's IsFollow() (first-line indent)
++        SwNodeOffset mnCharRectCheckNode;
++        const SwNode* mpCharRectCheckNode = nullptr;
++        sal_Int32 mnCharRectCheckContent = -1;
++
+         // for to-paragraph and to-character anchored objects:
+         // Layout frame vertical position is orient at - typically it's the upper
+         // of the anchor frame, but it could also by the upper of a follow or
+diff --git a/sw/source/core/inc/txtfrm.hxx b/sw/source/core/inc/txtfrm.hxx
+--- a/sw/source/core/inc/txtfrm.hxx
++++ b/sw/source/core/inc/txtfrm.hxx
+@@ -184,6 +184,17 @@
+     /// recreation of the SwLineLayout by Format() if necessary.
+     static SwCache *s_pTextCache;
+ 
++    /// Changes whenever this frame's line layout, or what reading it depends on, may have
++    /// changed: line formatting (Format_, FormatOnceMore, FormatQuick's lines), lines truncated
++    /// or a dummy line added, the paragraph portion set or cleared, or created for a non-empty
++    /// frame, the empty flag or the offset changed, a join or split, a prepare (other than the
++    /// flag-only MustFit and WidowsOrphans) or attribute notification, every path of Format()
++    /// that changes the frame, and a FormatEmpty() that changes the height. A Format() or
++    /// FormatEmpty() that finds nothing to do leaves it alone. Values come from one global counter, so a frame
++    /// never reuses a value another frame (also one freed earlier at the same address) has had.
++    /// SwAnchoredObject::CheckCharRectAndTopOfLine keys its result on it.
++    sal_uInt64 mnFormatGeneration;
++
+     sal_Int32  mnAllLines        :24; // Line count for the Paint (including nThisLines)
+     sal_Int32  mnThisLines       :8; // Count of Lines of the Frame
+ 
+@@ -258,7 +269,12 @@
+     void Unlock() { mbLocked = false; }
+     void SetWidow( const bool bNew ) { mbWidow = bNew; }
+     void SetJustWidow( const bool bNew ) { mbJustWidow = bNew; }
+-    void SetEmpty( const bool bNew ) { mbEmpty = bNew; }
++    void SetEmpty( const bool bNew )
++    {
++        if ( mbEmpty != bNew )
++            BumpFormatGeneration();
++        mbEmpty = bNew;
++    }
+     void SetFieldFollow( const bool bNew ) { mbFieldFollow = bNew; }
+ 
+     bool IsIdxInside(TextFrameIndex nPos, TextFrameIndex nLen) const;
+@@ -460,7 +476,12 @@
+     void SetNoHyphOffset(TextFrameIndex const nNewOfst) { mnNoHyphOffset = nNewOfst; }
+     sal_Int16 GetNoHyphEndZone() const { return mnNoHyphEndZone; }
+     void SetNoHyphEndZone(sal_Int16 nNewType) { mnNoHyphEndZone = nNewType; }
+-    void ManipOfst(TextFrameIndex const nNewOfst) { mnOffset = nNewOfst; }
++    void ManipOfst(TextFrameIndex const nNewOfst)
++    {
++        if (mnOffset != nNewOfst)
++            BumpFormatGeneration();
++        mnOffset = nNewOfst;
++    }
+            SwTextFrame   *GetFrameAtPos ( const SwPosition &rPos);
+     inline const SwTextFrame *GetFrameAtPos ( const SwPosition &rPos) const;
+     SwTextFrame&   GetFrameAtOfst(TextFrameIndex nOfst);
+@@ -691,6 +712,8 @@
+ 
+     /// For displaying the line numbers
+     sal_Int32 GetAllLines()  const { return mnAllLines; }
++    sal_uInt64 GetFormatGeneration() const { return mnFormatGeneration; }
++    void BumpFormatGeneration();
+     sal_Int32 GetThisLines() const { return mnThisLines;}
+     void RecalcAllLines();
+ 
+diff --git a/sw/source/core/layout/anchoredobject.cxx b/sw/source/core/layout/anchoredobject.cxx
+--- a/sw/source/core/layout/anchoredobject.cxx
++++ b/sw/source/core/layout/anchoredobject.cxx
+@@ -35,6 +35,104 @@
+ 
+ using namespace ::com::sun::star;
+ 
++namespace
++{
++// After a text frame is formatted, SwContentNotify re-checks every object anchored at its
++// characters, and objects at one position ask GetAutoPos/GetTopOfLine the same question of the
++// same frame: on round-trip documents with thousands of anchors in one paragraph that is n
++// identical lookups per format. The last answer of each lookup is kept, keyed like the
++// per-object cache (the frame, its globally unique format generation, its frame and print
++// areas, whether it is a follow, its upper's areas, the position), and used only while the
++// frame and its upper are valid and the frame has its portion or is empty (then the lookups
++// only read).
++struct CharFrameQuery
++{
++    const SwTextFrame* pFrame = nullptr;
++    sal_uInt64 nGeneration = 0;
++    SwRect aFrameArea, aPrtArea, aUpperFrameArea, aUpperPrtArea;
++    bool bFollow = false;
++    SwNodeOffset nNode;
++    const SwNode* pNode = nullptr;
++    sal_Int32 nContent = -1;
++    bool bResult = false;
++};
++
++bool lcl_IsQueryCacheable(const SwTextFrame& rFrame)
++{
++    const SwFrame* pUpper = rFrame.GetUpper();
++    return pUpper && rFrame.isFrameAreaDefinitionValid() && pUpper->isFrameAreaDefinitionValid()
++           && (rFrame.HasPara() || rFrame.IsEmpty());
++}
++
++bool lcl_IsSameQuery(const CharFrameQuery& rQuery, const SwTextFrame& rFrame, const SwPosition& rPos)
++{
++    const SwFrame* pUpper = rFrame.GetUpper();
++    return rQuery.pFrame == &rFrame && rQuery.nGeneration == rFrame.GetFormatGeneration()
++           && rQuery.aFrameArea == rFrame.getFrameArea() && rQuery.aPrtArea == rFrame.getFramePrintArea()
++           && rQuery.aUpperFrameArea == pUpper->getFrameArea() && rQuery.aUpperPrtArea == pUpper->getFramePrintArea()
++           && rQuery.bFollow == rFrame.IsFollow() && rQuery.nNode == rPos.GetNodeIndex()
++           && rQuery.pNode == &rPos.GetNode()
++           && rQuery.nContent == rPos.GetContentIndex();
++}
++
++void lcl_SetQuery(CharFrameQuery& rQuery, const SwTextFrame& rFrame, const SwPosition& rPos, bool bResult)
++{
++    const SwFrame* pUpper = rFrame.GetUpper();
++    rQuery.pFrame = &rFrame;
++    rQuery.nGeneration = rFrame.GetFormatGeneration();
++    rQuery.aFrameArea = rFrame.getFrameArea();
++    rQuery.aPrtArea = rFrame.getFramePrintArea();
++    rQuery.aUpperFrameArea = pUpper->getFrameArea();
++    rQuery.aUpperPrtArea = pUpper->getFramePrintArea();
++    rQuery.bFollow = rFrame.IsFollow();
++    rQuery.nNode = rPos.GetNodeIndex();
++    rQuery.pNode = &rPos.GetNode();
++    rQuery.nContent = rPos.GetContentIndex();
++    rQuery.bResult = bResult;
++}
++
++CharFrameQuery g_aAutoPosQuery;
++SwRect g_aAutoPosRect;
++CharFrameQuery g_aTopOfLineQuery;
++SwTwips g_nTopOfLine = 0;
++
++bool lcl_GetAutoPos(const SwTextFrame& rFrame, SwRect& rRect, const SwPosition& rPos)
++{
++    if (lcl_IsQueryCacheable(rFrame) && lcl_IsSameQuery(g_aAutoPosQuery, rFrame, rPos))
++    {
++        rRect = g_aAutoPosRect;
++        return g_aAutoPosQuery.bResult;
++    }
++    const bool bResult = rFrame.GetAutoPos(rRect, rPos);
++    if (lcl_IsQueryCacheable(rFrame))
++    {
++        lcl_SetQuery(g_aAutoPosQuery, rFrame, rPos, bResult);
++        g_aAutoPosRect = rRect;
++    }
++    else
++        g_aAutoPosQuery.pFrame = nullptr;
++    return bResult;
++}
++
++bool lcl_GetTopOfLine(const SwTextFrame& rFrame, SwTwips& rTop, const SwPosition& rPos)
++{
++    if (lcl_IsQueryCacheable(rFrame) && lcl_IsSameQuery(g_aTopOfLineQuery, rFrame, rPos))
++    {
++        rTop = g_nTopOfLine;
++        return g_aTopOfLineQuery.bResult;
++    }
++    const bool bResult = rFrame.GetTopOfLine(rTop, rPos);
++    if (lcl_IsQueryCacheable(rFrame))
++    {
++        lcl_SetQuery(g_aTopOfLineQuery, rFrame, rPos, bResult);
++        g_nTopOfLine = rTop;
++    }
++    else
++        g_aTopOfLineQuery.pFrame = nullptr;
++    return bResult;
++}
++}
++
+ // --> #i28701# -
+ // implementation of helper class <SwObjPositioningInProgress>
+ 
+@@ -174,11 +272,13 @@
+ void SwAnchoredObject::AddLastCharY( tools::Long nDiff )
+ {
+     maLastCharRect.Pos().AdjustY(nDiff );
++    mnCharRectCheckGeneration = 0;   // the cached check no longer describes these values
+ }
+ 
+ void SwAnchoredObject::ResetLastCharRectHeight()
+ {
+     maLastCharRect.Height( 0 );
++    mnCharRectCheckGeneration = 0;   // the cached check no longer describes these values
+ }
+ 
+ void SwAnchoredObject::SetVertPosOrientFrame( const SwLayoutFrame& _rVertPosOrientFrame )
+@@ -199,6 +299,7 @@
+ void SwAnchoredObject::AddLastTopOfLineY( SwTwips _nDiff )
+ {
+     mnLastTopOfLine += _nDiff;
++    mnCharRectCheckGeneration = 0;   // the cached check no longer describes these values
+ }
+ 
+ /** check anchor character rectangle and top of line
+@@ -233,8 +334,43 @@
+     const SwTextFrame& aAnchorCharFrame = *(FindAnchorCharFrame());
+     if ( !_bCheckForParaPorInf || aAnchorCharFrame.HasPara() )
+     {
++        // With its paragraph portion and valid, the frame is only read by
++        // GetAutoPos/GetTopOfLine; so it is when it is empty and valid (they read only its
++        // areas then, and GetFormatted does nothing); otherwise they may format it, so
++        // nothing is cached then.
++        const SwFrame* pUpper = aAnchorCharFrame.GetUpper();
++        const bool bCacheable = pUpper && ( aAnchorCharFrame.HasPara()
++            || ( aAnchorCharFrame.IsEmpty() && aAnchorCharFrame.isFrameAreaDefinitionValid() ) );
++        const SwPosition& rPos = *rAnch.GetContentAnchor();
++        if ( bCacheable && mnCharRectCheckGeneration != 0
++             && aAnchorCharFrame.isFrameAreaDefinitionValid()
++             && pUpper->isFrameAreaDefinitionValid()
++             && mnCharRectCheckGeneration == aAnchorCharFrame.GetFormatGeneration()
++             && maCharRectCheckFrameArea == aAnchorCharFrame.getFrameArea()
++             && maCharRectCheckPrtArea == aAnchorCharFrame.getFramePrintArea()
++             && maCharRectCheckUpperFrameArea == pUpper->getFrameArea()
++             && maCharRectCheckUpperPrtArea == pUpper->getFramePrintArea()
++             && mbCharRectCheckFollow == aAnchorCharFrame.IsFollow()
++             && mnCharRectCheckNode == rPos.GetNodeIndex()
++             && mpCharRectCheckNode == &rPos.GetNode()
++             && mnCharRectCheckContent == rPos.GetContentIndex() )
++        {
++            return;   // the same answer as last time: char rect and top of line unchanged
++        }
+         CheckCharRect( rAnch, aAnchorCharFrame );
+         CheckTopOfLine( rAnch, aAnchorCharFrame );
++        if ( bCacheable )
++        {
++            mnCharRectCheckGeneration = aAnchorCharFrame.GetFormatGeneration();
++            maCharRectCheckFrameArea = aAnchorCharFrame.getFrameArea();
++            maCharRectCheckPrtArea = aAnchorCharFrame.getFramePrintArea();
++            maCharRectCheckUpperFrameArea = pUpper->getFrameArea();
++            maCharRectCheckUpperPrtArea = pUpper->getFramePrintArea();
++            mbCharRectCheckFollow = aAnchorCharFrame.IsFollow();
++            mnCharRectCheckNode = rPos.GetNodeIndex();
++            mpCharRectCheckNode = &rPos.GetNode();
++            mnCharRectCheckContent = rPos.GetContentIndex();
++        }
+     }
+ }
+ 
+@@ -253,7 +389,7 @@
+ {
+     // determine rectangle of anchor character. If not exist, abort operation
+     SwRect aCharRect;
+-    if ( !_rAnchorCharFrame.GetAutoPos( aCharRect, *_rAnch.GetContentAnchor() ) )
++    if ( !lcl_GetAutoPos( _rAnchorCharFrame, aCharRect, *_rAnch.GetContentAnchor() ) )
+     {
+         return;
+     }
+@@ -313,7 +449,7 @@
+                                         const SwTextFrame& _rAnchorCharFrame )
+ {
+     SwTwips nTopOfLine = 0;
+-    if ( !_rAnchorCharFrame.GetTopOfLine( nTopOfLine, *_rAnch.GetContentAnchor() ) )
++    if ( !lcl_GetTopOfLine( _rAnchorCharFrame, nTopOfLine, *_rAnch.GetContentAnchor() ) )
+         return;
+ 
+     if ( nTopOfLine == mnLastTopOfLine )
+@@ -339,6 +475,7 @@
+ {
+     maLastCharRect.Clear();
+     mnLastTopOfLine = 0;
++    mnCharRectCheckGeneration = 0;   // the cached check no longer describes these values
+ }
+ 
+ void SwAnchoredObject::SetCurrRelPos( Point _aRelPos )
+diff --git a/sw/source/core/text/frmform.cxx b/sw/source/core/text/frmform.cxx
+--- a/sw/source/core/text/frmform.cxx
++++ b/sw/source/core/text/frmform.cxx
+@@ -700,6 +700,7 @@
+ 
+ SwContentFrame *SwTextFrame::JoinFrame()
+ {
++    BumpFormatGeneration();
+     OSL_ENSURE( GetFollow(), "+SwTextFrame::JoinFrame: no follow" );
+     SwTextFrame  *pFoll = GetFollow();
+ 
+@@ -773,6 +774,7 @@
+ 
+ void SwTextFrame::SplitFrame(TextFrameIndex const nTextPos)
+ {
++    BumpFormatGeneration();
+     SwSwapIfSwapped swap( this );
+ 
+     // The Paste sends a Modify() to me
+@@ -853,6 +855,7 @@
+     // We do not need to invalidate our Follow.
+     // We are a Follow, get formatted right away and call
+     // SetOffset() from there
++    BumpFormatGeneration();
+     mnOffset = nNewOfst;
+     SwParaPortion *pPara = GetPara();
+     if( pPara )
+@@ -1588,6 +1591,7 @@
+ void SwTextFrame::Format_( SwTextFormatter &rLine, SwTextFormatInfo &rInf,
+                         const bool bAdjust )
+ {
++    BumpFormatGeneration();
+     OSL_ENSURE( ! IsVertical() || IsSwapped(),"SwTextFrame::Format_ with unswapped frame" );
+ 
+     SwParaPortion *pPara = rLine.GetInfo().GetParaPortion();
+@@ -1926,6 +1930,7 @@
+ 
+ void SwTextFrame::FormatOnceMore( SwTextFormatter &rLine, SwTextFormatInfo &rInf )
+ {
++    BumpFormatGeneration();
+     OSL_ENSURE( ! IsVertical() || IsSwapped(),
+             "A frame is not swapped in SwTextFrame::FormatOnceMore" );
+ 
+@@ -2104,6 +2109,9 @@
+ // Shrink() or Grow() to adjust the frame's size to the changed required space.
+ void SwTextFrame::Format( vcl::RenderContext* pRenderContext, const SwBorderAttrs * )
+ {
++    // The format generation moves on each path below that changes the frame, not here: a
++    // Format() that finds the frame formatted changes nothing CheckCharRectAndTopOfLine reads
++    // (CalcAdditionalFirstLineOffset swaps the portion with SetPara, which moves it).
+     // tdf#92091: SwTextFrame::Format is re-entrant, but may change VCL global state.
+     // The previous state is saved here and restored after returning.
+     SwTextFrameFormatScopeGuard stSg{ pRenderContext, this };
+@@ -2116,6 +2124,7 @@
+     // a width <= 0 from time to time
+     if( aRectFnSet.GetWidth(getFramePrintArea()) <= 0 )
+     {
++        BumpFormatGeneration();
+         // If MustFit is set, we shrink to the Upper's bottom edge if needed.
+         SwTextLineAccess aAccess( this );
+ 
+@@ -2167,6 +2176,7 @@
+         // Attention: Format() could be triggered by GetFormatted()
+         if( IsHiddenNow() )
+         {
++            BumpFormatGeneration();
+             tools::Long nPrtHeight = aRectFnSet.GetHeight(getFramePrintArea());
+             if( nPrtHeight )
+             {
+@@ -2191,6 +2201,7 @@
+         // finds the master formatted in case it's needed
+         if (IsFollow() && IsFieldFollow())
+         {
++            BumpFormatGeneration();
+             SwTextFrame *pMaster = FindMaster();
+             assert(pMaster);
+             if (!pMaster->HasPara())
+@@ -2223,6 +2234,7 @@
+         {
+             if (GetTextNodeForParaProps()->GetSwAttrSet().GetRegister().GetValue())
+             {
++                BumpFormatGeneration();
+                 aAccess.GetPara()->SetPrepAdjust();
+                 aAccess.GetPara()->SetPrep();
+                 CalcPreps();
+@@ -2231,6 +2243,7 @@
+         }
+         else if( bSetOffset && IsFollow() )
+         {
++            BumpFormatGeneration();
+             SwTextFrame *pMaster = FindMaster();
+             OSL_ENSURE( pMaster, "SwTextFrame::Format: homeless follow" );
+             if( pMaster )
+@@ -2249,6 +2262,7 @@
+         }
+         else
+         {
++            BumpFormatGeneration();
+             // bSetOffset here means that we have the "red arrow situation"
+             if ( bSetOffset )
+                 SetOffset_(TextFrameIndex(0));
+@@ -2370,6 +2384,7 @@
+ 
+             if (IsEmptyMasterWithSplitFly())
+             {
++                BumpFormatGeneration();
+                 // A fly is anchored to us, reduce size, so we definitely still fit the current
+                 // page.
+                 SwFrameAreaDefinition::FrameAreaWriteAccess aFrm(*this);
+@@ -2431,6 +2446,8 @@
+         ( ( IsVertical() ? getFramePrintArea().Width() : getFramePrintArea().Height() ) && IsHiddenNow() ) )
+         return false;
+ 
++    // From here the lines are rebuilt (FormatEmpty above moves the generation itself).
++    BumpFormatGeneration();
+     SwTextLineAccess aAccess( this );
+     SwParaPortion *pPara = aAccess.GetPara();
+     if( !pPara )
+diff --git a/sw/source/core/text/porrst.cxx b/sw/source/core/text/porrst.cxx
+--- a/sw/source/core/text/porrst.cxx
++++ b/sw/source/core/text/porrst.cxx
+@@ -513,6 +513,11 @@
+         }
+     }
+ 
++    // For an empty frame GetAutoPos/GetTopOfLine read its areas, never its portion, so only a
++    // height change or dropped rotated portions move the generation here (SetEmpty below
++    // moves it when the frame becomes empty).
++    if ( nChg || GetHasRotatedPortions() )
++        BumpFormatGeneration();
+     if( !nChg )
+         SetUndersized( false );
+     AdjustFrame( nChg );
+diff --git a/sw/source/core/text/txtcache.cxx b/sw/source/core/text/txtcache.cxx
+--- a/sw/source/core/text/txtcache.cxx
++++ b/sw/source/core/text/txtcache.cxx
+@@ -58,7 +58,13 @@
+         const_cast<SwTextFrame *>(static_cast<SwTextFrame const *>(m_pOwner))->SetCacheIdx( pRet->GetCachePos() );
+     }
+     if ( !pRet->GetPara() )
++    {
+         pRet->SetPara( new SwParaPortion, true/*bDelete*/ );
++        // An empty frame's portion is not read until SetEmpty(false) moves the generation.
++        SwTextFrame* pOwner = const_cast<SwTextFrame *>(static_cast<SwTextFrame const *>(m_pOwner));
++        if ( !pOwner->IsEmpty() )
++            pOwner->BumpFormatGeneration();
++    }
+     return pRet->GetPara();
+ }
+ 
+@@ -103,6 +109,7 @@
+ 
+ void SwTextFrame::ClearPara()
+ {
++    BumpFormatGeneration();
+     OSL_ENSURE( !IsLocked(), "+SwTextFrame::ClearPara: this is locked." );
+     if ( !IsLocked() && GetCacheIdx() != USHRT_MAX )
+     {
+@@ -128,6 +135,7 @@
+ 
+ void SwTextFrame::SetPara( SwParaPortion *pNew, bool bDelete )
+ {
++    BumpFormatGeneration();
+     if ( GetCacheIdx() != USHRT_MAX )
+     {
+         // Only change the information, the CacheObj stays there
+diff --git a/sw/source/core/text/txtfrm.cxx b/sw/source/core/text/txtfrm.cxx
+--- a/sw/source/core/text/txtfrm.cxx
++++ b/sw/source/core/text/txtfrm.cxx
+@@ -761,9 +761,21 @@
+     }
+ }
+ 
++namespace
++{
++// One counter for every frame's format generation (see SwTextFrame::mnFormatGeneration).
++sal_uInt64 s_nFormatGenerationCounter = 0;
++}
++
++void SwTextFrame::BumpFormatGeneration()
++{
++    mnFormatGeneration = ++s_nFormatGenerationCounter;
++}
++
+ SwTextFrame::SwTextFrame(SwTextNode * const pNode, SwFrame* pSib,
+         sw::FrameMode const eMode)
+     : SwContentFrame( pNode, pSib )
++    , mnFormatGeneration( 0 )
+     , mnAllLines( 0 )
+     , mnThisLines( 0 )
+     , mnFlyAnchorOfst( 0 )
+@@ -789,6 +801,7 @@
+     , mbIsSwapped( false )
+     , mbFollowFormatAllowed( true )
+ {
++    BumpFormatGeneration();
+     mnFrameType = SwFrameType::Txt;
+     // note: this may call SwClientNotify if it's in a list so do it last
+     // note: this may change this->pRegisteredIn to m_pMergedPara->listeners
+@@ -1400,6 +1413,7 @@
+ 
+ void SwTextFrame::SetMergedPara(std::unique_ptr<sw::MergedPara> p)
+ {
++    BumpFormatGeneration();
+     SwTextNode *const pFirst(m_pMergedPara ? m_pMergedPara->pFirstNode : nullptr);
+     m_pMergedPara = std::move(p);
+     if (pFirst)
+@@ -1733,6 +1747,7 @@
+                             aRectFnSet.SetWidth( aLastCharRect, 1 );
+                             _pAnchoredObj->maLastCharRect = aLastCharRect;
+                             _pAnchoredObj->mnLastTopOfLine = aRectFnSet.GetTop(aLastCharRect);
++                            _pAnchoredObj->mnCharRectCheckGeneration = 0;   // cached check is stale
+                         }
+                     }
+                 }
+@@ -2199,6 +2214,7 @@
+ // SwContentFrame::SwClientNotify() when appropriate.
+ void SwTextFrame::SwClientNotify(SwModify const& rModify, SfxHint const& rHint)
+ {
++    BumpFormatGeneration();
+     SfxPoolItem const* pOld(nullptr);
+     SfxPoolItem const* pNew(nullptr);
+     sw::MoveText const* pMoveText(nullptr);
+@@ -2978,6 +2994,11 @@
+ bool SwTextFrame::Prepare( const PrepareHint ePrep, const void* pVoid,
+                         bool bNotify )
+ {
++    // MustFit and WidowsOrphans only set preparation flags (or invalidate the size of a frame
++    // without a portion); CalcPreps applies them, and what that changes moves the generation
++    // where it happens. Every other hint may change more.
++    if ( ePrep != PrepareHint::MustFit && ePrep != PrepareHint::WidowsOrphans )
++        BumpFormatGeneration();
+     bool bParaPossiblyInvalid = false;
+ 
+     SwFrameSwapper aSwapper( this, false );
+diff --git a/sw/source/core/text/itrtxt.cxx b/sw/source/core/text/itrtxt.cxx
+--- a/sw/source/core/text/itrtxt.cxx
++++ b/sw/source/core/text/itrtxt.cxx
+@@ -370,6 +370,7 @@
+ 
+     if( pDel )
+     {
++        GetTextFrame()->BumpFormatGeneration();
+         m_pCurr->SetNext( nullptr );
+         if (MaybeHasHints() && bNoteFollow)
+         {
+diff --git a/sw/source/core/text/txtftn.cxx b/sw/source/core/text/txtftn.cxx
+--- a/sw/source/core/text/txtftn.cxx
++++ b/sw/source/core/text/txtftn.cxx
+@@ -1279,6 +1279,7 @@
+     SwTwips nRstHeight = GetFrameRstHeight();
+     if( m_pCurr && nRstHeight > m_pCurr->Height() )
+     {
++        GetTextFrame()->BumpFormatGeneration();
+         SwLineLayout *pLay = new SwLineLayout;
+         nRstHeight = nRstHeight - m_pCurr->Height();
+         pLay->Height( nRstHeight );
