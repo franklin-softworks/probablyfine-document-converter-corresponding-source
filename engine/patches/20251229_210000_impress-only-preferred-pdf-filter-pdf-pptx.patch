@@ -1,0 +1,22 @@
+diff --git a/sdext/source/pdfimport/config/pdf_import_filter.xcu b/sdext/source/pdfimport/config/pdf_import_filter.xcu
+index 3909f9fc1855..38cc755fbba6 100644
+--- a/sdext/source/pdfimport/config/pdf_import_filter.xcu
++++ b/sdext/source/pdfimport/config/pdf_import_filter.xcu
+@@ -31,7 +31,7 @@
+     <value>com.sun.star.comp.Writer.XmlFilterAdaptor</value>
+    </prop>
+    <prop oor:name="Flags" oor:type="oor:string-list">
+-    <value>3RDPARTYFILTER ALIEN IMPORT PREFERRED SUPPORTSSIGNING</value>
++    <value>3RDPARTYFILTER ALIEN IMPORT SUPPORTSSIGNING</value>
+    </prop>
+    <prop oor:name="Type" oor:type="xs:string">
+     <value>pdf_Portable_Document_Format</value>
+@@ -89,7 +89,7 @@
+     <value>com.sun.star.comp.Writer.XmlFilterAdaptor</value>
+    </prop>
+    <prop oor:name="Flags" oor:type="oor:string-list">
+-    <value>3RDPARTYFILTER ALIEN IMPORT PREFERRED</value>
++    <value>3RDPARTYFILTER ALIEN IMPORT</value>
+    </prop>
+    <prop oor:name="Type" oor:type="xs:string">
+     <value>pdf_Portable_Document_Format</value>
