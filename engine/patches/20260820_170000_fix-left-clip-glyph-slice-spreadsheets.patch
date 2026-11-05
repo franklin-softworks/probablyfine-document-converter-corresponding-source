@@ -1,0 +1,60 @@
+--- a/sc/source/ui/view/output2.cxx
++++ b/sc/source/ui/view/output2.cxx
+@@ -2069,6 +2069,57 @@ void ScOutputData::LayoutStrings(bool bPixelToLogic)
+                                 aAreaParam.maClipRect.SetBottom( nScrY+nScrH );
+                             }
+ 
++#ifdef __EMSCRIPTEN__
++                            // Item 11 / FG-124: start a LEFT page-clipped string on a
++                            // glyph boundary, at the page's left clip.
++                            //
++                            // A long string in the last data column overflows into
++                            // empty columns; ExtendPrintArea gives those their own
++                            // pages, and the tail is drawn from an anchor off-page to
++                            // the left. The clip then fell mid-glyph, slicing one
++                            // leading character per row (an 'O' rendering as ')').
++                            //
++                            // Trimming the STRING was tried first and is wrong: the
++                            // drawn text IS the PDF text layer, so shortening it made
++                            // the complete cell value unextractable (measured: p9 lost
++                            // 'pWy KKo5G...' from its text layer, and extractable
++                            // source values across the file went 331 -> 0). That trades
++                            // a cosmetic defect for a real one.
++                            //
++                            // So the full string is still drawn (and fully extractable),
++                            // and it is shifted left so the clip falls between glyphs.
++                            // (#158 moved the CLIP to the boundary instead, which left
++                            // every continuation row starting at a different x; FG-124.)
++                            if ( bHClip && aAreaParam.mbLeftClip && !bCellIsValue
++                                 && eOutHorJust == SvxCellHorJustify::Left
++                                 && aVars.GetOrient() == SvxCellOrientation::Standard )
++                            {
++                                const OUString& aClipStr = aVars.GetString();
++                                const tools::Long nClipL = aAreaParam.maClipRect.Left();
++                                if ( !aClipStr.isEmpty() && nJustPosX < nClipL )
++                                {
++                                    sal_Int32 nCh = 0;
++                                    const sal_Int32 nChLen = aClipStr.getLength();
++                                    while ( nCh < nChLen &&
++                                            nJustPosX + aVars.GetFmtTextWidth(aClipStr.copy(0, nCh + 1)) < nClipL )
++                                        ++nCh;
++                                    if ( nCh < nChLen )
++                                    {
++                                        const tools::Long nBoundary = nJustPosX +
++                                            static_cast<tools::Long>(aVars.GetFmtTextWidth(aClipStr.copy(0, nCh + 1)));
++                                        // FG-124: rather than move the clip to the boundary
++                                        // (which left every row starting at a different x),
++                                        // shift the string left so its first whole glyph
++                                        // starts AT the page's left clip, as Excel prints a
++                                        // continuation band. The glyph that straddles the
++                                        // band edge stays hidden here either way; only the
++                                        // alignment changes.
++                                        if ( nBoundary > nClipL && nBoundary < aAreaParam.maClipRect.Right() )
++                                            nJustPosX -= ( nBoundary - nClipL );
++                                    }
++                                }
++                            }
++#endif
+                             //  aClipRect is not used after SetClipRegion/IntersectClipRegion,
+                             //  so it can be modified here
+                             if (bPixelToLogic)
