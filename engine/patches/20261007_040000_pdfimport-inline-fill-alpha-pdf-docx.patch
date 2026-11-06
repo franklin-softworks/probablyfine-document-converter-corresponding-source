@@ -1,0 +1,141 @@
+diff --git a/sdext/source/pdfimport/tree/writertreevisiting.cxx b/sdext/source/pdfimport/tree/writertreevisiting.cxx
+index 58b4a59..f4c7a04 100644
+--- a/sdext/source/pdfimport/tree/writertreevisiting.cxx
++++ b/sdext/source/pdfimport/tree/writertreevisiting.cxx
+@@ -1122,4 +1122,7 @@ void WriterXmlFinalizer::visit( PolyPolyElement& elem, const std::list< std::uni
+ 
+         aGCProps[ u"svg:stroke-color"_ustr ] = getColorString(rGC.LineColor);
++        // FG-176: as for the fill below; the Draw visitor already emits it.
++        if (rGC.LineColor.Alpha != 1.0)
++            aGCProps[ u"svg:stroke-opacity"_ustr ] = getPercentString(rGC.LineColor.Alpha * 100.0);
+         aGCProps[ u"svg:stroke-width"_ustr ] = convertPixelToUnitString(rGC.LineWidth * scale);
+         aGCProps[ u"draw:stroke-linejoin"_ustr ] = rGC.GetLineJoinString();
+@@ -1165,4 +1168,10 @@ void WriterXmlFinalizer::visit( PolyPolyElement& elem, const std::list< std::uni
+         }
+         aGCProps[ u"draw:fill-color"_ustr ] = getColorString( rGC.FillColor );
++        // FG-176: constant fill alpha (PDF /ca, times any enclosing group's
++        // alpha, see PDFOutDev::beginTransparencyGroup) was dropped here -- the
++        // Draw visitor emits it, this copy never did -- so every semi-transparent
++        // fill came in opaque.
++        if (rGC.FillColor.Alpha != 1.0)
++            aGCProps[ u"draw:opacity"_ustr ] = getPercentString(rGC.FillColor.Alpha * 100.0);
+     }
+     else
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+index b297b43..86c6a2e 100644
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+@@ -685,4 +685,7 @@ void PDFOutDev::startPage(int /*pageNum*/, GfxState* state
+     m_aGroupIsSoftMask.clear();
+     m_nSoftMaskDepth = 0;
++    m_aSavedFillOpacity.clear();
++    m_aGroupAlphaStack.clear();
++    m_fGroupAlpha = 1.0;
+     // FG-175: spans are per page; the store set for this page is trusted
+     // until a span has no recorded layer.
+@@ -740,7 +743,8 @@ void PDFOutDev::processLink(Link* link, Catalog*)
+ }
+ 
+-void PDFOutDev::saveState(GfxState*)
++void PDFOutDev::saveState(GfxState* state)
+ {
+     m_aTightClipStack.push_back(m_aTightClip);
++    m_aSavedFillOpacity.push_back(state ? state->getFillOpacity() : 1.0); // FG-176
+     if (spanTrackerActive())
+         m_aSpans.saveState();
+@@ -755,4 +759,6 @@ void PDFOutDev::restoreState(GfxState* state)
+         m_aTightClipStack.pop_back();
+     }
++    if (!m_aSavedFillOpacity.empty())
++        m_aSavedFillOpacity.pop_back(); // FG-176
+     printf( "restoreState\n" );
+     // After the record: a span resumed by Q emits its layer under the
+@@ -877,5 +883,6 @@ void PDFOutDev::emitSoftMaskLayer( GfxState* state, int nOrdinal )
+     // carries it. The LibreOffice side would apply the current fill alpha to
+     // the bitmap-filled polygon as well (draw:opacity): emit the layer at
+-    // alpha 1 and restore the colour record afterwards.
++    // the alpha of the groups enclosing the span (FG-176; 1 outside any
++    // group) and restore the colour record afterwards.
+     const bool bAlpha = state && state->getFillOpacity() != 1.0;
+     GfxRGB aRGB = { 0, 0, 0 };
+@@ -885,5 +892,5 @@ void PDFOutDev::emitSoftMaskLayer( GfxState* state, int nOrdinal )
+         printf( "updateFillColor %f %f %f %f\n",
+                 normalize(colToDbl(aRGB.r)), normalize(colToDbl(aRGB.g)),
+-                normalize(colToDbl(aRGB.b)), 1.0 );
++                normalize(colToDbl(aRGB.b)), normalize(m_fGroupAlpha) );
+     }
+ 
+@@ -898,5 +905,5 @@ void PDFOutDev::emitSoftMaskLayer( GfxState* state, int nOrdinal )
+         printf( "updateFillColor %f %f %f %f\n",
+                 normalize(colToDbl(aRGB.r)), normalize(colToDbl(aRGB.g)),
+-                normalize(colToDbl(aRGB.b)), normalize(state->getFillOpacity()) );
++                normalize(colToDbl(aRGB.b)), normalize(state->getFillOpacity() * m_fGroupAlpha) );
+     ++m_nLayersEmitted;
+     beat();
+@@ -1035,5 +1042,5 @@ void PDFOutDev::updateFillColor(GfxState *state)
+             normalize(colToDbl(aRGB.g)),
+             normalize(colToDbl(aRGB.b)),
+-            normalize(state->getFillOpacity()) );
++            normalize(state->getFillOpacity() * m_fGroupAlpha) ); // FG-176
+ }
+ 
+@@ -1051,5 +1058,5 @@ void PDFOutDev::updateStrokeColor(GfxState *state)
+             normalize(colToDbl(aRGB.g)),
+             normalize(colToDbl(aRGB.b)),
+-            normalize(state->getStrokeOpacity()) );
++            normalize(state->getStrokeOpacity() * m_fGroupAlpha) ); // FG-176
+ }
+ 
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
+index 805c25a..f6025cf 100644
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
+@@ -157,4 +157,20 @@ namespace pdfi
+         std::vector<bool>                       m_aGroupIsSoftMask;
+         int                                     m_nSoftMaskDepth = 0;
++        // FG-176: a transparency group's constant alpha (the /ca in force at
++        // its "Do") is applied by poppler when the group is PAINTED, after its
++        // content; Gfx::drawForm resets the opacity to 1 for the content. This
++        // device has no groups, so the alpha would be lost and Illustrator
++        // blend shadows (stacks of groups at /ca 0.03, 0.06, ...) come in
++        // opaque. Instead multiply it into every fill/stroke alpha emitted
++        // inside the group. m_aSavedFillOpacity mirrors saveState/restoreState;
++        // Gfx::drawForm calls saveState immediately before the reset, so its
++        // top holds the group's alpha when beginTransparencyGroup arrives.
++        // Exact for a group of non-overlapping content; overlapping content
++        // inside one group is composited per element (slightly darker).
++        // Not covered: images and text, which carry no alpha on this path at
++        // all (neither /ca nor a group's).
++        std::vector<double>                     m_aSavedFillOpacity;
++        std::vector<double>                     m_aGroupAlphaStack;
++        double                                  m_fGroupAlpha = 1.0; ///< product of the open groups' alphas
+ 
+         // FG-175: soft masks APPLIED. The span tracker is driven by the same
+@@ -398,4 +414,15 @@ namespace pdfi
+             if (forSoftMask)
+                 ++m_nSoftMaskDepth;
++            // FG-176: a soft-mask group is a mask definition, not painted
++            // content, so it carries no group alpha.
++            const double fAlpha = (forSoftMask || m_aSavedFillOpacity.empty())
++                ? 1.0 : m_aSavedFillOpacity.back();
++            m_aGroupAlphaStack.push_back(m_fGroupAlpha);
++            m_fGroupAlpha *= fAlpha;
++            if (fAlpha != 1.0)
++            {
++                updateFillColor(state);
++                updateStrokeColor(state);
++            }
+             if (spanTrackerActive())
+                 applySpanTransition(state, m_aSpans.beginGroup(forSoftMask));
+@@ -405,4 +432,11 @@ namespace pdfi
+             if (spanTrackerActive())
+                 applySpanTransition(state, m_aSpans.endGroup());
++            // FG-176: no colour record needed; Gfx::drawForm restores the
++            // saved state (restoreState) straight after this call.
++            if (!m_aGroupAlphaStack.empty())
++            {
++                m_fGroupAlpha = m_aGroupAlphaStack.back();
++                m_aGroupAlphaStack.pop_back();
++            }
+             if (m_aGroupIsSoftMask.empty())
+                 return;
