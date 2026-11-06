@@ -1,0 +1,41 @@
+BUG-48: a Writer document with a comment trapped the headless engine ("memory access out of bounds").
+
+Since Writer got a real SwView (FG-096, #419, 2026-10-04) every view makes a SwPostItMgr. It collects the
+document's comments (SwPostItMgr::InsertItem) and, once the event loop turns, lays them out from a posted user
+event, which creates one SwAnnotationWin per comment: a widget built from annotation.ui, a UI file the slimmed
+VFS does not contain. The headless engine has no sidebar to show them in. Every DOCX, ODT, DOC or RTF that carried
+a comment failed to convert while the same text without a comment converted.
+
+InsertItem now declines to register the comment in the sidebar list, so nothing is laid out. The comment itself
+stays in the document model, which is what the exports read, so editable outputs keep their comments.
+CONSEQUENCE, repeated in the code: everything that reads the sidebar list is empty too, in particular PDF export of
+comments in the margin (ExportNotesInMargin prints through this manager). The build offers no such option.
+
+Module-scoped (-documents): pdf-docx also links Writer and gives it a view, but PDF import creates no comment, so
+its manager has none to lay out.
+
+diff --git a/sw/source/uibase/docvw/PostItMgr.cxx b/sw/source/uibase/docvw/PostItMgr.cxx
+--- a/sw/source/uibase/docvw/PostItMgr.cxx
++++ b/sw/source/uibase/docvw/PostItMgr.cxx
+@@ -504,6 +504,21 @@
+ 
+ SwAnnotationItem* SwPostItMgr::InsertItem(SfxBroadcaster* pItem, bool bCheckExistence, bool bFocus)
+ {
++#ifdef __EMSCRIPTEN__
++    // BUG-48: the headless WASM engine has no sidebar to put comments in. Since Writer got a real
++    // view (FG-096, #419) every SwView makes a SwPostItMgr, which collects the document's comments
++    // and lays them out from a user event posted once the event loop turns; that creates one
++    // SwAnnotationWin per comment (a UI-file widget, annotation.ui, which the slimmed VFS does not
++    // have) and traps with "memory access out of bounds". Any document with a comment failed to
++    // convert. The comments themselves stay in the document model (the exports read them from
++    // there); only the sidebar list stays empty, so nothing is ever laid out.
++    // CONSEQUENCE, so a future option does not silently produce nothing: everything that reads this
++    // list is empty too, in particular PDF export of comments IN THE MARGIN (ExportNotesInMargin,
++    // which prints through the manager). This build offers no such option; if it ever does, this
++    // guard has to give way to a real implementation. Code that assumes a non-empty list
++    // (GetLatestPostItField, used from inside an annotation window) cannot be reached without one.
++    return nullptr;
++#endif
+     if (bCheckExistence)
+     {
+         for (auto const& postItField : mvPostItFields)
