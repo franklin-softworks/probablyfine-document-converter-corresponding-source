@@ -1,0 +1,139 @@
+The converter's embedded-font rights rule (owner decisions D4, 2026-10-18, the no-rights
+rule, 2026-10-19, and Preview & Print for every output, 2026-10-22;
+docs/fonts/embedded-font-rights.md).
+
+EmbeddedFontsHelper::addEmbeddedFont applies one rule for every output: the font must be
+Installable or Editable (sufficientTTFRights(EditingAllowed): fsType == 0 || fsType & 8),
+and a Word subset (w:subsetted) must hold at least 26 non-empty glyphs. Under
+__EMSCRIPTEN__ it now applies (OpenType OS/2 spec, fsType):
+  - combined usage bits: the least restrictive wins ("Version differences"), for every
+    OS/2 version, so 0x000A/0x000E are Editable and 0x0006 is Preview & Print; only
+    Restricted alone (0x0002) is never used;
+  - every output: Installable, Editable or Preview & Print (owner, 2026-10-22: "Fonts
+    marked 'preview and print' can be used for conversion");
+  - PDF-only outputs: Word's small subsets are also used (at least 1 drawable glyph
+    instead of 26; a character a subset lacks falls back per glyph);
+  - 0x0100 (no subsetting) refuses PDF output only (PDF export always subsets; an
+    editable re-embedding copies the whole font); 0x0200 (bitmap embedding only)
+    refuses every output;
+  - a font with NO rights information (no OS/2 table, or one under 42 bytes) reads as
+    fsType 0 (GetTTGlobalFontInfo) and is used like Installable, as upstream does.
+Differs from upstream's editing rule (fsType == 0 || fsType & 8) for Preview & Print (now
+used), 0x0100 alone (now used for editable outputs) and 0x0208 (now refused).
+
+The browser worker writes /tmp/pf-embedded-fonts-pdf-only before loading a document it
+converts to PDF and removes it otherwise (web/js/conversion_worker.js), the same signal
+pattern as /tmp/pf-default-paper; it is read once per font. A worker that has converted to
+PDF never makes an editable output (driver + worker refusal PDF_ONLY_FONTS_LOADED), since
+the engine keeps activated fonts for its lifetime. EOT (PPTX) is not affected: this build
+decodes no EOT (FG-054 option A).
+
+Our own implementation, not a backport: upstream's tdf#145967 work (master fdd24dab and
+follow-ups) is built on 26.x's EmbeddedFontsManager rewrite and a user-facing dialog,
+neither of which exists on the 25.8 pin. WASM only (#ifdef __EMSCRIPTEN__); all modules.
+Gate pdf_only_font_rights.
+
+diff --git a/vcl/source/gdi/embeddedfontshelper.cxx b/vcl/source/gdi/embeddedfontshelper.cxx
+index e30244ce0a33..622f05e304f9 100644
+--- a/vcl/source/gdi/embeddedfontshelper.cxx
++++ b/vcl/source/gdi/embeddedfontshelper.cxx
+@@ -10,6 +10,7 @@
+ #include <sal/config.h>
+ 
+ #include <memory>
++#include <cstdio>
+ #include <frozen/bits/defines.h>
+ #include <frozen/bits/elsa_std.h>
+ #include <frozen/unordered_set.h>
+@@ -68,10 +69,61 @@ void EmbeddedFontsHelper::clearTemporaryFontFiles()
+     clearDir( path + "fromsystem/" );
+ }
+ 
++#ifdef __EMSCRIPTEN__
++namespace
++{
++// D4 (owner decision 2026-10-18): the browser worker writes this file for a conversion
++// whose ONLY output is PDF and removes it otherwise (web/js/conversion_worker.js).
++bool lcl_pdfOnlyConversion()
++{
++    FILE* pFile = std::fopen("/tmp/pf-embedded-fonts-pdf-only", "rb");
++    if (!pFile)
++        return false;
++    std::fclose(pFile);
++    return true;
++}
++
++// The converter's embedded-font rights rule (docs/fonts/embedded-font-rights.md; owner
++// decisions D4, 2026-10-19, 2026-10-22). OS/2 fsType (OpenType spec, OS/2, "fsType"):
++//  - usage bits 0-3: when several are set the LEAST restrictive wins ("Version
++//    differences": "the least-restrictive permission indicated take[s] precedence"),
++//    applied to every OS/2 version; only Restricted on its own is not used;
++//  - every output: Installable, Editable or Preview & Print (owner, 2026-10-22);
++//  - 0x0100 (no subsetting) refuses only PDF output, which always subsets;
++//  - 0x0200 (bitmap embedding only) refuses every output (both embed outlines).
++// A font with NO rights information (no OS/2 table, or one too short for fsType) reads
++// as 0 (GetTTGlobalFontInfo) and is used like Installable: the user supplied the file.
++bool lcl_sufficientRights(const void* pData, tools::Long nSize, bool bPdfOnly)
++{
++    TrueTypeFont* pFont;
++    if (OpenTTFontBuffer(pData, nSize, 0, &pFont) != SFErrCodes::Ok)
++        return true; // no known restriction, as sufficientTTFRights()
++    TTGlobalFontInfo aInfo;
++    GetTTGlobalFontInfo(pFont, &aInfo);
++    CloseTTFont(pFont);
++    const sal_uInt32 nFsType = aInfo.typeFlags;
++    if (nFsType & 0x0200)
++        return false; // bitmap embedding only
++    if (bPdfOnly && (nFsType & 0x0100))
++        return false; // no subsetting
++    if (nFsType & 0x0008)
++        return true; // Editable (wins over 0x0002 and 0x0004)
++    if (nFsType & 0x0004)
++        return true; // Preview & Print: every output (owner, 2026-10-22; wins over 0x0002)
++    if (nFsType & 0x0002)
++        return false; // Restricted alone
++    return true; // Installable, or no rights information
++}
++}
++#endif
++
+ bool EmbeddedFontsHelper::addEmbeddedFont( const uno::Reference< io::XInputStream >& stream, const OUString& fontName,
+     std::u16string_view extra, std::vector< unsigned char > const & key, bool eot,
+     bool bSubsetted )
+ {
++#ifdef __EMSCRIPTEN__
++    const bool bPdfOnly = lcl_pdfOnlyConversion();
++#endif
+     OUString fileUrl = EmbeddedFontsHelper::fileUrlForTemporaryFont( fontName, extra );
+     osl::File file( fileUrl );
+     switch( file.open( osl_File_OpenFlag_Create | osl_File_OpenFlag_Write ))
+@@ -152,7 +204,11 @@ bool EmbeddedFontsHelper::addEmbeddedFont( const uno::Reference< io::XInputStrea
+     }
+     if( !eot )
+     {
++#ifdef __EMSCRIPTEN__
++        sufficientFontRights = lcl_sufficientRights(fontData.data(), fontData.size(), bPdfOnly);
++#else
+         sufficientFontRights = sufficientTTFRights(fontData.data(), fontData.size(), FontRights::EditingAllowed);
++#endif
+     }
+     if( !sufficientFontRights )
+     {
+@@ -186,7 +242,16 @@ bool EmbeddedFontsHelper::addEmbeddedFont( const uno::Reference< io::XInputStrea
+         }
+         // Check if it has reasonable amount of glyphs, set the limit to the number of glyphs in the
+         // English alphabet (not differentiating lowercase and uppercase).
+-        if (nGlyphs < 26)
++#ifdef __EMSCRIPTEN__
++        // D4: the limit exists so a font is kept only when the document can be EDITED with
++        // it. A PDF is not edited: Word's small subset draws exactly the text it was made
++        // for, and a character it lacks falls back per glyph. It must still open and draw
++        // something (an unparseable font counts 0).
++        const sal_uInt32 nMinGlyphs = bPdfOnly ? 1 : 26;
++#else
++        const sal_uInt32 nMinGlyphs = 26;
++#endif
++        if (nGlyphs < nMinGlyphs)
+         {
+             SAL_INFO("vcl.fonts", "Ignoring embedded font that only provides " << nGlyphs << " non-empty glyphs");
+             osl::File::remove(fileUrl);
