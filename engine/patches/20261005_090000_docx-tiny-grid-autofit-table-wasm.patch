@@ -1,0 +1,39 @@
+diff --git a/sw/source/writerfilter/dmapper/DomainMapperTableManager.cxx b/sw/source/writerfilter/dmapper/DomainMapperTableManager.cxx
+index 312d2abf10b3..6356a30bfc72 100644
+--- a/sw/source/writerfilter/dmapper/DomainMapperTableManager.cxx
++++ b/sw/source/writerfilter/dmapper/DomainMapperTableManager.cxx
+@@ -17,6 +17,7 @@
+  *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
+  */
+ #include <optional>
++#include <algorithm>
+ #include "DomainMapperTableManager.hxx"
+ #include "ConversionHelper.hxx"
+ #include "MeasureHandler.hxx"
+@@ -693,6 +694,26 @@ void DomainMapperTableManager::endOfRowAction()
+                     pTablePropMap->setValue(TablePropertyMap::TABLE_WIDTH, sal_Int32(100));
+                     pTablePropMap->setValue(TablePropertyMap::TABLE_WIDTH_TYPE, text::SizeType::VARIABLE);
+                 }
++#ifdef __EMSCRIPTEN__
++                // FG-095: an autofit table (tblW auto or absent) whose grid is
++                // a placeholder -- every gridCol <= 200 twips (3.5 mm), as the
++                // `docx` npm library writes by default (100 each) -- was laid
++                // out at the grid's literal sum, a few millimetres, so every
++                // cell's text vanished. Word autofits such a table to its
++                // content. Approximation: span the text area and keep the
++                // grid's proportions (the separators below are relative).
++                // Not for floating tables (tblpPr): they become frames sized
++                // from this, at their anchor position, where 100% could run off
++                // the page (e.g. a decorative zero-margin shaded bar).
++                else if (!pTableGrid->empty()
++                         && (m_aTablePositions.empty() || !m_aTablePositions.back())
++                         && std::all_of(pTableGrid->begin(), pTableGrid->end(),
++                                        [](sal_Int32 n) { return n <= 200; }))
++                {
++                    pTablePropMap->setValue(TablePropertyMap::TABLE_WIDTH, sal_Int32(100));
++                    pTablePropMap->setValue(TablePropertyMap::TABLE_WIDTH_TYPE, text::SizeType::VARIABLE);
++                }
++#endif
+                 else
+                 {
+                     pTablePropMap->setValue(TablePropertyMap::TABLE_WIDTH, m_nTableWidth);
