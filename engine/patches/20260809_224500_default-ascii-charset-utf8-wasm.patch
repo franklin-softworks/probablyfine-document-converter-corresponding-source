@@ -1,0 +1,34 @@
+--- a/sw/source/filter/basflt/shellio.cxx
++++ b/sw/source/filter/basflt/shellio.cxx
+@@ -81,7 +81,31 @@
+ {
+     m_sFont.clear();
+     m_eCRLF_Flag = GetSystemLineEnd();
++#ifdef __EMSCRIPTEN__
++    // Defense-in-depth for BUG-27, not the fix for it. The originally suspected root
++    // cause -- osl_getThreadTextEncoding() resolving the Emscripten "C" locale to a
++    // "fake ASCII_US" that is actually RTL_TEXTENCODING_ISO_8859_1 (see the
++    // nl_language_list comment in sal/osl/unx/nlsupport.cxx) -- turned out NOT to be
++    // what was happening at runtime: instrumented with a one-off diagnostic build,
++    // osl_getThreadTextEncoding() already returns RTL_TEXTENCODING_UTF8 (76) here, so
++    // this line was a no-op for the bug as filed. The actual defect was in our own
++    // engine/bridge/wasm_bridge.cpp, not in this default: it passed a literal
++    // "FilterName=Text" string as LOK saveAs()'s FilterOptions argument, which
++    // SwASCWriter::SetupFilterOptions() (sw/source/filter/ascii/wrtasc.cxx) parses as
++    // structured "charset,lineend,..." data -- reading the whole unrecognised string
++    // as a charset name and silently landing on RTL_TEXTENCODING_DONTKNOW, which is
++    // what actually produced the low-byte truncation (U+2019 -> raw 0x19). That is
++    // fixed at the source in wasm_bridge.cpp. This override is kept anyway as a
++    // narrow safety net: it costs nothing, and it means a plain-TEXT export still
++    // defaults to UTF-8 rather than silently depending on
++    // osl_getThreadTextEncoding()'s current (correct, but indirect and unguarded by
++    // any test) behaviour under Emscripten. It changes only the *default* -- any
++    // explicit charset (SwAsciiOptions::SetCharSet / ReadUserData from a
++    // well-formed FilterOptions string) still overrides it afterward.
++    m_eCharSet = RTL_TEXTENCODING_UTF8;
++#else
+     m_eCharSet = ::osl_getThreadTextEncoding();
++#endif
+     m_nLanguage = LANGUAGE_SYSTEM;
+     m_bIncludeBOM = true;
+     m_bIncludeHidden = officecfg::Office::Writer::FilterFlags::ASCII::IncludeHiddenText::get();
