@@ -1,0 +1,15 @@
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+@@ -1419,7 +1419,11 @@
+         if (!globalParams)
+         {
+ #if POPPLER_CHECK_VERSION(0, 83, 0)
+-            globalParams = std::make_unique<GlobalParams>(nullptr);
++            // Poppler >= 22.x: GlobalParams takes const std::string&. Passing
++            // nullptr constructs std::string(nullptr) -- UB: it throws on
++            // libstdc++ and calls strlen(NULL) on libc++/Emscripten. Use the
++            // default (empty) poppler-data dir instead.
++            globalParams = std::make_unique<GlobalParams>();
+ #else
+             globalParams = new GlobalParams(nullptr);
+ #endif
