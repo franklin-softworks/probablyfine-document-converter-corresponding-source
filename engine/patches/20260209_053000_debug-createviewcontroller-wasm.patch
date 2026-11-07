@@ -1,0 +1,38 @@
+diff --git a/sfx2/source/doc/sfxbasemodel.cxx b/sfx2/source/doc/sfxbasemodel.cxx
+--- a/sfx2/source/doc/sfxbasemodel.cxx
++++ b/sfx2/source/doc/sfxbasemodel.cxx
+@@ -23,6 +23,9 @@
+ #include <chrono>
+ #include <memory>
+ #include <optional>
++#ifdef __EMSCRIPTEN__
++#include <iostream>
++#endif
+ #include <config_features.h>
+
+ #include <sfx2/sfxbasemodel.hxx>
+@@ -4348,15 +4351,24 @@ Reference< frame::XController2 > SAL_CALL SfxBaseModel::createViewController(
+     // a guard which will clean up in case of failure
+     ::sfx::intern::ViewCreationGuard aViewCreationGuard;
+
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[CREATEVC] FindOrCreateViewFrame_Impl..." << std::endl;
++#endif
+     // determine the ViewFrame belonging to the given XFrame
+     SfxViewFrame* pViewFrame = FindOrCreateViewFrame_Impl( i_rFrame, aViewCreationGuard );
+     assert(pViewFrame && "SfxBaseModel::createViewController: no frame");
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[CREATEVC] Got ViewFrame, creating ViewShell..." << std::endl;
++#endif
+
+     // delegate to SFX' view factory
+     pViewFrame->GetBindings().ENTERREGISTRATIONS();
+     SfxViewShell* pViewShell = pViewFactory->CreateInstance(*pViewFrame, pOldViewShell);
+     pViewFrame->GetBindings().LEAVEREGISTRATIONS();
+     ENSURE_OR_THROW( pViewShell, "invalid view shell provided by factory" );
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[CREATEVC] ViewShell created, setting up..." << std::endl;
++#endif
+
+     // by setting the ViewShell it is prevented that disposing the Controller will destroy this ViewFrame also
+     pViewFrame->GetDispatcher()->SetDisableFlags( SfxDisableFlags::NONE );
