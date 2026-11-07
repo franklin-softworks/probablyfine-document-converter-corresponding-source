@@ -1,0 +1,22 @@
+--- a/RepositoryModule_host.mk
++++ b/RepositoryModule_host.mk
+@@ -83,7 +83,7 @@
+ 	external \
+ 	extras \
+ 	filter \
+-	$(call gb_Helper_optional,DBCONNECTIVITY,forms) \
++	forms \
+ 	formula \
+ 	$(call gb_Helper_optional,DESKTOP,fpicker) \
+ 	framework \
+--- a/forms/Library_frm.mk
++++ b/forms/Library_frm.mk
+@@ -28,7 +28,7 @@
+     comphelper \
+     cppu \
+     cppuhelper \
+-    $(call gb_Helper_optional,DBCONNECTIVITY,dbtools) \
++    dbtools \
+     editeng \
+     i18nlangtag \
+     sal \

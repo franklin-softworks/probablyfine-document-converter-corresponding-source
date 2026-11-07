@@ -1,0 +1,141 @@
+{
+  "version": "1.0.0",
+  "description": "Module registry for LibreOffice WASM build pipeline",
+  "modules": {
+    "documents": {
+      "config": "engine/modules/documents/autogen.input",
+      "patch_suffix": "documents",
+      "build_command": "build-documents",
+      "formats": [
+        "docx",
+        "doc",
+        "odt",
+        "rtf"
+      ],
+      "artifact_prefix": "soffice",
+      "description": "Documents module for word processing documents (DOCX, DOC, ODT, RTF)",
+      "test_fixtures_dir": "test_corpus/fixtures/documents",
+      "web_module_dir": "web/modules/documents"
+    },
+    "spreadsheets": {
+      "config": "engine/modules/spreadsheets/autogen.input",
+      "patch_suffix": "spreadsheets",
+      "build_command": "build-spreadsheets",
+      "formats": [
+        "xlsx",
+        "xls",
+        "ods"
+      ],
+      "artifact_prefix": "soffice",
+      "description": "Spreadsheets module for spreadsheets (XLSX, XLS, ODS)",
+      "test_fixtures_dir": "test_corpus/fixtures/spreadsheets",
+      "web_module_dir": "web/modules/spreadsheets"
+    },
+    "presentations": {
+      "config": "engine/modules/presentations/autogen.input",
+      "patch_suffix": "presentations",
+      "build_command": "build-presentations",
+      "formats": [
+        "pptx",
+        "ppt",
+        "odp",
+        "pptm"
+      ],
+      "artifact_prefix": "soffice",
+      "description": "Presentations module for presentations (PPTX, PPT, ODP)",
+      "test_fixtures_dir": "test_corpus/fixtures/presentations",
+      "web_module_dir": "web/modules/presentations"
+    },
+    "pdf-docx": {
+      "config": "engine/modules/pdf-docx/autogen.input",
+      "patch_suffix": "pdf-docx",
+      "build_command": "build-pdf-docx",
+      "input_formats": [
+        "pdf"
+      ],
+      "output_formats": [
+        "docx"
+      ],
+      "artifact_prefix": "soffice",
+      "description": "PDF to Word conversion module (PDF import -> DOCX export)",
+      "test_fixtures_dir": "test_corpus/fixtures/pdf-docx",
+      "web_module_dir": "web/modules/pdf-docx"
+    },
+    "pdf-pptx": {
+      "config": "engine/modules/pdf-pptx/autogen.input",
+      "patch_suffix": "presentations",
+      "build_command": "build-pdf-pptx",
+      "input_formats": [
+        "pdf"
+      ],
+      "output_formats": [
+        "pptx"
+      ],
+      "artifact_prefix": "soffice",
+      "description": "PDF to PowerPoint conversion module (PDF import -> PPTX export)",
+      "test_fixtures_dir": "test_corpus/fixtures/pdf-pptx",
+      "web_module_dir": "web/modules/pdf-pptx"
+    }
+  },
+  "default_modules": [
+    "documents",
+    "spreadsheets",
+    "presentations",
+    "pdf-docx",
+    "pdf-pptx"
+  ],
+  "paths": {
+    "patches_dir": "engine/patches",
+    "build_dir": "engine/build",
+    "web_dir": "web",
+    "libreoffice_dir": "libreoffice",
+    "finished_packages_dir": "finished_packages",
+    "pipeline_state_dir": ".pipeline_state",
+    "archives_dir": "pipeline/archives",
+    "modules_dir": "engine/modules",
+    "bridge_dir": "engine/bridge",
+    "engine_tools_dir": "engine/tools"
+  },
+  "build_scripts": [
+    "engine/build/build.sh",
+    "engine/build/orchestrator.sh",
+    "engine/bridge/wasm_bridge.cpp"
+  ],
+  "artifact_extensions": {
+    "primary": [
+      ".wasm",
+      ".js",
+      ".data",
+      ".data.js.metadata",
+      ".worker.js"
+    ],
+    "optimized": [
+      "_optimized.wasm",
+      "_optimized.wasm.br"
+    ],
+    "compressed": [
+      ".wasm.gz",
+      ".wasm.br",
+      ".data.gz"
+    ]
+  },
+  "retention": {
+    "successful_builds": 10,
+    "failed_builds": 10,
+    "pipeline_runs": 20
+  },
+  "build_config": {
+    "nice_level": 10,
+    "comment": "Nice level for docker builds (0=normal, 10=low priority, 19=lowest)"
+  },
+  "test_config": {
+    "server_port": 8080,
+    "server_root": "web",
+    "timeout_ms": 180000,
+    "auto_promotion": {
+      "passes_to_verify": 5,
+      "fails_to_demote": 3,
+      "comment": "Consecutive passes to promote experimental->verified, consecutive fails to demote verified->known-failing"
+    }
+  }
+}
