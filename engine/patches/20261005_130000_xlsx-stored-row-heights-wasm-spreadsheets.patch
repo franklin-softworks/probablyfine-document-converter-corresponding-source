@@ -1,0 +1,119 @@
+diff --git a/sc/source/filter/inc/worksheethelper.hxx b/sc/source/filter/inc/worksheethelper.hxx
+index 42e1a6e5f112..d0724464be02 100644
+--- a/sc/source/filter/inc/worksheethelper.hxx
++++ b/sc/source/filter/inc/worksheethelper.hxx
+@@ -293,6 +293,19 @@ private:
+     WorksheetGlobals&   mrSheetGlob;
+ };
+ 
++#ifdef __EMSCRIPTEN__
++/** FG-154: rows whose height the file stores (ht, not customHeight) are marked
++    manual during import so the post-import optimal-height pass skips measuring
++    them; the pass then re-measures only rows the file gave no height. After the
++    pass, releaseStoredRowHeights() clears that temporary manual flag again, so
++    export keeps them as auto-height rows. */
++void releaseStoredRowHeights(ScDocument& rDoc);
++/** Drops any entries left by an import that never reached finalize() (an
++    exception skips the release), so they cannot touch a later document that
++    happens to reuse the same address. Called at the start of every import. */
++void resetStoredRowHeights();
++#endif
++
+ } // namespace oox::xls
+ 
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/sc/source/filter/oox/workbookhelper.cxx b/sc/source/filter/oox/workbookhelper.cxx
+index 5f7210c86a68..d09344fc9dc8 100644
+--- a/sc/source/filter/oox/workbookhelper.cxx
++++ b/sc/source/filter/oox/workbookhelper.cxx
+@@ -58,6 +58,9 @@
+ #include <viewsettings.hxx>
+ #include <workbooksettings.hxx>
+ #include <worksheetbuffer.hxx>
++#ifdef __EMSCRIPTEN__
++#include <worksheethelper.hxx>   // FG-154: releaseStoredRowHeights
++#endif
+ #include <docsh.hxx>
+ #include <document.hxx>
+ #include <docuno.hxx>
+@@ -553,6 +556,9 @@ void WorkbookGlobals::initialize()
+     mbGeneratorKnownGood = false;
+     mbHasCalculatedFormulaCells = false;
+     meTextEnc = osl_getThreadTextEncoding();
++#ifdef __EMSCRIPTEN__
++    resetStoredRowHeights();   // FG-154: no stale entries from an aborted import
++#endif
+ 
+     // the spreadsheet document
+     mxDoc = &dynamic_cast<ScModelObj&>(*mrBaseFilter.getModel());
+@@ -663,6 +669,11 @@ void WorkbookGlobals::finalize()
+     // check settings (potentially asking the user if optimal row height should be run now)
+     if (mpDocShell->GetRecalcRowHeightsMode()) // default is to always update
+         mpDocShell->UpdateAllRowHeights(/*bOnlyUsedRows=*/true);
++#ifdef __EMSCRIPTEN__
++    // FG-154: the rows convertRows() held as manual only for that pass are auto
++    // rows again, so an XLSX/ODS export does not mark them fixed-height.
++    releaseStoredRowHeights(*mpDoc);
++#endif
+ 
+     // #i76026# enable Undo after loading the document
+     mpDoc->EnableUndo(true);
+diff --git a/sc/source/filter/oox/worksheethelper.cxx b/sc/source/filter/oox/worksheethelper.cxx
+--- a/sc/source/filter/oox/worksheethelper.cxx
++++ b/sc/source/filter/oox/worksheethelper.cxx
+@@ -83,6 +83,36 @@
+ 
+ namespace oox::xls {
+ 
++#ifdef __EMSCRIPTEN__
++namespace {
++struct StoredHeightRows { ScDocument* pDoc; SCTAB nTab; SCROW nStart; SCROW nEnd; };
++// FG-154: rows temporarily marked manual by convertRows(). One import at a time
++// in this single-threaded build; entries are keyed by document and released by
++// WorkbookGlobals::finalize() after the optimal-height pass.
++std::vector<StoredHeightRows>& storedHeightRows()
++{
++    static std::vector<StoredHeightRows> aRows;
++    return aRows;
++}
++}
++
++void resetStoredRowHeights()
++{
++    storedHeightRows().clear();
++}
++
++void releaseStoredRowHeights(ScDocument& rDoc)
++{
++    auto& rRows = storedHeightRows();
++    for (const auto& r : rRows)
++        if (r.pDoc == &rDoc)
++            rDoc.SetManualHeight(r.nStart, r.nEnd, r.nTab, false);
++    rRows.erase(std::remove_if(rRows.begin(), rRows.end(),
++                               [&rDoc](const StoredHeightRows& r) { return r.pDoc == &rDoc; }),
++                rRows.end());
++}
++#endif
++
+ using namespace ::com::sun::star;
+ using namespace ::com::sun::star::beans;
+ using namespace ::com::sun::star::drawing;
+@@ -1266,6 +1296,18 @@
+         rDoc.SetRowHeightOnly(nStartRow, nEndRow, nTab, nHeight);
+         if(rModel.mbCustomHeight)
+             rDoc.SetManualHeight( nStartRow, nEndRow, nTab, true );
++#ifdef __EMSCRIPTEN__
++        // FG-154: a height the file stores (ht present, not customHeight) is
++        // trusted as Excel does: held as manual during the optimal-height pass,
++        // which then measures only rows the file left without a height. On a
++        // 96,020-row sheet that stores every height, re-measuring all rows took
++        // more than 30 s with no progress and the conversion was stopped.
++        else if (rModel.mfHeight >= 0.0)
++        {
++            rDoc.SetManualHeight( nStartRow, nEndRow, nTab, true );
++            storedHeightRows().push_back({ &rDoc, nTab, nStartRow, nEndRow });
++        }
++#endif
+     }
+ 
+     // hidden rows: TODO: #108683# hide rows later?
