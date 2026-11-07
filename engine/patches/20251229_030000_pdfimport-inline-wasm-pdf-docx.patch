@@ -1,0 +1,636 @@
+diff --git a/sdext/Library_pdfimport.mk b/sdext/Library_pdfimport.mk
+index a1d4d0b5aceb..1835142625da 100644
+--- a/sdext/Library_pdfimport.mk
++++ b/sdext/Library_pdfimport.mk
+@@ -42,6 +42,23 @@ $(eval $(call gb_Library_use_externals,pdfimport,\
+     $(if $(filter-out WNT MACOSX,$(OS)),fontconfig) \
+ ))
+ 
++# On Emscripten, we need to link poppler directly since we can't spawn xpdfimport
++ifeq ($(OS),EMSCRIPTEN)
++$(eval $(call gb_Library_use_externals,pdfimport,\
++    expat \
++    freetype \
++    poppler \
++    libpng \
++))
++$(eval $(call gb_Library_add_defs,pdfimport,\
++    -DEMSCRIPTEN_INLINE_PDFIMPORT \
++))
++$(eval $(call gb_Library_set_include,pdfimport,\
++    -I$(SRCDIR)/sdext/source/pdfimport/xpdfwrapper \
++    $$(INCLUDE) \
++))
++endif
++
+ ifeq ($(COM),MSC)
+ $(eval $(call gb_Library_add_defs,pdfimport, \
+     -D_SILENCE_CXX17_ALLOCATOR_VOID_DEPRECATION_WARNING \
+@@ -72,4 +89,13 @@ $(eval $(call gb_Library_add_exception_objects,pdfimport,\
+     sdext/source/pdfimport/wrapper/wrapper \
+ ))
+ 
++# On Emscripten, include xpdfwrapper sources directly in the library
++# since we can't spawn external processes
++ifeq ($(OS),EMSCRIPTEN)
++$(eval $(call gb_Library_add_exception_objects,pdfimport,\
++    sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl \
++    sdext/source/pdfimport/xpdfwrapper/pnghelper \
++))
++endif
++
+ # vim:set noet sw=4 ts=4:
+diff --git a/sdext/Module_sdext.mk b/sdext/Module_sdext.mk
+index 1522d214470f..abfb380f99f0 100644
+--- a/sdext/Module_sdext.mk
++++ b/sdext/Module_sdext.mk
+@@ -20,11 +20,15 @@ $(eval $(call gb_Module_add_targets,sdext,\
+ ))
+ 
+ ifeq ($(ENABLE_POPPLER),TRUE)
++# On Emscripten, don't build xpdfimport as a separate executable
++# because we can't spawn processes - the code is linked directly into pdfimport
++ifneq ($(OS),EMSCRIPTEN)
+ $(eval $(call gb_Module_add_targets,sdext,\
+     Executable_xpdfimport \
+     Package_pdfimport_xpdfimport \
+ ))
+ endif
++endif
+ 
+ $(eval $(call gb_Module_add_check_targets,sdext,\
+     CppunitTest_sdext_pdfimport \
+diff --git a/sdext/source/pdfimport/pdfiadaptor.cxx b/sdext/source/pdfimport/pdfiadaptor.cxx
+index 45250a911884..9a20fd70b5e1 100644
+--- a/sdext/source/pdfimport/pdfiadaptor.cxx
++++ b/sdext/source/pdfimport/pdfiadaptor.cxx
+@@ -37,6 +37,10 @@
+ 
+ #include <memory>
+ 
++#ifdef __EMSCRIPTEN__
++#include <stdio.h>  // for fprintf diagnostics
++#endif
++
+ using namespace com::sun::star;
+ 
+ 
+@@ -226,20 +230,72 @@ bool PDFIRawAdaptor::parse( const uno::Reference<io::XInputStream>&       xInput
+                             const OUString&                          rURL,
+                             const OUString&                          rFilterOptions )
+ {
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[ADAPTOR] PDFIRawAdaptor::parse() starting\n");
++#endif
+     // container for metaformat
+     auto pSink = std::make_shared<PDFIProcessor>(xStatus, m_xContext);
+ 
+     bool bSuccess=false;
+ 
+     if( xInput.is() )
++    {
++#ifdef __EMSCRIPTEN__
++        fprintf(stderr, "[ADAPTOR] Calling xpdf_ImportFromStream\n");
++#endif
+         bSuccess = xpdf_ImportFromStream( xInput, pSink, xIHdl,
+                                           rPwd, m_xContext, rFilterOptions );
++    }
+     else
++    {
++#ifdef __EMSCRIPTEN__
++        fprintf(stderr, "[ADAPTOR] Calling xpdf_ImportFromFile\n");
++#endif
+         bSuccess = xpdf_ImportFromFile( rURL, pSink, xIHdl,
+                                         rPwd, m_xContext, rFilterOptions );
++    }
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[ADAPTOR] Import returned: %s\n", bSuccess ? "true" : "false");
++#endif
+ 
+     if( bSuccess )
+-        pSink->emit(*rEmitter,*m_pVisitorFactory);
++    {
++#ifdef __EMSCRIPTEN__
++        fprintf(stderr, "[ADAPTOR] Calling pSink->emit()\n");
++#endif
++        try
++        {
++            pSink->emit(*rEmitter,*m_pVisitorFactory);
++#ifdef __EMSCRIPTEN__
++            fprintf(stderr, "[ADAPTOR] emit() completed successfully\n");
++#endif
++        }
++        catch (const uno::Exception& e)
++        {
++#ifdef __EMSCRIPTEN__
++            fprintf(stderr, "[ADAPTOR] emit() threw uno::Exception: %s\n",
++                    OUStringToOString(e.Message, RTL_TEXTENCODING_UTF8).getStr());
++#endif
++            bSuccess = false;
++        }
++        catch (const std::exception& e)
++        {
++#ifdef __EMSCRIPTEN__
++            fprintf(stderr, "[ADAPTOR] emit() threw std::exception: %s\n", e.what());
++#endif
++            bSuccess = false;
++        }
++        catch (...)
++        {
++#ifdef __EMSCRIPTEN__
++            fprintf(stderr, "[ADAPTOR] emit() threw unknown exception\n");
++#endif
++            bSuccess = false;
++        }
++    }
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[ADAPTOR] parse() returning: %s\n", bSuccess ? "true" : "false");
++#endif
+ 
+     return bSuccess;
+ }
+diff --git a/sdext/source/pdfimport/tree/pdfiprocessor.cxx b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+index 0a45cf0d96bd..445a9518b209 100644
+--- a/sdext/source/pdfimport/tree/pdfiprocessor.cxx
++++ b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+@@ -40,6 +40,10 @@
+ #include <i18nutil/unicode.hxx>
+ #include <o3tl/string_view.hxx>
+ 
++#ifdef __EMSCRIPTEN__
++#include <stdio.h>  // for fprintf diagnostics
++#endif
++
+ using namespace com::sun::star;
+ 
+ #include <drawinglayer/primitive2d/PolyPolygonStrokePrimitive2D.hxx>
+@@ -671,28 +675,46 @@ void PDFIProcessor::startPage( const geometry::RealSize2D& rSize )
+ void PDFIProcessor::emit( XmlEmitter&               rEmitter,
+                           const TreeVisitorFactory& rVisitorFactory )
+ {
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[EMIT] PDFIProcessor::emit() starting, m_nPages=%d\n", m_nPages);
++#endif
+ #if OSL_DEBUG_LEVEL > 0
+     m_pDocument->emitStructure( 0 );
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[EMIT] Creating optimizing visitor...\n");
++#endif
+     ElementTreeVisitorSharedPtr optimizingVisitor(
+         rVisitorFactory.createOptimizingVisitor(*this));
+     // FIXME: localization
+     startIndicator( u" "_ustr );
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[EMIT] Running optimizing visitor on document...\n");
++#endif
+     m_pDocument->visitedBy( *optimizingVisitor, std::list<std::unique_ptr<Element>>::const_iterator());
+ 
+ #if OSL_DEBUG_LEVEL > 0
+     m_pDocument->emitStructure( 0 );
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[EMIT] Creating style container and finalizing visitor...\n");
++#endif
+     // get styles
+     StyleContainer aStyles;
+     ElementTreeVisitorSharedPtr finalizingVisitor(
+         rVisitorFactory.createStyleCollectingVisitor(aStyles,*this));
+     // FIXME: localization
+ 
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[EMIT] Running finalizing visitor on document...\n");
++#endif
+     m_pDocument->visitedBy( *finalizingVisitor, std::list<std::unique_ptr<Element>>::const_iterator() );
+ 
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[EMIT] Creating emit context...\n");
++#endif
+     EmitContext aContext( rEmitter, aStyles, m_aImages, *this, m_xStatusIndicator, m_xContext );
+     ElementTreeVisitorSharedPtr aEmittingVisitor(
+         rVisitorFactory.createEmittingVisitor(aContext));
+@@ -720,14 +742,29 @@ void PDFIProcessor::emit( XmlEmitter&               rEmitter,
+     aProps[ u"xmlns:xsi"_ustr]          = "http://www.w3.org/2001/XMLSchema-instance";
+     aProps[ u"office:version"_ustr ]    = "1.0";
+ 
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[EMIT] Beginning XML output...\n");
++#endif
+     aContext.rEmitter.beginTag( "office:document", aProps );
+ 
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[EMIT] Emitting styles...\n");
++#endif
+     // emit style list
+     aStyles.emit( aContext, *aEmittingVisitor );
+ 
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[EMIT] Running emitting visitor on document...\n");
++#endif
+     m_pDocument->visitedBy( *aEmittingVisitor, std::list<std::unique_ptr<Element>>::const_iterator() );
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[EMIT] Ending document tag...\n");
++#endif
+     aContext.rEmitter.endTag( "office:document" );
+     endIndicator();
++#ifdef __EMSCRIPTEN__
++    fprintf(stderr, "[EMIT] emit() completed successfully\n");
++#endif
+ }
+ 
+ void PDFIProcessor::startIndicator( const OUString& rText  )
+diff --git a/sdext/source/pdfimport/wrapper/wrapper.cxx b/sdext/source/pdfimport/wrapper/wrapper.cxx
+index fcac1cdacfa2..95cbbbceb1ec 100644
+--- a/sdext/source/pdfimport/wrapper/wrapper.cxx
++++ b/sdext/source/pdfimport/wrapper/wrapper.cxx
+@@ -63,6 +63,10 @@
+ #include <vector>
+ #include <string.h>
+ 
++#ifdef EMSCRIPTEN_INLINE_PDFIMPORT
++#include <stdio.h>  // for FILE*
++#endif
++
+ using namespace com::sun::star;
+ 
+ namespace pdfi
+@@ -1020,6 +1024,8 @@ public:
+ 
+ }
+ 
++#ifndef EMSCRIPTEN_INLINE_PDFIMPORT
++// Standard implementation using subprocess
+ bool xpdf_ImportFromFile(const OUString& rURL,
+                          const ContentSinkSharedPtr& rSink,
+                          const uno::Reference<task::XInteractionHandler>& xIHdl,
+@@ -1229,6 +1235,228 @@ bool xpdf_ImportFromFile(const OUString& rURL,
+     osl_freeProcessHandle(aProcess);
+     return bRet;
+ }
++#else
++// Emscripten implementation - inline Poppler integration for WASM
++// Cannot spawn subprocess, so we call Poppler directly via pdfi_process_pdf_inline
++// Forward declaration of the C function defined in pdfioutdev_gpl.cxx
++extern "C" bool pdfi_process_pdf_inline(
++    const char* pdfPath,
++    const char* ownerPwd,
++    const char* userPwd,
++    FILE* textOutFile,
++    FILE* binaryOutFile,
++    bool skipImages);
++
++bool xpdf_ImportFromFile(const OUString& rURL,
++                         const ContentSinkSharedPtr& rSink,
++                         const uno::Reference<task::XInteractionHandler>& xIHdl,
++                         const OUString& rPwd,
++                         const uno::Reference<uno::XComponentContext>& xContext,
++                         const OUString& rFilterOptions)
++{
++    OSL_ASSERT(rSink);
++
++    OUString aSysUPath;
++    if( osl_getSystemPathFromFileURL( rURL.pData, &aSysUPath.pData ) != osl_File_E_None )
++    {
++        SAL_WARN("sdext.pdfimport", "getSystemPathFromFileURL(" << rURL << ") failed");
++        return false;
++    }
++    OUString aDocName( rURL.copy( rURL.lastIndexOf( '/' )+1 ) );
++
++    // In 25.8, checkEncryption was removed (tdf#55425) - encryption is
++    // handled by poppler directly during processing.
++    OUString aPwd( rPwd );
++    (void)xIHdl;
++    (void)aDocName;
++
++    SAL_INFO("sdext.pdfimport", "WASM: Starting inline PDF import for " << aSysUPath);
++
++    // Create temp files for stdout (text commands) and stderr (binary data)
++    oslFileHandle hTextOut = nullptr;
++    oslFileHandle hBinaryOut = nullptr;
++    OUString aTextOutURL, aBinaryOutURL;
++
++    if( osl_createTempFile( nullptr, &hTextOut, &aTextOutURL.pData ) != osl_File_E_None )
++    {
++        SAL_WARN("sdext.pdfimport", "Failed to create temp file for text output");
++        return false;
++    }
++    if( osl_createTempFile( nullptr, &hBinaryOut, &aBinaryOutURL.pData ) != osl_File_E_None )
++    {
++        SAL_WARN("sdext.pdfimport", "Failed to create temp file for binary output");
++        osl_closeFile(hTextOut);
++        osl_removeFile(aTextOutURL.pData);
++        return false;
++    }
++
++    // Close osl handles - we'll use FILE* for Poppler
++    osl_closeFile(hTextOut);
++    osl_closeFile(hBinaryOut);
++
++    // Convert URLs to system paths for fopen
++    OUString aTextOutPath, aBinaryOutPath;
++    osl_getSystemPathFromFileURL(aTextOutURL.pData, &aTextOutPath.pData);
++    osl_getSystemPathFromFileURL(aBinaryOutURL.pData, &aBinaryOutPath.pData);
++
++    OString aTextOutPathOStr = OUStringToOString(aTextOutPath, osl_getThreadTextEncoding());
++    OString aBinaryOutPathOStr = OUStringToOString(aBinaryOutPath, osl_getThreadTextEncoding());
++
++    // Open files for writing
++    FILE* pTextFile = fopen(aTextOutPathOStr.getStr(), "w");
++    if (!pTextFile)
++    {
++        SAL_WARN("sdext.pdfimport", "Failed to open text output file");
++        osl_removeFile(aTextOutURL.pData);
++        osl_removeFile(aBinaryOutURL.pData);
++        return false;
++    }
++
++    FILE* pBinaryFile = fopen(aBinaryOutPathOStr.getStr(), "wb");
++    if (!pBinaryFile)
++    {
++        SAL_WARN("sdext.pdfimport", "Failed to open binary output file");
++        fclose(pTextFile);
++        osl_removeFile(aTextOutURL.pData);
++        osl_removeFile(aBinaryOutURL.pData);
++        return false;
++    }
++
++    // Convert strings for Poppler
++    OString aPDFPath = OUStringToOString(aSysUPath, osl_getThreadTextEncoding());
++    OString aPwdStr;
++    if (!aPwd.isEmpty())
++        aPwdStr = OUStringToOString(aPwd, RTL_TEXTENCODING_ISO_8859_1);
++
++    bool bSkipImages = (rFilterOptions == "SkipImages");
++
++    // Call the C function that does the actual Poppler processing
++    // Pass password if provided (poppler handles encryption directly in 25.8)
++    bool bRet = pdfi_process_pdf_inline(
++        aPDFPath.getStr(),
++        !aPwd.isEmpty() ? aPwdStr.getStr() : nullptr,
++        !aPwd.isEmpty() ? aPwdStr.getStr() : nullptr,
++        pTextFile,
++        pBinaryFile,
++        bSkipImages);
++
++    // Close output files
++    fclose(pTextFile);
++    fclose(pBinaryFile);
++
++    // Now parse the output files using the Parser
++    if (bRet)
++    {
++        SAL_INFO("sdext.pdfimport", "WASM: Parsing PDFOutDev output");
++
++        // Open files for reading
++        oslFileHandle hTextRead = nullptr;
++        oslFileHandle hBinaryRead = nullptr;
++
++        if (osl_openFile(aTextOutURL.pData, &hTextRead, osl_File_OpenFlag_Read) != osl_File_E_None)
++        {
++            SAL_WARN("sdext.pdfimport", "Failed to open text output for reading");
++            bRet = false;
++        }
++        else if (osl_openFile(aBinaryOutURL.pData, &hBinaryRead, osl_File_OpenFlag_Read) != osl_File_E_None)
++        {
++            SAL_WARN("sdext.pdfimport", "Failed to open binary output for reading");
++            osl_closeFile(hTextRead);
++            bRet = false;
++        }
++        else
++        {
++            fprintf(stderr, "[PARSE] Starting parser for PDF output\n");
++            int nLineCount = 0;
++            try
++            {
++                // Use the existing Parser to process the output
++                fprintf(stderr, "[PARSE] Creating Parser object...\n");
++                Parser aParser(rSink, hBinaryRead, xContext);
++                fprintf(stderr, "[PARSE] Parser created, creating Buffering...\n");
++                Buffering aBuffering(hTextRead);
++                OStringBuffer line;
++                fprintf(stderr, "[PARSE] Beginning line parsing loop\n");
++
++                for (;;)
++                {
++                    char aChar('\n');
++                    sal_uInt64 nBytesRead;
++                    oslFileError nRes;
++
++                    // Skip garbage \r \n at start of line
++                    for (;;)
++                    {
++                        nRes = aBuffering.read(&aChar, 1, &nBytesRead);
++                        if (osl_File_E_None != nRes || nBytesRead != 1 || (aChar != '\n' && aChar != '\r'))
++                            break;
++                    }
++                    if (osl_File_E_None != nRes)
++                        break;
++
++                    if (aChar != '\n' && aChar != '\r')
++                        line.append(aChar);
++
++                    for (;;)
++                    {
++                        nRes = aBuffering.read(&aChar, 1, &nBytesRead);
++                        if (osl_File_E_None != nRes || nBytesRead != 1 || aChar == '\n' || aChar == '\r')
++                            break;
++                        line.append(aChar);
++                    }
++                    if (osl_File_E_None != nRes)
++                        break;
++                    if (line.isEmpty())
++                        break;
++
++                    nLineCount++;
++                    if (nLineCount <= 10 || nLineCount % 1000 == 0)
++                    {
++                        OString lineStr = line.makeStringAndClear();
++                        // Show first token only for brevity
++                        size_t spacePos = lineStr.indexOf(' ');
++                        OString cmd = (spacePos != -1) ? lineStr.copy(0, spacePos) : lineStr;
++                        fprintf(stderr, "[PARSE] Line %d: cmd=%s\n", nLineCount, cmd.getStr());
++                        line.append(lineStr);
++                    }
++                    aParser.parseLine(line);
++                    line.setLength(0);
++                }
++
++                fprintf(stderr, "[PARSE] Loop ended, parsed %d lines\n", nLineCount);
++                SAL_INFO("sdext.pdfimport", "WASM: Parser completed successfully");
++            }
++            catch (const uno::Exception& e)
++            {
++                fprintf(stderr, "[PARSE] uno::Exception at line %d: %s\n",
++                        nLineCount, OUStringToOString(e.Message, RTL_TEXTENCODING_UTF8).getStr());
++                SAL_WARN("sdext.pdfimport", "WASM: Exception in parser: " << e.Message);
++                bRet = false;
++            }
++            catch (const std::exception& e)
++            {
++                fprintf(stderr, "[PARSE] std::exception at line %d: %s\n", nLineCount, e.what());
++                bRet = false;
++            }
++            catch (...)
++            {
++                fprintf(stderr, "[PARSE] Unknown exception at line %d\n", nLineCount);
++                bRet = false;
++            }
++            fprintf(stderr, "[PARSE] Parser finished, bRet=%d\n", bRet ? 1 : 0);
++
++            osl_closeFile(hTextRead);
++            osl_closeFile(hBinaryRead);
++        }
++    }
++
++    // Clean up temp files
++    osl_removeFile(aTextOutURL.pData);
++    osl_removeFile(aBinaryOutURL.pData);
++
++    return bRet;
++}
++#endif // EMSCRIPTEN_INLINE_PDFIMPORT
+ 
+ 
+ bool xpdf_ImportFromStream( const uno::Reference< io::XInputStream >&         xInput,
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+index 4fa0f051b55e..f19f6d6235fe 100644
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+@@ -47,6 +47,12 @@
+ #include <memory>
+ #include <vector>
+ 
++#ifdef EMSCRIPTEN_INLINE_PDFIMPORT
++#include <unistd.h>  // for dup, dup2, close
++// For WASM, g_binary_out is defined here instead of wrapper_gpl.cxx
++FILE* g_binary_out = stderr;
++#endif
++
+ // sigh, UTF8.h was removed in poppler-0.21.0 and put back in 0.21.1, then renamed to UnicodeMapFuncs.h in 0.62.0
+ // FIXME: we can't use #if POPPLER_CHECK_VERSION(0, 21, 0) && !POPPLER_CHECK_VERSION(0, 21, 1)
+ //        because the internal poppler does not provide poppler-version.h and the macro always returns 0
+@@ -1380,4 +1386,122 @@ poppler_bool PDFOutDev::tilingPatternFill(GfxState *state, Gfx *, Catalog *,
+ #endif
+ }
+ 
++#ifdef EMSCRIPTEN_INLINE_PDFIMPORT
++// WASM-specific: C-style wrapper for inline PDF processing
++// This function can be called from wrapper.cxx without including pdfioutdev_gpl.hxx
++// Note: g_binary_out is defined at the top of this file (not inside extern "C")
++// so it has C++ linkage, but that's fine since we only access it within this file.
++extern "C" {
++
++bool pdfi_process_pdf_inline(
++    const char* pdfPath,
++    const char* ownerPwd,
++    const char* userPwd,
++    FILE* textOutFile,
++    FILE* binaryOutFile,
++    bool skipImages)
++{
++    fprintf(stderr, "[PDFIMPORT] pdfi_process_pdf_inline: Starting for %s\n", pdfPath);
++
++    // Save original stdout and set up redirection
++    int savedStdout = dup(fileno(stdout));
++    dup2(fileno(textOutFile), fileno(stdout));
++
++    // Set g_binary_out for PDFOutDev
++    FILE* savedBinaryOut = g_binary_out;
++    g_binary_out = binaryOutFile;
++
++    bool bSuccess = false;
++
++    try
++    {
++        // Initialize Poppler GlobalParams if not already done
++        if (!globalParams)
++        {
++#if POPPLER_CHECK_VERSION(0, 83, 0)
++            globalParams = std::make_unique<GlobalParams>(nullptr);
++#else
++            globalParams = new GlobalParams(nullptr);
++#endif
++            // Don't suppress errors so we can see poppler diagnostics
++            fprintf(stderr, "[PDFIMPORT] Poppler GlobalParams initialized\n");
++        }
++
++        fprintf(stderr, "[PDFIMPORT] Creating PDFDoc...\n");
++        // Create PDFDoc - construct with password strings if provided
++#if POPPLER_CHECK_VERSION(22, 6, 0)
++        std::optional<GooString> ownerPwdOpt = (ownerPwd && ownerPwd[0])
++            ? std::optional<GooString>(std::in_place, ownerPwd)
++            : std::nullopt;
++        std::optional<GooString> userPwdOpt = (userPwd && userPwd[0])
++            ? std::optional<GooString>(std::in_place, userPwd)
++            : std::nullopt;
++        PDFDoc aDoc(std::make_unique<GooString>(pdfPath), ownerPwdOpt, userPwdOpt);
++#else
++        GooString* pOwnerPwdStr = (ownerPwd && ownerPwd[0]) ? new GooString(ownerPwd) : nullptr;
++        GooString* pUserPwdStr = (userPwd && userPwd[0]) ? new GooString(userPwd) : nullptr;
++        PDFDoc aDoc(new GooString(pdfPath), pOwnerPwdStr, pUserPwdStr);
++#endif
++
++        fprintf(stderr, "[PDFIMPORT] PDFDoc created, isOk=%d\n", aDoc.isOk() ? 1 : 0);
++
++        if (aDoc.isOk())
++        {
++            const int nPages = aDoc.getNumPages();
++            fprintf(stderr, "[PDFIMPORT] PDF OK: pages=%d, version=%d.%d, encrypted=%d\n",
++                    nPages, aDoc.getPDFMajorVersion(), aDoc.getPDFMinorVersion(),
++                    aDoc.isEncrypted() ? 1 : 0);
++
++            // Create PDFOutDev and process pages
++            pdfi::PDFOutDev aOutDev(&aDoc);
++            if (skipImages)
++                aOutDev.setSkipImages(true);
++
++            // Output page count first
++            pdfi::PDFOutDev::setPageNum(nPages);
++
++            // Virtual resolution for PDF rendering (matches xpdfimport)
++            static const int PDF_OUTDEV_RESOLUTION = 7200;
++
++            // Process each page
++            for (int i = 1; i <= nPages; ++i)
++            {
++                fprintf(stderr, "[PDFIMPORT] Processing page %d/%d...\n", i, nPages);
++                aDoc.displayPage(&aOutDev, i,
++                                PDF_OUTDEV_RESOLUTION,
++                                PDF_OUTDEV_RESOLUTION,
++                                0, true, true, true);
++                aDoc.processLinks(&aOutDev, i);
++            }
++
++            fprintf(stderr, "[PDFIMPORT] All pages processed successfully\n");
++            bSuccess = true;
++        }
++        else
++        {
++            int errCode = aDoc.getErrorCode();
++            fprintf(stderr, "[PDFIMPORT] ERROR: PDFDoc.isOk()=false, errorCode=%d\n", errCode);
++        }
++    }
++    catch (...)
++    {
++        fprintf(stderr, "[PDFIMPORT] EXCEPTION caught!\n");
++    }
++
++    // Flush and restore stdout
++    fflush(stdout);
++    dup2(savedStdout, fileno(stdout));
++    close(savedStdout);
++
++    // Restore g_binary_out
++    fflush(g_binary_out);
++    g_binary_out = savedBinaryOut;
++
++    fprintf(stderr, "[PDFIMPORT] Returning %s\n", bSuccess ? "true" : "false");
++    return bSuccess;
++}
++
++} // extern "C"
++#endif // EMSCRIPTEN_INLINE_PDFIMPORT
++
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
