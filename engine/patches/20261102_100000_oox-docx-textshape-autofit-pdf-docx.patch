@@ -1,0 +1,32 @@
+oox: let a text shape obey TextAutoGrowHeight when it is exported to DOCX (pdf-docx module only).
+
+DrawingML::WriteText writes <a:spAutoFit/> in a DOCX bodyPr only for an SdrObjCustomShape whose TextAutoGrowHeight is
+true (tdf#112312: other shapes defaulted the property to true and were wrongly exported as auto-fit), and <a:noAutofit/>
+for everything else. The PDF import's text boxes are plain text shapes whose graphic style sets draw:auto-grow-height
+and draw:auto-grow-width on purpose (WriterXmlFinalizer::visit(FrameElement)), so they always came out as noAutofit: a
+reader that draws a wider font than the PDF's wraps the line and the box keeps its height, which hides the overflow.
+
+In this module every text shape comes from the PDF import, which sets the property deliberately, so here a text shape
+obeys it too. The file is named *-pdf-docx.patch, which pipeline/lib/fingerprint.sh sends to the pdf-docx module ONLY;
+every other module keeps the tdf#112312 rule. Not observed in Word.
+
+diff --git a/oox/source/export/drawingml.cxx b/oox/source/export/drawingml.cxx
+index 7e119c3..6deb9c3 100644
+--- a/oox/source/export/drawingml.cxx
++++ b/oox/source/export/drawingml.cxx
+@@ -4347,10 +4347,13 @@ void DrawingML::WriteText(const Reference<XInterface>& rXIface, bool bBodyPr, bo
+ 
+         if (GetDocumentType() == DOCUMENT_DOCX || GetDocumentType() == DOCUMENT_XLSX)
+         {
+-            // tdf#112312: only custom shapes obey the TextAutoGrowHeight option
++            // tdf#112312: only custom shapes obey the TextAutoGrowHeight option.
++            // BUG-43 (pdf-docx module only, see the patch header): every text shape of a PDF import sets it on purpose
++            // (draw:auto-grow-height in the importer's graphic style), so here a text shape obeys it too.
+             bool bTextAutoGrowHeight = false;
+             auto pSdrObjCustomShape = xShape.is() ? dynamic_cast<SdrObjCustomShape*>(SdrObject::getSdrObjectFromXShape(xShape)) : nullptr;
+-            if (pSdrObjCustomShape && GetProperty(rXPropSet, u"TextAutoGrowHeight"_ustr))
++            const bool bTextShape = xShape.is() && SdrObject::getSdrObjectFromXShape(xShape) != nullptr;
++            if ((pSdrObjCustomShape || bTextShape) && GetProperty(rXPropSet, u"TextAutoGrowHeight"_ustr))
+             {
+                 mAny >>= bTextAutoGrowHeight;
+             }
