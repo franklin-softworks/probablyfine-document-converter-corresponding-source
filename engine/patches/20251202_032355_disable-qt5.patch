@@ -1,0 +1,9 @@
+diff --git a/distro-configs/LibreOfficeWASM32.conf b/distro-configs/LibreOfficeWASM32.conf
+index 61c3f8f9da53..34235cb9505b 100644
+--- a/distro-configs/LibreOfficeWASM32.conf
++++ b/distro-configs/LibreOfficeWASM32.conf
+@@ -1,4 +1,3 @@
+ --host=wasm32-local-emscripten
+---enable-qt5
+ --disable-gen
+ --disable-scripting

@@ -1,0 +1,911 @@
+D6 phase 1 (owner decisions 2026-10-18/19; docs/fonts/embedded-font-rights.md): a PDF's
+own embedded simple TrueType fonts are used to lay out and draw its text.
+
+Before, the inline import read each embedded program only to guess the family name and
+weight (vcl::Font::identifyFont); the text was then measured and drawn with whatever
+that family resolved to (a substitute, or a fallback face). Now:
+  - Poppler side (pdfioutdev_gpl.cxx): before an embedded simple TrueType font's first
+    updateFont, a `fontCodeMap <fontID> <n> <unicode> <gid> ...` line carries the
+    Unicode -> glyph pairs for its 256 codes, from Poppler's own code -> GID map
+    (Gfx8BitFont::getCodeToGIDMap, the one it renders with) and the font's ToUnicode.
+    A PDF subset's own cmap is keyed by character codes, so the program cannot be used
+    as it is.
+  - Import side (wrapper.cxx): the program is rebuilt with a (3,1) format-4 cmap from
+    those pairs (every table offset and length checked against the buffer; TrueType
+    outlines only, 6 required tables, <= 64 tables, <= 64 MB) and registered through
+    EmbeddedFontsHelper::addEmbeddedFont under the family name the import writes. So
+    layout uses it, an editable output names the real family and embeds nothing (D5),
+    and the rights rule is the converter's one (D4 patch: PDF-only outputs 0/8/4,
+    editable outputs 0/8, no rights information = usable, Restricted alone never,
+    0x100 refuses PDF, 0x200 every output). The temp file name carries the program's
+    SHA-256 (WAF #594 F2), because addEmbeddedFont keeps an existing file unchecked and
+    the rights differ by output; with no hash backend the font is not used.
+  - Per document, the parse retains at most 256 programs and 128 MB (both copies
+    counted; WAF #594 F1); past either limit a font is not used, with a `[PDFFONT]`
+    line. The corpus's largest is 25 programs and 3.1 MB. Transient copies put the peak
+    at about 2-3x the figure; what outlives the document is bounded by the driver giving
+    each font-carrying document its own engine (#594 F3).
+  - Each program is first registered under an internal name of its own
+    ("<family> pdf<id>", rights checked there) and the import measures its ascent with
+    it, so the metric is the real face's; the document's text never names it.
+  - At the end of the parse (~Parser) each face's programs are MERGED into one font
+    (pdffont::mergeSubsets: union of the characters; glyf/loca/hmtx rebuilt, composite
+    components remapped, long loca, post format 3) when they are subsets of one font
+    (same unitsPerEm, identical fpgm/prep/cvt, identical glyphs for shared characters:
+    simple ones byte for byte, composites through their components), and registered under
+    the family name. The first program keeps its glyph ids, so a composite stored before
+    its components (Cairo's order) needs no remapping. Otherwise the program with the
+    most characters is used and the others' characters fall back to the D3 substitute,
+    never a box. Layout happens after the parse.
+  - CID TrueType (phase 2) and CFF programs (phase 3) are not passed yet: their code
+    map record is never written, so nothing changes for them.
+  - One `[PDFFONT]` line per font on stderr says what happened.
+  - Untrusted input: the tables' lengths may not add up to more than the program (so
+    overlapping entries cannot multiply its size), each program is parsed once, and the
+    shared-glyph comparison stops after 65535 proven pairs per program. A
+    program with no family name is not registered under the import's "Arial" fallback.
+    The end-of-parse registration runs from ~Parser and catches every exception.
+  - A family name containing # ? % is not used: addEmbeddedFont opens its temporary file
+    by URL, which osl refuses for # and ? (no corpus PDF has one).
+WASM only (#ifdef __EMSCRIPTEN__ on the import side; the Poppler record is only read by
+it). Routed to pdf-docx and pdf-pptx by the pdfimport-inline arm.
+
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+@@ -74,6 +74,8 @@ FILE* g_text_out = stdout;
+ //        because the internal poppler does not provide poppler-version.h and the macro always returns 0
+ #if POPPLER_CHECK_VERSION(0, 62, 0)
+ #include <UnicodeMapFuncs.h>
++#include <CharCodeToUnicode.h>
++#include <fofi/FoFiTrueType.h>
+ #elif POPPLER_CHECK_VERSION(0, 21, 1)
+ #include <UTF8.h>
+ #elif POPPLER_CHECK_VERSION(0, 21, 0)
+@@ -632,6 +634,48 @@ void PDFOutDev::writeFontFile( GfxFont* gfxFont ) const
+ #endif
+ }
+ 
++// D6: for an embedded simple TrueType font, the Unicode -> glyph pairs the import needs
++// to draw ITS OWN text with the embedded program. A PDF subset usually carries only a
++// (1,0) or (3,0) cmap keyed by the PDF's character codes, so the program cannot be
++// registered as it is. Built here from Poppler's own code -> GID map (the one it renders
++// with) and the font's ToUnicode, for all 256 codes; one text line, before the font's
++// first updateFont:
++//   fontCodeMap <fontID> <n> <unicode> <gid> ... (decimal, n <= 256)
++// Codes mapping to no glyph, to more than one character (ligatures) or to a control
++// character are left out: the import draws those through the substitute.
++void PDFOutDev::writeFontCodeMap( long long fontID, GfxFont* gfxFont ) const
++{
++    if( gfxFont->getType() != fontTrueType )
++        return;
++    std::optional<std::vector<unsigned char>> pBuf = gfxFont->readEmbFontFile( m_pDoc->getXRef() );
++    if( !pBuf || pBuf->empty() )
++        return;
++    std::unique_ptr<FoFiTrueType> pTT = FoFiTrueType::make( std::span<unsigned char>( pBuf->data(), pBuf->size() ), 0 );
++    if( !pTT )
++        return;
++    const std::vector<int> aCodeToGID = static_cast<Gfx8BitFont*>( gfxFont )->getCodeToGIDMap( pTT.get() );
++    const CharCodeToUnicode* pToUnicode = gfxFont->getToUnicode();
++    if( !pToUnicode )
++        return;
++    std::vector<std::pair<unsigned int, int>> aPairs;
++    for( size_t nCode = 0; nCode < 256 && nCode < aCodeToGID.size(); ++nCode )
++    {
++        const int nGID = aCodeToGID[nCode];
++        if( nGID <= 0 )
++            continue;
++        const Unicode* pU = nullptr;
++        if( pToUnicode->mapToUnicode( static_cast<CharCode>( nCode ), &pU ) != 1 || !pU || pU[0] < 0x20 )
++            continue;
++        aPairs.emplace_back( static_cast<unsigned int>( pU[0] ), nGID );
++    }
++    if( aPairs.empty() )
++        return;
++    printf( "fontCodeMap %lld %d", fontID, static_cast<int>( aPairs.size() ) );
++    for( const auto& rPair : aPairs )
++        printf( " %u %d", rPair.first, rPair.second );
++    printf( "\n" );
++}
++
+ #if POPPLER_CHECK_VERSION(0, 83, 0)
+ void PDFOutDev::printPath( const GfxPath* pPath )
+ #else
+@@ -1284,6 +1328,8 @@ void PDFOutDev::updateFont(GfxState *state)
+     {
+         nEmbedSize = parseFont( fontID, gfxFont, state );
+         it = m_aFontMap.find( fontID );
++        if( nEmbedSize )
++            writeFontCodeMap( fontID, gfxFont );   // D6: before the font's updateFont
+     }
+ 
+     printf( "updateFont" );
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
+@@ -327,6 +327,7 @@ namespace pdfi
+ 
+         int  parseFont( long long nNewId, GfxFont* pFont, const GfxState* state ) const;
+         void writeFontFile( GfxFont* gfxFont ) const;
++        void writeFontCodeMap( long long fontID, GfxFont* gfxFont ) const;
+ #if POPPLER_CHECK_VERSION(0, 83, 0)
+         static void printPath( const GfxPath* pPath );
+ #else
+--- a/sdext/source/pdfimport/wrapper/wrapper.cxx
++++ b/sdext/source/pdfimport/wrapper/wrapper.cxx
+@@ -55,6 +55,16 @@
+ #include <vcl/metric.hxx>
+ #include <vcl/font.hxx>
+ #include <vcl/virdev.hxx>
++#ifdef __EMSCRIPTEN__
++#include <comphelper/seqstream.hxx>
++#include <comphelper/hash.hxx>
++#include <vcl/embeddedfontshelper.hxx>
++#include <algorithm>
++#include <cstdint>
++#include <functional>
++#include <map>
++#include <set>
++#endif
+ 
+ #include <cstddef>
+ #include <memory>
+@@ -94,6 +104,7 @@ enum parseKey {
+     EOCLIPPATH,
+     EOFILLPATH,
+     FILLPATH,
++    FONTCODEMAP,
+     HYPERLINK,
+     INTERSECTCLIP,
+     INTERSECTEOCLIP,
+@@ -143,6 +154,441 @@ enum parseKey {
+ #pragma clang diagnostic pop
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++// ---------------------------------------------------------------------------------------
++// D6 (owner decisions 2026-10-18/19, docs/fonts/embedded-font-rights.md): a PDF's own
++// embedded TrueType fonts are used to lay out and draw its text. A PDF subset carries a
++// cmap keyed by the PDF's character codes, so each program is rebuilt with a Unicode cmap
++// from the code map the Poppler side sends (fontCodeMap); the subsets of one face are
++// merged into one font; it is registered under the family name the import writes, so
++// layout uses it, and an editable output names the real family and embeds nothing (D5).
++// Rights: EmbeddedFontsHelper::addEmbeddedFont applies the converter's rule (D4 patch).
++// The code below parses untrusted bytes: every read is bounds-checked (fuzzed natively
++// with ASan/UBSan, see the PR).
++// ---------------------------------------------------------------------------------------
++namespace pdffont
++{
++using Pairs = std::vector<std::pair<std::uint32_t, std::uint32_t>>; // unicode -> gid
++
++inline std::uint32_t get32(const std::uint8_t* p)
++{
++    return (std::uint32_t(p[0]) << 24) | (std::uint32_t(p[1]) << 16) | (std::uint32_t(p[2]) << 8) | p[3];
++}
++inline std::uint16_t get16(const std::uint8_t* p) { return std::uint16_t((p[0] << 8) | p[1]); }
++inline void put16(std::vector<std::uint8_t>& v, std::uint32_t x)
++{
++    v.push_back(std::uint8_t((x >> 8) & 0xff));
++    v.push_back(std::uint8_t(x & 0xff));
++}
++inline void put32(std::vector<std::uint8_t>& v, std::uint32_t x)
++{
++    put16(v, x >> 16);
++    put16(v, x & 0xffff);
++}
++inline void set16(std::vector<std::uint8_t>& v, std::size_t at, std::uint32_t x)
++{
++    if (at + 2 <= v.size()) { v[at] = std::uint8_t((x >> 8) & 0xff); v[at + 1] = std::uint8_t(x & 0xff); }
++}
++inline std::uint32_t checksum(const std::uint8_t* p, std::size_t n)
++{
++    std::uint32_t s = 0;
++    for (std::size_t i = 0; i < n; i += 4)
++    {
++        std::uint32_t w = 0;
++        for (std::size_t k = 0; k < 4; ++k)
++            w = (w << 8) | (i + k < n ? p[i + k] : 0);
++        s += w;
++    }
++    return s;
++}
++
++constexpr std::uint32_t TAG(char a, char b, char c, char d)
++{
++    return (std::uint32_t(std::uint8_t(a)) << 24) | (std::uint32_t(std::uint8_t(b)) << 16)
++           | (std::uint32_t(std::uint8_t(c)) << 8) | std::uint8_t(d);
++}
++
++struct Table
++{
++    std::uint32_t tag;
++    std::vector<std::uint8_t> data;
++};
++
++/** The tables of a TrueType-outline sfnt; false if it is not one or a bound fails. */
++inline bool readTables(const std::uint8_t* p, std::size_t n, std::map<std::uint32_t, std::vector<std::uint8_t>>& rOut)
++{
++    rOut.clear();
++    if (!p || n < 12 || n > 64 * 1024 * 1024)
++        return false;
++    const std::uint32_t v = get32(p);
++    if (v != 0x00010000 && v != TAG('t', 'r', 'u', 'e'))
++        return false;
++    const std::uint16_t nTables = get16(p + 4);
++    if (nTables == 0 || nTables > 64 || 12 + 16 * std::size_t(nTables) > n)
++        return false;
++    // Tables may not overlap beyond the buffer's size in total: 64 entries each claiming the
++    // whole buffer would otherwise copy 64 times its size.
++    std::size_t nTotal = 0;
++    for (std::uint16_t i = 0; i < nTables; ++i)
++    {
++        const std::uint8_t* r = p + 12 + 16 * std::size_t(i);
++        const std::uint32_t t = get32(r), off = get32(r + 8), len = get32(r + 12);
++        if (off > n || len > n - off)
++            return false;
++        nTotal += len;
++        if (nTotal > n)
++            return false;
++        rOut[t].assign(p + off, p + off + len);
++    }
++    for (std::uint32_t req : { TAG('g', 'l', 'y', 'f'), TAG('l', 'o', 'c', 'a'), TAG('h', 'e', 'a', 'd'),
++                               TAG('h', 'h', 'e', 'a'), TAG('h', 'm', 't', 'x'), TAG('m', 'a', 'x', 'p') })
++        if (!rOut.count(req))
++            return false;
++    if (rOut[TAG('h', 'e', 'a', 'd')].size() < 54 || rOut[TAG('m', 'a', 'x', 'p')].size() < 6
++        || rOut[TAG('h', 'h', 'e', 'a')].size() < 36)
++        return false;
++    return true;
++}
++
++/** A cmap table with one (3,1) format-4 subtable, one segment per character. */
++inline std::vector<std::uint8_t> unicodeCmap(Pairs aPairs, std::uint32_t nGlyphs)
++{
++    std::sort(aPairs.begin(), aPairs.end());
++    Pairs aMap;
++    for (const auto& r : aPairs)
++        if (r.first < 0xFFFF && r.second > 0 && r.second < nGlyphs && (aMap.empty() || aMap.back().first != r.first))
++            aMap.push_back(r);
++    std::vector<std::uint8_t> v;
++    if (aMap.empty() || aMap.size() > 8000)
++        return v;
++    const std::uint32_t nSeg = std::uint32_t(aMap.size()) + 1;
++    std::uint32_t nPow = 1, nLog = 0;
++    while (nPow * 2 <= nSeg) { nPow *= 2; ++nLog; }
++    put16(v, 0); put16(v, 1);
++    put16(v, 3); put16(v, 1); put32(v, 12);
++    const std::size_t nFmt = v.size();
++    put16(v, 4); put16(v, 0); put16(v, 0);
++    put16(v, nSeg * 2); put16(v, nPow * 2); put16(v, nLog); put16(v, nSeg * 2 - nPow * 2);
++    for (const auto& r : aMap) put16(v, r.first);
++    put16(v, 0xFFFF);
++    put16(v, 0);
++    for (const auto& r : aMap) put16(v, r.first);
++    put16(v, 0xFFFF);
++    for (const auto& r : aMap) put16(v, (r.second - r.first) & 0xFFFF);
++    put16(v, 1);
++    for (std::uint32_t i = 0; i < nSeg; ++i) put16(v, 0);
++    set16(v, nFmt + 2, std::uint32_t(v.size() - nFmt));
++    return v;
++}
++
++/** Serialize tables (sorted by tag) as an sfnt with version 1.0. */
++inline std::vector<std::uint8_t> writeSfnt(std::vector<Table> aTables)
++{
++    std::sort(aTables.begin(), aTables.end(), [](const Table& a, const Table& b) { return a.tag < b.tag; });
++    const std::uint32_t nT = std::uint32_t(aTables.size());
++    std::uint32_t nPow = 1, nLog = 0;
++    while (nPow * 2 <= nT) { nPow *= 2; ++nLog; }
++    std::vector<std::uint8_t> out;
++    put32(out, 0x00010000);
++    put16(out, nT); put16(out, nPow * 16); put16(out, nLog); put16(out, nT * 16 - nPow * 16);
++    std::size_t nOffset = 12 + 16 * std::size_t(nT);
++    for (const Table& t : aTables)
++    {
++        put32(out, t.tag);
++        put32(out, checksum(t.data.data(), t.data.size()));
++        put32(out, std::uint32_t(nOffset));
++        put32(out, std::uint32_t(t.data.size()));
++        nOffset += (t.data.size() + 3) & ~std::size_t(3);
++    }
++    for (const Table& t : aTables)
++    {
++        out.insert(out.end(), t.data.begin(), t.data.end());
++        while (out.size() % 4)
++            out.push_back(0);
++    }
++    return out;
++}
++
++/** Tables read by readTables, written out with the cmap replaced by a Unicode one built from rPairs. */
++inline bool withUnicodeCmap(const std::map<std::uint32_t, std::vector<std::uint8_t>>& t, const Pairs& rPairs,
++                            std::vector<std::uint8_t>& rOut)
++{
++    const std::uint32_t nGlyphs = get16(t.at(TAG('m', 'a', 'x', 'p')).data() + 4);
++    std::vector<std::uint8_t> aCmap = unicodeCmap(rPairs, nGlyphs);
++    if (nGlyphs == 0 || aCmap.empty())
++        return false;
++    std::vector<Table> aOut;
++    for (auto& r : t)
++        if (r.first != TAG('c', 'm', 'a', 'p'))
++            aOut.push_back({ r.first, r.second });
++    aOut.push_back({ TAG('c', 'm', 'a', 'p'), std::move(aCmap) });
++    rOut = writeSfnt(std::move(aOut));
++    return true;
++}
++
++/** The program with its cmap replaced by a Unicode one built from rPairs. */
++inline bool withUnicodeCmap(const std::uint8_t* p, std::size_t n, const Pairs& rPairs, std::vector<std::uint8_t>& rOut)
++{
++    std::map<std::uint32_t, std::vector<std::uint8_t>> t;
++    return readTables(p, n, t) && withUnicodeCmap(t, rPairs, rOut);
++}
++
++// ---- merging subsets of one font -----------------------------------------------------
++
++struct Program
++{
++    std::map<std::uint32_t, std::vector<std::uint8_t>> t;
++    Pairs pairs;
++    std::uint32_t nGlyphs = 0, nHMetrics = 0;
++    bool bLongLoca = false;
++
++    bool glyph(std::uint32_t g, const std::uint8_t*& rP, std::size_t& rN) const
++    {
++        const auto& loca = t.at(TAG('l', 'o', 'c', 'a'));
++        const auto& glyf = t.at(TAG('g', 'l', 'y', 'f'));
++        if (g >= nGlyphs)
++            return false;
++        std::size_t a, b;
++        if (bLongLoca)
++        {
++            if (4 * (std::size_t(g) + 2) > loca.size()) return false;
++            a = get32(loca.data() + 4 * g); b = get32(loca.data() + 4 * (g + 1));
++        }
++        else
++        {
++            if (2 * (std::size_t(g) + 2) > loca.size()) return false;
++            a = 2 * std::size_t(get16(loca.data() + 2 * g)); b = 2 * std::size_t(get16(loca.data() + 2 * (g + 1)));
++        }
++        if (a > b || b > glyf.size())
++            return false;
++        rP = glyf.data() + a;
++        rN = b - a;
++        return true;
++    }
++    void metric(std::uint32_t g, std::uint16_t& rAdv, std::uint16_t& rLsb) const
++    {
++        const auto& hmtx = t.at(TAG('h', 'm', 't', 'x'));
++        rAdv = 0; rLsb = 0;
++        const std::uint32_t nH = std::min<std::uint32_t>(nHMetrics, std::uint32_t(hmtx.size() / 4));
++        if (nH == 0)
++            return;
++        if (g < nH) { rAdv = get16(hmtx.data() + 4 * g); rLsb = get16(hmtx.data() + 4 * g + 2); return; }
++        rAdv = get16(hmtx.data() + 4 * (nH - 1));
++        const std::size_t at = 4 * std::size_t(nH) + 2 * std::size_t(g - nH);
++        if (at + 2 <= hmtx.size()) rLsb = get16(hmtx.data() + at);
++    }
++};
++
++inline bool loadProgram(const std::uint8_t* p, std::size_t n, const Pairs& rPairs, Program& rOut)
++{
++    if (!readTables(p, n, rOut.t))
++        return false;
++    rOut.pairs = rPairs;
++    rOut.nGlyphs = get16(rOut.t[TAG('m', 'a', 'x', 'p')].data() + 4);
++    rOut.nHMetrics = get16(rOut.t[TAG('h', 'h', 'e', 'a')].data() + 34);
++    rOut.bLongLoca = get16(rOut.t[TAG('h', 'e', 'a', 'd')].data() + 50) != 0;
++    return rOut.nGlyphs > 0;
++}
++
++/** Component glyph ids of a composite glyph, with their byte offsets; false if malformed. */
++inline bool components(const std::uint8_t* p, std::size_t n, std::vector<std::pair<std::size_t, std::uint16_t>>& rOut)
++{
++    rOut.clear();
++    if (n < 10 || std::int16_t(get16(p)) >= 0)
++        return true; // empty or simple
++    std::size_t at = 10;
++    for (int nGuard = 0; nGuard < 1024; ++nGuard)
++    {
++        if (at + 4 > n) return false;
++        const std::uint16_t flags = get16(p + at);
++        rOut.emplace_back(at + 2, get16(p + at + 2));
++        at += 4 + ((flags & 0x0001) ? 4 : 2);
++        if (flags & 0x0008) at += 2;
++        else if (flags & 0x0040) at += 4;
++        else if (flags & 0x0080) at += 8;
++        if (!(flags & 0x0020)) return at <= n;
++    }
++    return false;
++}
++
++/**
++ * Merge subsets of ONE font into one program: the union of their characters. Safe only
++ * when they are cut from the same font: same unitsPerEm, identical hinting programs, and
++ * an identical glyph for every character two of them share (simple glyphs compared
++ * byte for byte). false when it is not safe (the caller then uses one program alone).
++ */
++inline bool mergeSubsets(const std::vector<Program>& rProgs, std::vector<std::uint8_t>& rOut)
++{
++    if (rProgs.size() < 2 || rProgs.size() > 64)
++        return false;
++    const Program& p0 = rProgs[0];
++    const auto head0 = p0.t.at(TAG('h', 'e', 'a', 'd'));
++    for (const Program& p : rProgs)
++    {
++        if (get16(p.t.at(TAG('h', 'e', 'a', 'd')).data() + 18) != get16(head0.data() + 18))
++            return false; // unitsPerEm
++        for (std::uint32_t tag : { TAG('f', 'p', 'g', 'm'), TAG('p', 'r', 'e', 'p'), TAG('c', 'v', 't', ' ') })
++        {
++            const bool a = p.t.count(tag) != 0, b = p0.t.count(tag) != 0;
++            if (a != b || (a && p.t.at(tag) != p0.t.at(tag)))
++                return false;
++        }
++    }
++
++    std::vector<std::vector<std::uint8_t>> aGlyphs;  // merged glyph data
++    std::vector<std::pair<std::uint16_t, std::uint16_t>> aMetrics;
++    std::map<std::uint32_t, std::uint32_t> aCmap;     // unicode -> merged gid
++    std::vector<std::map<std::uint32_t, std::uint32_t>> aGidMap(rProgs.size());
++
++    // Copy glyph g of program k (and its components) into the merged font; its new id.
++    std::function<bool(std::size_t, std::uint32_t, std::uint32_t&, int)> add;
++    add = [&](std::size_t k, std::uint32_t g, std::uint32_t& rNew, int nDepth) -> bool {
++        auto it = aGidMap[k].find(g);
++        if (it != aGidMap[k].end()) { rNew = it->second; return true; }
++        if (nDepth > 16 || aGlyphs.size() >= 65535) return false;
++        const std::uint8_t* gp; std::size_t gn;
++        if (!rProgs[k].glyph(g, gp, gn)) return false;
++        std::vector<std::uint8_t> data(gp, gp + gn);
++        std::vector<std::pair<std::size_t, std::uint16_t>> comps;
++        if (!components(gp, gn, comps)) return false;
++        rNew = std::uint32_t(aGlyphs.size());
++        aGidMap[k][g] = rNew;
++        aGlyphs.emplace_back();
++        std::uint16_t adv, lsb;
++        rProgs[k].metric(g, adv, lsb);
++        aMetrics.emplace_back(adv, lsb);
++        for (const auto& c : comps)
++        {
++            std::uint32_t nc;
++            if (!add(k, c.second, nc, nDepth + 1)) return false;
++            set16(data, c.first, nc);
++        }
++        aGlyphs[rNew] = std::move(data);
++        return true;
++    };
++
++    // Program 0 keeps its glyph ids (glyph 0 is .notdef), so its composites keep their
++    // component ids as they are (a component may follow its composite); they must exist.
++    for (std::uint32_t g = 0; g < p0.nGlyphs; ++g)
++    {
++        const std::uint8_t* gp; std::size_t gn;
++        std::vector<std::pair<std::size_t, std::uint16_t>> comps;
++        if (!p0.glyph(g, gp, gn) || !components(gp, gn, comps)) return false;
++        for (const auto& c : comps)
++            if (c.second >= p0.nGlyphs) return false;
++        aGidMap[0][g] = g;
++        aGlyphs.emplace_back(gp, gp + gn);
++        std::uint16_t adv, lsb;
++        p0.metric(g, adv, lsb);
++        aMetrics.emplace_back(adv, lsb);
++    }
++
++    // Is glyph gk of program k the same outline as merged glyph gm? The bytes must be equal
++    // apart from component ids, and each component the same in turn (simple glyphs: byte for
++    // byte). A simple glyph never equals a composite one.
++    std::set<std::pair<std::uint32_t, std::uint32_t>> aSame; // (gk, gm) already shown equal, for this k
++    std::function<bool(std::size_t, std::uint32_t, std::uint32_t, int)> same;
++    same = [&](std::size_t k, std::uint32_t gk, std::uint32_t gm, int nDepth) -> bool {
++        if (aSame.count({ gk, gm })) return true;
++        // A real subset's glyph matches one merged glyph, so a program needs at most 65535
++        // proven pairs; more means hostile input built to make this comparison expensive.
++        if (nDepth > 16 || gm >= aGlyphs.size() || aSame.size() > 65535) return false;
++        const std::uint8_t* gp; std::size_t gn;
++        if (!rProgs[k].glyph(gk, gp, gn)) return false;
++        const std::vector<std::uint8_t>& have = aGlyphs[gm];
++        std::vector<std::pair<std::size_t, std::uint16_t>> ck, cm;
++        if (have.size() != gn || !components(gp, gn, ck) || !components(have.data(), have.size(), cm)
++            || ck.size() != cm.size())
++            return false;
++        std::vector<std::uint8_t> a(gp, gp + gn), b(have);
++        for (std::size_t i = 0; i < ck.size(); ++i)
++        {
++            if (ck[i].first != cm[i].first) return false;
++            set16(a, ck[i].first, 0);
++            set16(b, cm[i].first, 0);
++        }
++        if (a != b) return false;
++        for (std::size_t i = 0; i < ck.size(); ++i)
++            if (!same(k, ck[i].second, cm[i].second, nDepth + 1)) return false;
++        aSame.insert({ gk, gm });
++        return true;
++    };
++
++    for (const auto& r : p0.pairs)
++        if (r.second < p0.nGlyphs) aCmap.emplace(r.first, r.second);
++    for (std::size_t k = 1; k < rProgs.size(); ++k)
++    {
++        aSame.clear();
++        for (const auto& r : rProgs[k].pairs)
++        {
++            auto it = aCmap.find(r.first);
++            if (it != aCmap.end())
++            {
++                // Shared character: must be the same glyph.
++                if (!same(k, r.second, it->second, 0)) return false;
++                continue;
++            }
++            std::uint32_t nNew;
++            if (!add(k, r.second, nNew, 0)) return false;
++            aCmap.emplace(r.first, nNew);
++        }
++    }
++
++    const std::uint32_t N = std::uint32_t(aGlyphs.size());
++    std::vector<Table> aOut;
++    std::vector<std::uint8_t> glyf, loca, hmtx;
++    for (const auto& g : aGlyphs)
++    {
++        put32(loca, std::uint32_t(glyf.size()));
++        glyf.insert(glyf.end(), g.begin(), g.end());
++        while (glyf.size() % 4) glyf.push_back(0);
++    }
++    put32(loca, std::uint32_t(glyf.size()));
++    for (const auto& m : aMetrics) { put16(hmtx, m.first); put16(hmtx, m.second); }
++
++    std::vector<std::uint8_t> head = head0;
++    set16(head, 50, 1);                       // indexToLocFormat: long
++    head[8] = head[9] = head[10] = head[11] = 0; // checkSumAdjustment
++    std::vector<std::uint8_t> hhea = p0.t.at(TAG('h', 'h', 'e', 'a'));
++    set16(hhea, 34, N);
++    std::vector<std::uint8_t> maxp = p0.t.at(TAG('m', 'a', 'x', 'p'));
++    set16(maxp, 4, N);
++    if (maxp.size() >= 32) // version 1.0: the largest limits of all programs
++        for (std::size_t at = 6; at + 2 <= 32; at += 2)
++            for (const Program& p : rProgs)
++            {
++                const auto& m = p.t.at(TAG('m', 'a', 'x', 'p'));
++                if (m.size() >= at + 2 && get16(m.data() + at) > get16(maxp.data() + at))
++                    set16(maxp, at, get16(m.data() + at));
++            }
++    Pairs aPairs(aCmap.begin(), aCmap.end());
++    std::vector<std::uint8_t> cmap = unicodeCmap(aPairs, N);
++    if (cmap.empty())
++        return false;
++    std::vector<std::uint8_t> post;
++    if (p0.t.count(TAG('p', 'o', 's', 't')) && p0.t.at(TAG('p', 'o', 's', 't')).size() >= 32)
++    {
++        post.assign(p0.t.at(TAG('p', 'o', 's', 't')).begin(), p0.t.at(TAG('p', 'o', 's', 't')).begin() + 32);
++        post[0] = 0; post[1] = 3; post[2] = 0; post[3] = 0; // format 3.0: no glyph names
++    }
++    aOut.push_back({ TAG('h', 'e', 'a', 'd'), std::move(head) });
++    aOut.push_back({ TAG('h', 'h', 'e', 'a'), std::move(hhea) });
++    aOut.push_back({ TAG('m', 'a', 'x', 'p'), std::move(maxp) });
++    aOut.push_back({ TAG('h', 'm', 't', 'x'), std::move(hmtx) });
++    aOut.push_back({ TAG('l', 'o', 'c', 'a'), std::move(loca) });
++    aOut.push_back({ TAG('g', 'l', 'y', 'f'), std::move(glyf) });
++    aOut.push_back({ TAG('c', 'm', 'a', 'p'), std::move(cmap) });
++    if (!post.empty()) aOut.push_back({ TAG('p', 'o', 's', 't'), std::move(post) });
++    for (std::uint32_t tag : { TAG('n', 'a', 'm', 'e'), TAG('O', 'S', '/', '2'), TAG('f', 'p', 'g', 'm'),
++                               TAG('p', 'r', 'e', 'p'), TAG('c', 'v', 't', ' '), TAG('g', 'a', 's', 'p') })
++        if (p0.t.count(tag)) aOut.push_back({ tag, p0.t.at(tag) });
++    rOut = writeSfnt(std::move(aOut));
++    return true;
++}
++}
++
++#endif
++
+ class Parser
+ {
+     friend class LineParser;
+@@ -155,6 +601,31 @@ class Parser
+     const ContentSinkSharedPtr                   m_pSink;
+     const oslFileHandle                          m_pErr;
+     FontMapType                                  m_aFontMap;
++#ifdef __EMSCRIPTEN__
++    // D6: per font id, the Unicode -> glyph pairs from the fontCodeMap record; the
++    // family/style keys already registered; the helper that registers them.
++    std::unordered_map<sal_Int64, pdffont::Pairs> m_aFontCodeMaps;
++    // One entry per face (family, weight, italic), in first-seen order: its programs and
++    // their rebuilt bytes, registered under the family name when the parse ends.
++    struct PdfFace
++    {
++        OUString aFamily;
++        std::vector<pdffont::Program> aPrograms;
++        std::vector<std::vector<std::uint8_t>> aRebuilt;
++    };
++    std::vector<OUString> m_aFaceOrder;
++    std::unordered_map<OUString, PdfFace> m_aFaces;
++    EmbeddedFontsHelper m_aEmbeddedFonts;
++    // Per-document bound on what the parse retains (WAF #594 F1): each accepted program
++    // is held twice (parsed and rebuilt) until the parse ends, and compressed streams let
++    // a small PDF carry many large ones. Past either limit a font is not used. This bounds
++    // the retained copies; the transient ones (the input sequence, the temp file, FreeType's
++    // copy, a merge) put the peak at about 2-3x the figure. What outlives the document (its
++    // temp files) is bounded by the driver's one-document-per-engine rule (#594 F3).
++    size_t m_nFontProgramsRetained = 0;
++    size_t m_nFontBytesRetained = 0;
++    void finishEmbeddedFonts();
++#endif
+ 
+ public:
+     Parser( const ContentSinkSharedPtr&                   rSink,
+@@ -167,6 +638,21 @@ public:
+     {}
+ 
+     void parseLine( std::string_view aLine );
++#ifdef __EMSCRIPTEN__
++    // A destructor must not throw (addEmbeddedFont reads a UNO stream, activateFonts
++    // rebuilds the font list): a failure leaves the text in its substitute.
++    ~Parser()
++    {
++        try
++        {
++            finishEmbeddedFonts();
++        }
++        catch (...)
++        {
++            fprintf(stderr, "[PDFFONT] registering the merged fonts failed; the text keeps its substitutes\n");
++        }
++    }
++#endif
+ };
+ 
+ class LineParser {
+@@ -199,6 +685,11 @@ public:
+     void                 readTransformation();
+     rendering::ARGBColor readColor();
+     void                 readFont();
++#ifdef __EMSCRIPTEN__
++    void                 readFontCodeMap();
++    OUString             registerEmbeddedFont( const uno::Sequence<sal_Int8>& rFile, sal_Int64 nFontID,
++                                               const FontAttributes& rFont );
++#endif
+ 
+     void                 readImage();
+     void                 readMask();
+@@ -620,9 +1111,10 @@ void LineParser::readFont()
+        determine the font attributes from the font name.
+     3. If all these attempts have failed, then use a fallback font.
+     */
++    uno::Sequence<sal_Int8> aFontFile;
+     if (nFileLen > 0)
+     {
+-        uno::Sequence<sal_Int8> aFontFile(nFileLen);
++        aFontFile.realloc(nFileLen);
+         readBinaryData(aFontFile);  // Read fontFile.
+ 
+         vcl::Font aFontReadResult = vcl::Font::identifyFont(aFontFile.getArray(), nFileLen);
+@@ -682,6 +1174,11 @@ void LineParser::readFont()
+         parseFontFamilyName(aResult);
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    // D6: a program with no family name of its own is not registered under the fallback
++    // name below, where it would share a face with a real Arial subset.
++    const bool bNoFamilyName = aResult.familyName.isEmpty();
++#endif
+     // last fallback
+     if (aResult.familyName.isEmpty())
+     {
+@@ -689,10 +1186,25 @@ void LineParser::readFont()
+         aResult.familyName = "Arial";
+     }
+ 
++    OUString aMeasureFamily = aResult.familyName;
++#ifdef __EMSCRIPTEN__
++    // D6: the embedded program is registered under an internal name of its own, used only
++    // to measure the ascent below (the document's text never names it), so the metric is
++    // the real face's even before the face's subsets are merged at the end of the parse.
++    if (aFontFile.hasElements() && bNoFamilyName)
++        fprintf(stderr, "[PDFFONT] (font %lld): not used (no family name)\n", static_cast<long long>(nFontID));
++    else if (aFontFile.hasElements())
++    {
++        const OUString aOwn = registerEmbeddedFont(aFontFile, nFontID, aResult);
++        if (!aOwn.isEmpty())
++            aMeasureFamily = aOwn;
++    }
++#endif
++
+     if (!m_parser.m_xDev)
+         m_parser.m_xDev.disposeAndReset(VclPtr<VirtualDevice>::Create());
+ 
+-    vcl::Font font(aResult.familyName, Size(0, 1000));
++    vcl::Font font(aMeasureFamily, Size(0, 1000));
+     m_parser.m_xDev->SetFont(font);
+     FontMetric metric(m_parser.m_xDev->GetFontMetric());
+     aResult.ascent = metric.GetAscent() / 1000.0;
+@@ -703,6 +1215,172 @@ void LineParser::readFont()
+     m_parser.m_pSink->setFont(aResult);
+ }
+ 
++#ifdef __EMSCRIPTEN__
++void LineParser::readFontCodeMap()
++{
++    // fontCodeMap <fontID> <n> <unicode> <gid> ...   (pdfioutdev_gpl.cxx writeFontCodeMap)
++    sal_Int64 nFontID = 0;
++    sal_Int32 nCount = 0;
++    readInt64(nFontID);
++    readInt32(nCount);
++    pdffont::Pairs aPairs;
++    if (nCount < 0 || nCount > 256)
++        return;
++    aPairs.reserve(nCount);
++    for (sal_Int32 i = 0; i < nCount && m_nCharIndex != std::string_view::npos; ++i)
++    {
++        sal_Int32 nUnicode = 0, nGID = 0;
++        readInt32(nUnicode);
++        readInt32(nGID);
++        if (nUnicode > 0 && nGID > 0)
++            aPairs.emplace_back(sal_uInt32(nUnicode), sal_uInt32(nGID));
++    }
++    m_parser.m_aFontCodeMaps[nFontID] = std::move(aPairs);
++}
++
++// addEmbeddedFont names the temporary file after the font and opens it by file URL, which
++// osl refuses when it contains '?' or '#' (sal/osl/unx/file_url.cxx), and '%' would be
++// read as an escape. Such a family is not registered.
++static bool lcl_canNameTempFont(std::u16string_view aFamily)
++{
++    return aFamily.find_first_of(u"#?%") == std::u16string_view::npos;
++}
++
++// The corpus's largest is 25 programs and 3.1 MB in one PDF (2026-10-23, 61 fixture PDFs).
++constexpr size_t kMaxDocFontPrograms = 256;
++constexpr size_t kMaxDocFontBytes = 128 * 1024 * 1024;   // both copies counted
++
++// The temporary file's name carries the program's SHA-256 (WAF #594 F2): addEmbeddedFont
++// keeps an existing file unchecked, and rights differ by output, so a file from another
++// document or another program must never match. Same name now means same bytes; the same
++// bytes under another document's rights never meet in one engine, because the driver gives
++// every document that may carry fonts its own engine (#594 F3; the MCP runs one engine
++// process per attempt).
++// Empty when no hash backend is built in (comphelper then returns zeros): fail closed.
++static OUString lcl_contentTag(const std::vector<std::uint8_t>& rProgram)
++{
++    const std::vector<unsigned char> aHash = comphelper::Hash::calculateHash(
++        rProgram.data(), rProgram.size(), comphelper::HashType::SHA256);
++    if (std::all_of(aHash.begin(), aHash.end(), [](unsigned char c) { return c == 0; }))
++        return OUString();
++    return "-pdf" + OUString::fromUtf8(comphelper::hashToString(aHash));
++}
++
++OUString LineParser::registerEmbeddedFont( const uno::Sequence<sal_Int8>& rFile, sal_Int64 nFontID,
++                                           const FontAttributes& rFont )
++{
++    const OString aName = OUStringToOString(rFont.familyName, RTL_TEXTENCODING_UTF8);
++    if (!lcl_canNameTempFont(rFont.familyName))
++    {
++        fprintf(stderr, "[PDFFONT] %s: not used (the family name cannot name a temporary file)\n", aName.getStr());
++        return OUString();
++    }
++    const size_t nLength = rFile.getLength() > 0 ? size_t(rFile.getLength()) : 0;
++    // Written so nothing wraps: the rebuilt copy can be a little larger than the input, so
++    // the retained total may pass the limit by that margin before the next check.
++    if (m_parser.m_nFontProgramsRetained >= kMaxDocFontPrograms
++        || m_parser.m_nFontBytesRetained >= kMaxDocFontBytes
++        || nLength > (kMaxDocFontBytes - m_parser.m_nFontBytesRetained) / 2)
++    {
++        fprintf(stderr, "[PDFFONT] %s: not used (this document's embedded fonts exceed the limit of %zu "
++                        "programs or %zu MB)\n", aName.getStr(), kMaxDocFontPrograms, kMaxDocFontBytes >> 20);
++        return OUString();
++    }
++    const auto it = m_parser.m_aFontCodeMaps.find(nFontID);
++    if (it == m_parser.m_aFontCodeMaps.end())
++    {
++        fprintf(stderr, "[PDFFONT] %s: not used (not a simple TrueType font with a code map)\n", aName.getStr());
++        return OUString();
++    }
++    const auto* pData = reinterpret_cast<const std::uint8_t*>(rFile.getConstArray());
++    std::vector<std::uint8_t> aRebuilt;
++    pdffont::Program aProgram;
++    if (!pdffont::loadProgram(pData, rFile.getLength(), it->second, aProgram)
++        || !pdffont::withUnicodeCmap(aProgram.t, it->second, aRebuilt))
++    {
++        fprintf(stderr, "[PDFFONT] %s: not used (not a well-formed TrueType program)\n", aName.getStr());
++        return OUString();
++    }
++    // Registered under its own name first: that checks its rights (addEmbeddedFont, the
++    // converter's rule) and gives the import the real face's metrics.
++    const OUString aOwn = rFont.familyName + " pdf" + OUString::number(nFontID);
++    uno::Reference<io::XInputStream> xIn(new comphelper::SequenceInputStream(
++        uno::Sequence<sal_Int8>(reinterpret_cast<const sal_Int8*>(aRebuilt.data()), aRebuilt.size())));
++    const OUString aExtra = lcl_contentTag(aRebuilt);
++    if (aExtra.isEmpty())
++    {
++        fprintf(stderr, "[PDFFONT] %s: not used (no content hash for its temporary file)\n", aName.getStr());
++        return OUString();
++    }
++    if (!m_parser.m_aEmbeddedFonts.addEmbeddedFont(xIn, aOwn, aExtra, {}, false, false))
++    {
++        fprintf(stderr, "[PDFFONT] %s: not used (its rights do not allow this output, or its temporary file failed)\n",
++                aName.getStr());
++        return OUString();
++    }
++    m_parser.m_aEmbeddedFonts.activateFonts();
++    const OUString aKey = rFont.familyName + "|" + rFont.fontWeight
++                          + (rFont.isItalic ? std::u16string_view(u"|i") : std::u16string_view(u"|"));
++    auto& rFace = m_parser.m_aFaces[aKey];
++    if (rFace.aPrograms.empty())
++    {
++        rFace.aFamily = rFont.familyName;
++        m_parser.m_aFaceOrder.push_back(aKey);
++    }
++    m_parser.m_nFontProgramsRetained += 1;
++    m_parser.m_nFontBytesRetained += nLength + aRebuilt.size();
++    rFace.aPrograms.push_back(std::move(aProgram));
++    rFace.aRebuilt.push_back(std::move(aRebuilt));
++    return aOwn;
++}
++
++void Parser::finishEmbeddedFonts()
++{
++    // Each face's programs, merged when they are subsets of one font, registered under
++    // the family name the document's text uses. Layout happens after the parse.
++    for (const OUString& rKey : m_aFaceOrder)
++    {
++        PdfFace& rFace = m_aFaces[rKey];
++        const OString aName = OUStringToOString(rFace.aFamily, RTL_TEXTENCODING_UTF8);
++        std::vector<std::uint8_t> aMerged;
++        const std::vector<std::uint8_t>* pUse = &rFace.aRebuilt[0];
++        if (rFace.aPrograms.size() > 1)
++        {
++            if (pdffont::mergeSubsets(rFace.aPrograms, aMerged))
++            {
++                pUse = &aMerged;
++                fprintf(stderr, "[PDFFONT] %s: %zu subsets merged\n", aName.getStr(), rFace.aPrograms.size());
++            }
++            else
++            {
++                // Not subsets of one font: the program with the most characters; the
++                // others' characters fall back to the substitute (never a box).
++                size_t nBest = 0;
++                for (size_t i = 1; i < rFace.aPrograms.size(); ++i)
++                    if (rFace.aPrograms[i].pairs.size() > rFace.aPrograms[nBest].pairs.size())
++                        nBest = i;
++                pUse = &rFace.aRebuilt[nBest];
++                fprintf(stderr, "[PDFFONT] %s: %zu programs not merged (not one font); the largest is used\n",
++                        aName.getStr(), rFace.aPrograms.size());
++            }
++        }
++        uno::Reference<io::XInputStream> xIn(new comphelper::SequenceInputStream(
++            uno::Sequence<sal_Int8>(reinterpret_cast<const sal_Int8*>(pUse->data()), pUse->size())));
++        const OUString aExtra = lcl_contentTag(*pUse);
++        if (!aExtra.isEmpty() && m_aEmbeddedFonts.addEmbeddedFont(xIn, rFace.aFamily, aExtra, {}, false, false))
++            fprintf(stderr, "[PDFFONT] %s: embedded program used\n", aName.getStr());
++        else
++            fprintf(stderr, "[PDFFONT] %s: not used (its rights do not allow this output, or its temporary file failed)\n",
++                    aName.getStr());
++    }
++    m_aEmbeddedFonts.activateFonts();
++    m_aFaceOrder.clear();
++    m_aFaces.clear();
++    m_nFontProgramsRetained = 0;
++    m_nFontBytesRetained = 0;
++}
++#endif
++
+ uno::Sequence<beans::PropertyValue> LineParser::readImageImpl()
+ {
+     std::string_view aToken = readNextToken();
+@@ -940,6 +1618,10 @@ void Parser::parseLine( std::string_view aLine )
+             m_pSink->eoFillPath(lp.readPath()); break;
+         case FILLPATH:
+             m_pSink->fillPath(lp.readPath()); break;
++#ifdef __EMSCRIPTEN__
++        case FONTCODEMAP:
++            lp.readFontCodeMap(); break;
++#endif
+         case RESTORESTATE:
+             m_pSink->popState(); break;
+         case SAVESTATE:
+--- a/sdext/source/pdfimport/wrapper/keyword_list
++++ b/sdext/source/pdfimport/wrapper/keyword_list
+@@ -20,6 +20,7 @@ endTextObject,ENDTEXTOBJECT
+ eoClipPath,EOCLIPPATH
+ eoFillPath,EOFILLPATH
+ fillPath,FILLPATH
++fontCodeMap,FONTCODEMAP
+ hyperLink,HYPERLINK
+ intersectClip,INTERSECTCLIP
+ intersectEoClip,INTERSECTEOCLIP
