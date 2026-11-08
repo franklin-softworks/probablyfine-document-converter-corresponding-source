@@ -1,0 +1,210 @@
+From: Claude <claude@anthropic.com>
+Subject: [PATCH] WASM: stop formatting when EditEngine auto-splits an oversized paragraph
+
+BUG-26. ImpEditEngine::ImpInsertText caps a paragraph at MAXCHARSINPARA
+(0x3FFF - CHARPOSGROW = 16367; editeng/source/editeng/impedit.hxx:84) and pushes
+the remainder into a NEW paragraph. That break is a text POSITION with no
+counterpart in the source string, so the WASM insert-then-format loops -- which
+advance a cursor by SOURCE lengths -- fall one position behind per split and
+format every later run over the wrong characters.
+
+Measured on a purpose-built fixture (a paragraph of N 'a' followed by a
+10-character run styled 40pt bold red, PPTX -> ODP):
+
+    17,000 chars (1 split):   <text:span T2>aZZMARKERZ</text:span>Z
+    34,000 chars (2 splits):  <text:span T2>aaZZMARKER</text:span>ZZ
+
+The styled window slides left by exactly the number of splits. No text is lost --
+this is purely formatting landing on the wrong characters, which is why it had
+never been noticed.
+
+The split point cannot be predicted without reimplementing EditEngine's backward
+word-break search (impedit2.cxx:2802-2858), which hunts up to 84 characters for a
+non-alphanumeric break with special cases for hyphen-minus before a digit and for
+NBSP/NNBSP/ZWNBSP. Duplicating that here would be upstream logic able to drift
+silently.
+
+So: format the runs provably BEFORE any possible split, then stop for the whole
+text body -- the drift carries across paragraph boundaries, so continuing would
+mis-format later paragraphs too. 16367-84 is the earliest position EditEngine
+could choose. Everything already inserted stays; only character formatting is
+skipped, and only from the first run that could straddle a split. SAL_WARN names
+the paragraph length and the run index.
+
+Applied to both loops (shape.cxx and table/tablecell.cxx), which have the same
+defect.
+
+--- a/oox/source/drawingml/shape.cxx
++++ b/oox/source/drawingml/shape.cxx
+@@ -2464,6 +2464,11 @@
+                         {
+                             xCursor->gotoStart(false);
+ 
++                            // BUG-26: set when an oversized paragraph makes the
++                            // cursor arithmetic untrackable; see the comment at the
++                            // run loop. Formatting stops for the WHOLE text body,
++                            // because the drift carries across paragraph boundaries.
++                            bool bFormattingAbandoned = false;
+                             for (size_t iPara = 0; iPara < rParagraphs.size(); ++iPara)
+                             {
+                                 const auto& paragraph = rParagraphs[iPara];
+@@ -2647,10 +2652,74 @@
+                                         "WASM: paragraph properties not applied");
+                                 }
+ 
++                                // BUG-26 — EditEngine silently splits an oversized
++                                // paragraph, and this loop's cursor arithmetic cannot
++                                // survive it.
++                                //
++                                // ImpEditEngine::ImpInsertText caps a paragraph at
++                                // MAXCHARSINPARA (0x3FFF - CHARPOSGROW = 16367,
++                                // editeng/source/editeng/impedit.hxx:84) and pushes the
++                                // remainder into a NEW paragraph. That break is a text
++                                // POSITION with no counterpart in the source string, so
++                                // this pass — which advances by SOURCE lengths — falls
++                                // one position behind per split and formats every later
++                                // run over the wrong characters.
++                                //
++                                // Measured on a purpose-built fixture, converting a
++                                // paragraph of N 'a' followed by a 10-character run
++                                // styled 40pt bold red:
++                                //     17,000 chars (1 split): <span>aZZMARKERZ</span>Z
++                                //     34,000 chars (2 splits): <span>aaZZMARKER</span>ZZ
++                                // i.e. the styled window slides left by exactly the
++                                // number of splits. No text is lost — this is purely
++                                // formatting landing on the wrong characters, which is
++                                // why it had never been noticed.
++                                //
++                                // Predicting the split count is NOT viable: EditEngine
++                                // walks backward up to 84 characters hunting a
++                                // non-alphanumeric break, with special cases for
++                                // hyphen-minus before a digit and for NBSP/NNBSP/ZWNBSP
++                                // (impedit2.cxx:2802-2858). Reimplementing that here
++                                // would duplicate upstream logic that can drift silently.
++                                //
++                                // So: format the runs that are provably BEFORE any
++                                // possible split, then stop. Everything already inserted
++                                // stays; only character formatting is skipped, and only
++                                // from the first run that could straddle a split. That is
++                                // strictly better than both silent misattribution and
++                                // dropping formatting for the whole shape.
++                                //
++                                // 16367 - 84 is the earliest position EditEngine could
++                                // choose to break at, so a run ending at or before it
++                                // cannot be affected.
++                                const sal_Int32 nEditEngineParaLimit = 16367 - 84;
++                                sal_Int32 nParaSourceChars = 0;
++                                for (const auto& rRunLen : rRuns)
++                                    nParaSourceChars += rRunLen->getText().getLength();
++                                const bool bParaWillSplit = nParaSourceChars > 16367;
++                                sal_Int32 nRunOffset = 0;
++
+                                 for (size_t iRun = 0; iRun < rRuns.size(); ++iRun)
+                                 {
+                                     const auto& run = rRuns[iRun];
+ 
++                                    if (bParaWillSplit)
++                                    {
++                                        nRunOffset += run->getText().getLength();
++                                        if (nRunOffset > nEditEngineParaLimit)
++                                        {
++                                            SAL_WARN("oox.drawingml",
++                                                "WASM: paragraph of " << nParaSourceChars
++                                                << " chars exceeds EditEngine's " << 16367
++                                                << "-char limit; it will be auto-split and the"
++                                                   " formatting cursor cannot track it. Character"
++                                                   " formatting skipped from run " << iRun
++                                                << " of this text body (BUG-26). Text is intact.");
++                                            bFormattingAbandoned = true;
++                                            break;
++                                        }
++                                    }
++
+                                     const RunFieldKind eFieldKind
+                                         = (iRun < aRunFieldKind[iPara].size())
+                                               ? aRunFieldKind[iPara][iRun]
+@@ -2953,6 +3022,12 @@
+                                         }
+                                     }
+                                 }
++                                // Once abandoned, every later position is unknown —
++                                // including the paragraph break below, whose count is
++                                // exactly what the split changed. Stop entirely.
++                                if (bFormattingAbandoned)
++                                    break;
++
+                                 // Skip the newline if not last paragraph
+                                 if (iPara < rParagraphs.size() - 1)
+                                     xCursor->goRight(1, false);
+--- a/oox/source/drawingml/table/tablecell.cxx
++++ b/oox/source/drawingml/table/tablecell.cxx
+@@ -723,6 +723,10 @@
+             {
+                 xCursor->gotoStart(false);
+ 
++                // BUG-26: see the run loop below. Drift from an EditEngine
++                // auto-split carries across paragraphs, so formatting stops for
++                // the whole cell once it can no longer be tracked.
++                bool bFormattingAbandoned = false;
+                 for (size_t iPara = 0; iPara < rParagraphs.size(); ++iPara)
+                 {
+                     const auto& paragraph = rParagraphs[iPara];
+@@ -887,10 +891,46 @@
+                                              "WASM: cell paragraph properties not applied");
+                     }
+ 
++                    // BUG-26 — EditEngine silently splits a paragraph longer than
++                    // MAXCHARSINPARA (16367, editeng impedit.hxx:84), pushing the
++                    // remainder into a NEW paragraph. That break is a text POSITION with
++                    // no counterpart in the source string, so this pass — which advances
++                    // by SOURCE lengths — falls one position behind per split and formats
++                    // every later run over the wrong characters. Measured: a 17,000-char
++                    // paragraph shifts the next run's styling left by 1, a 34,000-char one
++                    // by 2. No text is lost; only formatting lands wrongly.
++                    //
++                    // The split point cannot be predicted without reimplementing
++                    // EditEngine's backward word-break search (impedit2.cxx:2802-2858), so
++                    // instead: format the runs provably BEFORE any possible split, then
++                    // stop. 16367-84 is the earliest position it could break at.
++                    const sal_Int32 nEditEngineParaLimit = 16367 - 84;
++                    sal_Int32 nParaSourceChars = 0;
++                    for (const auto& rRunLen : rRuns)
++                        nParaSourceChars += rRunLen->getText().getLength();
++                    const bool bParaWillSplit = nParaSourceChars > 16367;
++                    sal_Int32 nRunOffset = 0;
++
+                     for (size_t iRun = 0; iRun < rRuns.size(); ++iRun)
+                     {
+                         const auto& run = rRuns[iRun];
+ 
++                        if (bParaWillSplit)
++                        {
++                            nRunOffset += run->getText().getLength();
++                            if (nRunOffset > nEditEngineParaLimit)
++                            {
++                                SAL_WARN("oox.drawingml",
++                                    "WASM: table cell paragraph of " << nParaSourceChars
++                                    << " chars exceeds EditEngine's 16367-char limit; it will be"
++                                       " auto-split and the formatting cursor cannot track it."
++                                       " Character formatting skipped from run " << iRun
++                                    << " of this cell (BUG-26). Text is intact.");
++                                bFormattingAbandoned = true;
++                                break;
++                            }
++                        }
++
+                         // Style, then the run's own, then endParaRPr where n#759180
+                         // says it applies. Was default-constructed; see above.
+                         TextCharacterProperties aRunProps(aEffectiveRunProps(iRun));
+@@ -1054,6 +1094,11 @@
+                             }
+                         }
+                     }
++                    // Once abandoned every later position is unknown, including the
++                    // paragraph break below. Stop entirely.
++                    if (bFormattingAbandoned)
++                        break;
++
+                     // Skip the newline if not last paragraph
+                     if (iPara < rParagraphs.size() - 1)
+                         xCursor->goRight(1, false);
