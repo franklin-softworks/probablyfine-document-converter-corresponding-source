@@ -1,0 +1,43 @@
+{
+  "_comment": [
+    "THE UPSTREAM LibreOffice THIS PROJECT PATCHES. This file is the DECLARATION;",
+    "libreoffice/ is a gitignored working tree and is not evidence of anything.",
+    "",
+    "Two things depend on this being correct and neither tolerates a guess:",
+    "  1. Reproducibility -- engine/patches/*.patch apply to THIS commit. A different",
+    "     upstream may apply cleanly and still produce different bytes.",
+    "  2. Licence compliance -- MPL-2.0 / LGPLv3+ require Corresponding Source for the",
+    "     soffice.wasm we convey. 'Corresponding' means THIS commit plus our patches;",
+    "     naming the wrong one does not discharge the obligation. See",
+    "     docs/deployment/02-legal-sequence.md 1b.",
+    "",
+    "To move to a new upstream: update commit/version/branch/describe/commit_date",
+    "and download_lst_sha256 together, re-apply the patch series, and rebuild. Do",
+    "not edit one field alone.",
+    "",
+    "download_lst_sha256 is the SHA-256 of LibreOffice's download.lst AT that commit",
+    "(git show <commit>:download.lst | sha256sum). The library source index is a",
+    "function of that file; infra/cicd/fetch_download_lst.py refuses any other bytes,",
+    "so a bad mirror answer cannot change the set of archives the index lists."
+  ],
+
+  "project": "LibreOffice core",
+  "repository": "https://github.com/LibreOffice/core.git",
+  "mirror": "https://git.libreoffice.org/core",
+
+  "commit": "30742500f2d3eb4366ac312fa33d3dcabdb3eba5",
+  "version": "25.8.7.3",
+  "branch": "libreoffice-25-8-7",
+  "describe": "libreoffice-25.8.7.3-0-g30742500f2d3",
+  "commit_date": "2026-05-08T13:48:49+02:00",
+  "download_lst_sha256": "d7bdc873f4a4c53009341d8be1cd164d756f5c3c8e881fbcd5ff67cf54cbfd9a",
+
+  "declared_on": "2026-10-18",
+  "declared_from": "tag libreoffice-25.8.7.3 (annotated, PGP-signed by the LibreOffice Build Team code-signing key C2839ECAD9408FBE9531C3E9F434A1EFAFEEAEA3; signature verified 2026-10-18); re-pinned from 806d09e511ad82dc6c4b801b9ce9ee83cd201ed2 (an ancestor, 134 commits earlier on libreoffice-25-8)",
+
+  "clone": [
+    "git clone https://github.com/LibreOffice/core.git libreoffice",
+    "git -C libreoffice checkout 30742500f2d3eb4366ac312fa33d3dcabdb3eba5",
+    "./engine/scripts/apply_patches.sh"
+  ]
+}
