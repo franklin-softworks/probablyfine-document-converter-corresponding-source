@@ -1,0 +1,42 @@
+diff --git a/sc/source/filter/oox/excelfilter.cxx b/sc/source/filter/oox/excelfilter.cxx
+index 01a25bd7e87d..6ced0880ae76 100644
+--- a/sc/source/filter/oox/excelfilter.cxx
++++ b/sc/source/filter/oox/excelfilter.cxx
+@@ -22,6 +22,9 @@
+ #include <com/sun/star/sheet/XSpreadsheetDocument.hpp>
+ #include <osl/diagnose.h>
+ #include <sal/log.hxx>
++#ifdef __EMSCRIPTEN__
++#include <iostream>
++#endif
+ 
+ #include <excelvbaproject.hxx>
+ #include <stylesbuffer.hxx>
+@@ -111,7 +114,13 @@ bool ExcelFilter::importDocument()
+             assert( pDocSh );
+             pDocSh->SetInitialLinkUpdate( pDocSh->GetMedium());
+ 
++#ifdef __EMSCRIPTEN__
++            std::cerr << "[EXCEL_FILTER] About to call importFragment..." << std::endl;
++#endif
+             bool bRet = importFragment( xWorkbookFragment);
++#ifdef __EMSCRIPTEN__
++            std::cerr << "[EXCEL_FILTER] importFragment returned " << bRet << std::endl;
++#endif
+             if (bRet && !pDocSh->GetErrorCode())
+             {
+                 const AddressConverter& rAC = xWorkbookFragment->getAddressConverter();
+@@ -122,7 +131,13 @@ bool ExcelFilter::importDocument()
+                 else if (rAC.isRowOverflow())
+                     pDocSh->SetError(SCWARN_IMPORT_ROW_OVERFLOW);
+             }
++#ifdef __EMSCRIPTEN__
++            std::cerr << "[EXCEL_FILTER] About to SetImportingXLSX(false)..." << std::endl;
++#endif
+             rDoc.SetImportingXLSX(false);
++#ifdef __EMSCRIPTEN__
++            std::cerr << "[EXCEL_FILTER] About to return (destructors will run)..." << std::endl;
++#endif
+             return bRet;
+         }
+     }
