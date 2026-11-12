@@ -1,0 +1,68 @@
+diff --git a/external/libwps/UnpackedTarball_libwps.mk b/external/libwps/UnpackedTarball_libwps.mk
+index de2e204..7556417 100644
+--- a/external/libwps/UnpackedTarball_libwps.mk
++++ b/external/libwps/UnpackedTarball_libwps.mk
+@@ -19,6 +19,7 @@ $(eval $(call gb_UnpackedTarball_add_patches,libwps,\
+ 	$(if $(SYSTEM_REVENGE),,external/libwps/rpath.patch.0) \
+ 	external/libwps/libtool.patch.0 \
+ 	external/libwps/enumarith.patch \
++	external/libwps/wks-date-time-range-guard-wasm.patch.1 \
+ ))
+ 
+ ifneq ($(OS),MACOSX)
+diff --git a/external/libwps/wks-date-time-range-guard-wasm.patch.1 b/external/libwps/wks-date-time-range-guard-wasm.patch.1
+new file mode 100644
+index 0000000..9fd6135
+--- /dev/null
++++ b/external/libwps/wks-date-time-range-guard-wasm.patch.1
+@@ -0,0 +1,50 @@
++Range-check the double before libwps converts it to an integer (dates and times of a spreadsheet cell).
++
++WKSContentListener::CellContent::double2Date() does `long(val-2+0.4)` and only then tests the result for
++a plausible range ("checkme: do we need to check before for isNan(val)?"). The value is whatever the file
++stores in a cell the file formats as a date. A NaN or a double beyond the range of long makes that conversion
++undefined behaviour in C++ (reported by UBSan -fsanitize=float-cast-overflow on the WKS fuzz target, line 1412
++of the bundled copy). double2Time() has the same hole for a NaN: `val < 0.0 || val > 1.0` is false for NaN,
++so the NaN reaches int(time/3600.).
++MEASURED, not assumed: in this engine's WebAssembly build the conversion does NOT trap. Crafted Lotus-format
++files with a date cell holding NaN, +Inf, 1e300 or 3e9 and a time cell holding NaN convert, byte-identical
++before and after this change (the cell reads as the zero date). The change removes the undefined behaviour;
++it fixes no crash in the shipped engine.
++The change tests the double first, with the limits the function already applies (widened by one day so the
++existing test after the truncation still decides), and returns through the existing fall-back path
++(1904-01-01, false = the cell keeps no date). A value the old code accepted gives the same result.
++Upstream candidate for the owner: upstream-issues/libwps-wks-double-to-long-date-time.md.
++
++--- a/src/lib/WKSContentListener.cpp	2026-11-08 17:12:58.529839225 +0000
+++++ b/src/lib/WKSContentListener.cpp	2026-11-08 19:45:23.253296842 +0000
++@@ -1409,8 +1409,18 @@
++ bool WKSContentListener::CellContent::double2Date(double val, int &Y, int &M, int &D)
++ {
++ 	/* first convert the date in long. Checkme: unsure why -2 is needed...*/
++-	auto numDaysSinceOrigin=long(val-2+0.4);
++-	// checkme: do we need to check before for isNan(val) ?
+++	/* range-check the double BEFORE the conversion: converting a NaN or an out-of-range double
+++	   to an integer is undefined behaviour in C++ (UBSan reports it), and the stored value is
+++	   whatever the file says. The limits are those below, widened by one day so that the exact test below still decides (truncation). */
+++	double const numDays=val-2+0.4;
+++	if (!(numDays>-10000.*365-1 && numDays<10000.*365+1))
+++	{
+++		WPS_DEBUG_MSG(("WKSContentListener::CellContent::double2Date: a date out of range or not a number\n"));
+++		Y=1904;
+++		M=D=1;
+++		return false;
+++	}
+++	auto numDaysSinceOrigin=long(numDays);
++ 	if (numDaysSinceOrigin<-10000*365 || numDaysSinceOrigin>10000*365)
++ 	{
++ 		/* normally, we can expect documents to contain date between 1904
++@@ -1464,7 +1474,8 @@
++ 
++ bool WKSContentListener::CellContent::double2Time(double val, int &H, int &M, int &S)
++ {
++-	if (val < 0.0 || val > 1.0) return false;
+++	// written so that a NaN is refused too (both comparisons are false for it)
+++	if (!(val >= 0.0 && val <= 1.0)) return false;
++ 	double time = 24.*3600.*val+0.5;
++ 	H=int(time/3600.);
++ 	time -= H*3600.;
