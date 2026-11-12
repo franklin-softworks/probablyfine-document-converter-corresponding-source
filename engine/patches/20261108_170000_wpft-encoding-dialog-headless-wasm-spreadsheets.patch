@@ -1,0 +1,29 @@
+# FF-6 (owner-approved plan 2026-11-08): MS Works / Lotus / Quattro / Multiplan import in a HEADLESS engine.
+#
+# For a file whose text encoding libwps cannot tell (`needEncoding`), the import filter asks the user with a GUI dialog,
+# writerperfect::WPFTEncodingDialog, inside try { } catch (...) (upstream's comment: "we can fail because we are in headless mode").
+# In this engine the dialog's .ui file is not in the slimmed file system, the weld builder gives nothing, and the constructor calls
+# through a null object: a WebAssembly TRAP ("null function or function signature mismatch"), which is not a C++ exception, so the
+# catch never runs. Under __EMSCRIPTEN__ the dialog is not built; `fileEncoding` already holds the code page the dialog pre-selects
+# (CP850 for MS Works, CP437 for Lotus, Symphony, Quattro Pro and Multiplan), which is what desktop uses when the user presses OK.
+# Internal note only (bugs/wpft_encoding_dialog_needs_a_gui.md): desktop `soffice --headless` converts such a file without waiting, so this is
+# a consequence of OUR build having no UI files, not an upstream defect, and it is not on the owner's upstream list.
+diff --git a/writerperfect/source/calc/MSWorksCalcImportFilter.cxx b/writerperfect/source/calc/MSWorksCalcImportFilter.cxx
+--- a/writerperfect/source/calc/MSWorksCalcImportFilter.cxx
++++ b/writerperfect/source/calc/MSWorksCalcImportFilter.cxx
+@@ -238,6 +238,7 @@
+             }
+ 
+             fileEncoding = encoding.toUtf8().getStr(); // set default to the proposed encoding
++#ifndef __EMSCRIPTEN__   // FF-6: headless engine: no dialog (see the note above), the proposed code page is used
+             try
+             {
+                 writerperfect::WPFTEncodingDialog aDlg(pParent, title, encoding);
+@@ -255,6 +256,7 @@
+                 SAL_WARN("writerperfect",
+                          "ignoring Exception in MSWorksCalcImportFilter::doImportDocument");
+             }
++#endif
+         }
+     }
+     OString aUtf8Passwd;

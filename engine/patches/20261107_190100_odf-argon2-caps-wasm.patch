@@ -1,0 +1,72 @@
+FEAT-08: bound the Argon2id parameters of an ODF manifest before deriving the key.
+
+The memory, passes and lanes come straight from the document's manifest. A crafted memory of several GiB is an out-of-memory crash
+and a huge pass count is one uninterruptible call (the same class as the PBKDF2 iteration count, which is already bounded). Caps,
+checked before anything is derived: memory 1..262144 KiB (256 MiB), passes 1..16, lanes 1..16, memory (KiB) times passes at most
+1048576 (a gibibyte-iteration). Stock LibreOffice writes about 64 MiB, 3 passes, 4 lanes. A refusal leaves its reason in
+LO_WASM_PACKAGE_REFUSAL (argon2-memory-kib=, argon2-passes=, argon2-lanes=, argon2-cost=) for the bridge to report as
+ENCRYPTION_REFUSED.
+
+diff --git a/package/source/zipapi/ZipFile.cxx b/package/source/zipapi/ZipFile.cxx
+--- a/package/source/zipapi/ZipFile.cxx
++++ b/package/source/zipapi/ZipFile.cxx
+@@ -164,6 +164,14 @@
+ constexpr sal_Int32 nMaxPBKDF2IterationCount = 10000000;
+ // The longest key any package cipher uses is 32 bytes (AES-256).
+ constexpr sal_Int32 nMaxDerivedKeySize = 64;
++// Argon2id parameters come straight from the manifest of the document, so each is bounded before anything is derived
++// (FEAT-08): the memory is allocated up front (a crafted 4 GiB is an out-of-memory crash) and the passes are one
++// uninterruptible call (the same class as the PBKDF2 iteration count above). LibreOffice itself writes about 64 MiB,
++// 3 passes, 4 lanes. Memory is in KiB, as argon2 takes it; the cost is memory (KiB) times passes.
++constexpr sal_Int32 nMaxArgon2MemoryKiB = 256 * 1024;
++constexpr sal_Int32 nMaxArgon2Passes = 16;
++constexpr sal_Int32 nMaxArgon2Lanes = 16;
++constexpr sal_Int64 nMaxArgon2Cost = sal_Int64(1024) * 1024;
+ }
+ 
+ uno::Reference< xml::crypto::XCipherContext > ZipFile::StaticGetCipher( const uno::Reference< uno::XComponentContext >& xArgContext, const ::rtl::Reference< EncryptionData >& xEncryptionData, bool bEncrypt )
+@@ -195,6 +203,44 @@
+     }
+     else if (xEncryptionData->m_oArgon2Args)
+     {
++        {
++            sal_Int32 const nPasses = ::std::get<0>(*xEncryptionData->m_oArgon2Args);
++            sal_Int32 const nMemoryKiB = ::std::get<1>(*xEncryptionData->m_oArgon2Args);
++            sal_Int32 const nLanes = ::std::get<2>(*xEncryptionData->m_oArgon2Args);
++            // a value below 1 would be converted to a huge unsigned number; libargon2 rejects most of those, but not
++            // every one of them is cheap to reject after the allocation, so say no here
++            char const* pReason = nullptr;
++            sal_Int32 nBad = 0;
++            if (nMemoryKiB < 1 || nMemoryKiB > nMaxArgon2MemoryKiB)
++            {
++                pReason = "argon2-memory-kib=";
++                nBad = nMemoryKiB;
++            }
++            else if (nPasses < 1 || nPasses > nMaxArgon2Passes)
++            {
++                pReason = "argon2-passes=";
++                nBad = nPasses;
++            }
++            else if (nLanes < 1 || nLanes > nMaxArgon2Lanes)
++            {
++                pReason = "argon2-lanes=";
++                nBad = nLanes;
++            }
++            else if (sal_Int64(nMemoryKiB) * nPasses > nMaxArgon2Cost)
++            {
++                pReason = "argon2-cost=";
++                nBad = sal_Int32(sal_Int64(nMemoryKiB) * nPasses > SAL_MAX_INT32 ? SAL_MAX_INT32 : sal_Int64(nMemoryKiB) * nPasses);
++            }
++            if (pReason)
++            {
++                SAL_WARN("package", "Argon2 parameters out of range");
++#ifdef __EMSCRIPTEN__
++                // as for the PBKDF2 count above: the bridge reports ENCRYPTION_REFUSED with this reason (no password helps)
++                setenv("LO_WASM_PACKAGE_REFUSAL", (::std::string(pReason) + ::std::to_string(nBad)).c_str(), 1);
++#endif
++                throw ZipIOException(u"Argon2 parameters are out of range"_ustr);
++            }
++        }
+         // apparently multiple lanes cannot be processed in parallel (the
+         // implementation will clamp), but it doesn't make sense to have more
+         // threads than CPUs
