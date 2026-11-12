@@ -1,0 +1,33 @@
+diff --git a/svx/source/svdraw/svdmodel.cxx b/svx/source/svdraw/svdmodel.cxx
+index 2884afefaa4e..8627e67fd9fc 100644
+--- a/svx/source/svdraw/svdmodel.cxx
++++ b/svx/source/svdraw/svdmodel.cxx
+@@ -689,7 +689,28 @@ void SdrModel::SetTextDefaults( SfxItemPool* pItemPool, sal_Int32 nDefTextHgt )
+ 
+ SdrOutliner& SdrModel::GetDrawOutliner(const SdrTextObj* pObj) const
+ {
++#ifdef __EMSCRIPTEN__
++    // WASM/LOK optimization: Skip expensive SetTextObj() call.
++    // SetTextObj() triggers Outliner::Init() which fully reinitializes
++    // the outliner for each text object. During PPTX import/export,
++    // this function is called 1000s of times (once per table cell,
++    // once per shape text, etc.), making it a major performance
++    // bottleneck. For headless PDF conversion, the outliner doesn't
++    // need per-object initialization - we just need the outliner
++    // reference for text operations.
++    // This optimization reduces PPTX table conversion from >10 min to <1 min.
++    //
++    // FG-152 (2026-10): skipping SetTextObj() also skipped the per-object state
++    // that is cheap and DOES matter for output -- the text-column count, so a
++    // two-column PPTX text box was laid out in one column, and the object pointer
++    // CalcFieldValue() reads. Re-apply just those, without the expensive Init().
++    m_pDrawOutliner->SetTextObjNoInit(pObj);
++    if (pObj)
++        m_pDrawOutliner->SetTextColumns(pObj->GetTextColumnsNumber(),
++                                        pObj->GetTextColumnsSpacing());
++#else
+     m_pDrawOutliner->SetTextObj(pObj);
++#endif
+     return *m_pDrawOutliner;
+ }
+ 
