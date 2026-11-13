@@ -1,0 +1,27 @@
+FG-021 (approved by orch for the owner 2026-10-25): password-protected OOXML export writes
+ECMA-376 Agile encryption (EncryptionInfo 4.4: AES-256, SHA-512, 100000 spins, data
+integrity HMAC), the Office 2010+ default, instead of Standard (3.2: AES-128, SHA-1).
+
+StrongEncryptionDataSpace is the only registered com.sun.star.comp.oox.crypto service. It
+starts with a Standard2007Engine and switches engine only on import (readEncryptionInfo).
+AgileEngine's export path (setupEncryption, writeEncryptionInfo, encrypt) is complete and
+unused; this selects it when an export sets up encryption. Import is unaffected.
+#ifdef __EMSCRIPTEN__ (native builds keep upstream's Standard default).
+
+--- a/oox/source/crypto/StrongEncryptionDataSpace.cxx
++++ b/oox/source/crypto/StrongEncryptionDataSpace.cxx
+@@ -112,6 +112,14 @@
+ 
+ sal_Bool StrongEncryptionDataSpace::setupEncryption(const Sequence<NamedValue>& rMediaEncData)
+ {
++#ifdef __EMSCRIPTEN__
++    // FG-021: write ECMA-376 Agile encryption (AES-256, SHA-512; Office 2010 and later)
++    // instead of Standard (AES-128, SHA-1). AgileEngine has a complete encryption path
++    // (setupEncryption, writeEncryptionInfo, encrypt with data integrity); only this
++    // export entry point never chose it. Import is unaffected: readEncryptionInfo picks
++    // the engine from the file being read.
++    mCryptoEngine.reset(new AgileEngine());
++#endif
+     if (!mCryptoEngine)
+         return false;
+ 
