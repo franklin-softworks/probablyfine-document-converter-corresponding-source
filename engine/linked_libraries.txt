@@ -1,0 +1,66 @@
+# Libraries built into the modules, by their download.lst entry. One line per library:
+#   <library>  <download.lst TARBALL variable>  <modules: * or a comma list>
+# engine/tools/gen_library_source_index.py turns this plus download.lst (at the LibreOffice commit
+# engine/upstream.json pins) into the library source index; a LibreOffice version bump needs no edit here.
+# A line is added only when the build starts to compile a NEW library, which is also when its notice and
+# licence election (engine/tools/gen_third_party_licences.py) are reviewed. The Emscripten toolchain's
+# source archive is not in download.lst; the generator carries its pin.
+
+argon2 ARGON2_TARBALL *
+boost BOOST_TARBALL *
+box2d BOX2D_TARBALL *
+cairo CAIRO_TARBALL *
+dragonbox DRAGONBOX_TARBALL *
+dtoa DTOA_TARBALL *
+expat EXPAT_TARBALL *
+fontconfig FONTCONFIG_TARBALL *
+freetype FREETYPE_TARBALL *
+frozen FROZEN_TARBALL *
+glm GLM_TARBALL *
+graphite GRAPHITE_TARBALL *
+harfbuzz HARFBUZZ_TARBALL *
+hunspell HUNSPELL_TARBALL *
+hyphen HYPHEN_TARBALL *
+icu ICU_TARBALL *
+lcms2 LCMS2_TARBALL *
+libabw ABW_TARBALL *
+libcdr CDR_TARBALL *
+libebook EBOOK_TARBALL *
+libeot LIBEOT_TARBALL presentations
+libetonyek ETONYEK_TARBALL *
+libexttextcat LIBEXTTEXTCAT_TARBALL *
+libfreehand FREEHAND_TARBALL *
+libjpeg-turbo LIBJPEG_TURBO_TARBALL *
+liblangtag LIBLANGTAG_TARBALL *
+libmspub MSPUB_TARBALL *
+libmwaw MWAW_TARBALL *
+libnumbertext LIBNUMBERTEXT_TARBALL *
+libodfgen ODFGEN_TARBALL *
+liborcus ORCUS_TARBALL *
+libpagemaker PAGEMAKER_TARBALL *
+libpng LIBPNG_TARBALL *
+libqxp QXP_TARBALL *
+librevenge REVENGE_TARBALL *
+libstaroffice STAROFFICE_TARBALL *
+libtiff LIBTIFF_TARBALL *
+libvisio VISIO_TARBALL *
+libwebp LIBWEBP_TARBALL *
+libwpd WPD_TARBALL *
+libwpg WPG_TARBALL *
+libwps WPS_TARBALL *
+libxml2 LIBXML_TARBALL *
+libxslt LIBXSLT_TARBALL *
+libzmf ZMF_TARBALL *
+mdds MDDS_TARBALL *
+mythes MYTHES_TARBALL *
+openssl OPENSSL_TARBALL *
+pixman PIXMAN_TARBALL *
+poppler POPPLER_TARBALL pdf-docx,pdf-pptx
+poppler_data POPPLER_DATA_TARBALL pdf-docx,pdf-pptx
+raptor RAPTOR_TARBALL *
+rasqal RASQAL_TARBALL *
+redland REDLAND_TARBALL *
+xmlsec XMLSEC_TARBALL *
+zlib ZLIB_TARBALL *
+zstd ZSTD_TARBALL *
+zxcvbn-c ZXCVBN_C_TARBALL *
