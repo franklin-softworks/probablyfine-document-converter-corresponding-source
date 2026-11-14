@@ -1,0 +1,273 @@
+diff --git a/sw/source/core/crsr/bookmark.cxx b/sw/source/core/crsr/bookmark.cxx
+index 7ab8d12bf585..d23d1a0e344a 100644
+--- a/sw/source/core/crsr/bookmark.cxx
++++ b/sw/source/core/crsr/bookmark.cxx
+@@ -40,8 +40,10 @@
+ #include <svl/numformat.hxx>
+ #include <svl/zforlist.hxx>
+ #include <edtwin.hxx>
++#ifndef __EMSCRIPTEN__
+ #include <DateFormFieldButton.hxx>
+ #include <DropDownFormFieldButton.hxx>
++#endif
+ #include <DocumentContentOperationsManager.hxx>
+ #include <comphelper/lok.hxx>
+ #include <txtfrm.hxx>
+@@ -782,6 +784,7 @@ namespace sw::mark
+ 
+     void DropDownFieldmark::ShowButton(SwEditWin* pEditWin)
+     {
++#ifndef __EMSCRIPTEN__
+         if(pEditWin)
+         {
+             if(!m_pButton)
+@@ -789,6 +792,9 @@ namespace sw::mark
+             m_pButton->CalcPosAndSize(m_aPortionPaintArea);
+             m_pButton->Show();
+         }
++#else
++        (void)pEditWin; // Unused in WASM headless mode
++#endif
+     }
+ 
+     void DropDownFieldmark::RemoveButton()
+@@ -1077,6 +1083,7 @@ namespace sw::mark
+ 
+     void DateFieldmark::ShowButton(SwEditWin* pEditWin)
+     {
++#ifndef __EMSCRIPTEN__
+         if(pEditWin)
+         {
+             if(!m_pButton)
+@@ -1085,6 +1092,9 @@ namespace sw::mark
+             m_pButton->CalcPosAndSize(aPaintArea);
+             m_pButton->Show();
+         }
++#else
++        (void)pEditWin; // Unused in WASM headless mode
++#endif
+     }
+ 
+     void DateFieldmark::SetPortionPaintAreaStart(const SwRect& rPortionPaintArea)
+diff --git a/sw/source/core/inc/DateFormFieldButton.hxx b/sw/source/core/inc/DateFormFieldButton.hxx
+index 3d74706a8a5d..aa055ff8842d 100644
+--- a/sw/source/core/inc/DateFormFieldButton.hxx
++++ b/sw/source/core/inc/DateFormFieldButton.hxx
+@@ -19,6 +19,23 @@ namespace sw::mark
+ class DateFieldmark;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// WASM stub - GUI buttons not needed in headless WASM conversion mode
++class DateFormFieldButton final : public FormFieldButton
++{
++private:
++    SvNumberFormatter* m_pNumberFormatter;
++    sw::mark::DateFieldmark* m_pDateFieldmark;
++    std::unique_ptr<weld::Calendar> m_xCalendar;
++public:
++    DateFormFieldButton(SwEditWin* pEditWin, sw::mark::DateFieldmark& rFieldMark,
++                        SvNumberFormatter*)
++        : FormFieldButton(pEditWin, rFieldMark), m_pNumberFormatter(nullptr), m_pDateFieldmark(nullptr) {}
++    virtual ~DateFormFieldButton() override {}
++    virtual void LaunchPopup() override {}
++    virtual void DestroyPopup() override {}
++};
++#else
+ /**
+  * This button is shown when the cursor is on a date form field.
+  * The user can select a date from a date picker while filling in a form.
+@@ -41,6 +58,7 @@ public:
+     virtual void LaunchPopup() override;
+     virtual void DestroyPopup() override;
+ };
++#endif // __EMSCRIPTEN__
+ 
+ #endif
+ 
+diff --git a/sw/source/core/inc/DropDownFormFieldButton.hxx b/sw/source/core/inc/DropDownFormFieldButton.hxx
+index 6f8aa42edd1d..d39d24342d83 100644
+--- a/sw/source/core/inc/DropDownFormFieldButton.hxx
++++ b/sw/source/core/inc/DropDownFormFieldButton.hxx
+@@ -17,6 +17,21 @@ namespace sw::mark
+ class DropDownFieldmark;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// WASM stub - GUI buttons not needed in headless WASM conversion mode
++class DropDownFormFieldButton final : public FormFieldButton
++{
++private:
++    std::unique_ptr<weld::TreeView> m_xTreeView;
++    void InitDropdown() {}
++public:
++    DropDownFormFieldButton(SwEditWin* pEditWin, sw::mark::DropDownFieldmark& rFieldMark)
++        : FormFieldButton(pEditWin, rFieldMark) {}
++    virtual ~DropDownFormFieldButton() override {}
++    virtual void LaunchPopup() override {}
++    virtual void DestroyPopup() override {}
++};
++#else
+ /**
+  * This button is shown when the cursor is on a drop-down form field.
+  * The user can select an item of the field using this button while filling in a form.
+@@ -37,5 +52,6 @@ public:
+     virtual void LaunchPopup() override;
+     virtual void DestroyPopup() override;
+ };
++#endif // __EMSCRIPTEN__
+ 
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */
+diff --git a/sw/source/core/inc/FormFieldButton.hxx b/sw/source/core/inc/FormFieldButton.hxx
+index 22a9b3e8c7b0..cd632446140c 100644
+--- a/sw/source/core/inc/FormFieldButton.hxx
++++ b/sw/source/core/inc/FormFieldButton.hxx
+@@ -19,6 +19,26 @@ namespace sw::mark
+ class Fieldmark;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// WASM stub - Minimal implementation to satisfy header includes.
++// GUI form field buttons are not needed in headless WASM conversion mode.
++class FormFieldButton : public Control
++{
++public:
++    FormFieldButton(SwEditWin*, sw::mark::Fieldmark& rFieldMark)
++        : Control(nullptr), m_rFieldmark(rFieldMark) {}
++    virtual ~FormFieldButton() override {}
++    virtual void dispose() override { Control::dispose(); }
++    void CalcPosAndSize(const SwRect&) {}
++    virtual void MouseButtonDown(const MouseEvent&) override {}
++    virtual void Paint(vcl::RenderContext&, const tools::Rectangle&) override {}
++    virtual WindowHitTest ImplHitTest(const Point&) override { return WindowHitTest::NONE; }
++    virtual void LaunchPopup() {}
++    virtual void DestroyPopup() {}
++protected:
++    sw::mark::Fieldmark& m_rFieldmark;
++};
++#else
+ /**
+  * This button is shown when the cursor is on a form field with drop-down capability.
+  */
+@@ -48,5 +68,6 @@ protected:
+     std::unique_ptr<weld::Builder> m_xFieldPopupBuilder;
+     std::unique_ptr<weld::Popover> m_xFieldPopup;
+ };
++#endif // __EMSCRIPTEN__
+ 
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab cinoptions=b1,g0,N-s cinkeys+=0=break: */
+diff --git a/sw/source/core/inc/contentcontrolbutton.hxx b/sw/source/core/inc/contentcontrolbutton.hxx
+index 28b9e49c3057..3b5a0a618e48 100644
+--- a/sw/source/core/inc/contentcontrolbutton.hxx
++++ b/sw/source/core/inc/contentcontrolbutton.hxx
+@@ -16,6 +16,34 @@
+ class SwEditWin;
+ class SwContentControl;
+ 
++#ifdef __EMSCRIPTEN__
++// WASM stub - Minimal implementation to satisfy header includes
++// GUI buttons are not needed in headless WASM conversion mode
++class SwContentControlButton : public Control
++{
++public:
++    SwContentControlButton(SwEditWin*, std::shared_ptr<SwContentControl> pContentControl)
++        : Control(nullptr), m_pContentControl(std::move(pContentControl)) {}
++    virtual ~SwContentControlButton() override {}
++    virtual void dispose() override { Control::dispose(); }
++    void CalcPosAndSize(const SwRect&) {}
++    void SetRTL(bool bRTL) { m_bRTL = bRTL; }
++    virtual void MouseButtonDown(const MouseEvent&) override {}
++    void StartPopup() {}
++    virtual void Paint(vcl::RenderContext&, const tools::Rectangle&) override {}
++    virtual WindowHitTest ImplHitTest(const Point&) override { return WindowHitTest::NONE; }
++    virtual void LaunchPopup() {}
++    virtual void DestroyPopup() {}
++    const std::shared_ptr<SwContentControl>& GetContentControl() const { return m_pContentControl; }
++private:
++    tools::Rectangle m_aFramePixel;
++protected:
++    std::shared_ptr<SwContentControl> m_pContentControl;
++    std::unique_ptr<weld::Builder> m_xPopupBuilder;
++    std::unique_ptr<weld::Popover> m_xPopup;
++    bool m_bRTL = false;
++};
++#else
+ /// This button is shown when the cursor is inside a content control with drop-down capability.
+ class SwContentControlButton : public Control
+ {
+@@ -49,5 +77,6 @@ protected:
+     std::unique_ptr<weld::Popover> m_xPopup;
+     bool m_bRTL = false;
+ };
++#endif // __EMSCRIPTEN__
+ 
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/sw/source/core/inc/datecontentcontrolbutton.hxx b/sw/source/core/inc/datecontentcontrolbutton.hxx
+index 48b08f2db981..15f57aba1b45 100644
+--- a/sw/source/core/inc/datecontentcontrolbutton.hxx
++++ b/sw/source/core/inc/datecontentcontrolbutton.hxx
+@@ -15,6 +15,23 @@ class SwEditWin;
+ class SvNumberFormatter;
+ class SwContentControl;
+ 
++#ifdef __EMSCRIPTEN__
++// WASM stub - GUI buttons not needed in headless WASM conversion mode
++class SwDateContentControlButton final : public SwContentControlButton
++{
++private:
++    SvNumberFormatter* m_pNumberFormatter;
++    std::unique_ptr<weld::Calendar> m_xCalendar;
++public:
++    SwDateContentControlButton(SwEditWin* pEditWin,
++                               const std::shared_ptr<SwContentControl>& pContentControl,
++                               SvNumberFormatter*)
++        : SwContentControlButton(pEditWin, pContentControl), m_pNumberFormatter(nullptr) {}
++    ~SwDateContentControlButton() override {}
++    void LaunchPopup() override {}
++    void DestroyPopup() override {}
++};
++#else
+ /**
+  * This button is shown when the cursor is on a date content control.  The user can select a date
+  * from a date picker.
+@@ -37,5 +54,6 @@ public:
+     void LaunchPopup() override;
+     void DestroyPopup() override;
+ };
++#endif // __EMSCRIPTEN__
+ 
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/sw/source/core/inc/dropdowncontentcontrolbutton.hxx b/sw/source/core/inc/dropdowncontentcontrolbutton.hxx
+index 6ca32974e196..1ae3561e6dbd 100644
+--- a/sw/source/core/inc/dropdowncontentcontrolbutton.hxx
++++ b/sw/source/core/inc/dropdowncontentcontrolbutton.hxx
+@@ -14,6 +14,22 @@
+ class SwEditWin;
+ class SwContentControl;
+ 
++#ifdef __EMSCRIPTEN__
++// WASM stub - GUI buttons not needed in headless WASM conversion mode
++class SwDropDownContentControlButton final : public SwContentControlButton
++{
++private:
++    std::unique_ptr<weld::TreeView> m_xTreeView;
++    void InitDropdown() {}
++public:
++    SwDropDownContentControlButton(SwEditWin* pEditWin,
++                                   const std::shared_ptr<SwContentControl>& pContentControl)
++        : SwContentControlButton(pEditWin, pContentControl) {}
++    virtual ~SwDropDownContentControlButton() override {}
++    virtual void LaunchPopup() override {}
++    virtual void DestroyPopup() override {}
++};
++#else
+ /**
+  * This button is shown when the cursor is inside a drop-down content control.
+  * The user can select a list item using this button while filling in a form.
+@@ -35,5 +51,6 @@ public:
+     virtual void LaunchPopup() override;
+     virtual void DestroyPopup() override;
+ };
++#endif // __EMSCRIPTEN__
+ 
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
