@@ -1,0 +1,28 @@
+expat 2.8.0 (bundled since LibreOffice 25.8.7.3): select the /dev/urandom entropy
+source on Emscripten.
+
+external/expat/StaticLibrary_expat.mk compiles random_dev_urandom + random_getrandom
+on Linux/Android, random_dev_urandom on macOS, and random_rand_s.c (Windows rand_s)
+on EVERY other OS. An Emscripten build falls into that last branch and fails:
+
+  expat/lib/random_rand_s.c:78:9: error: call to undeclared function 'rand_s'
+
+expat's own configure, run for the Emscripten target, defines XML_DEV_URANDOM and
+none of HAVE_GETRANDOM / HAVE_ARC4RANDOM* / HAVE_GETENTROPY (expat_config.h), so
+xmlparse.c calls writeRandomBytes_dev_urandom -- the macOS source set. Emscripten
+provides /dev/urandom (backed by crypto.getRandomValues). Build-system only; no
+change to any other platform.
+
+diff --git a/external/expat/StaticLibrary_expat.mk b/external/expat/StaticLibrary_expat.mk
+index 4d4cb69409a5..b89f0fb4d62f 100644
+--- a/external/expat/StaticLibrary_expat.mk
++++ b/external/expat/StaticLibrary_expat.mk
+@@ -47,7 +47,7 @@ $(eval $(call gb_StaticLibrary_add_generated_cobjects,expat,\
+ 	UnpackedTarball/expat/lib/random_dev_urandom \
+ 	UnpackedTarball/expat/lib/random_getrandom \
+ ))
+-else ifeq ($(OS),MACOSX)
++else ifeq ($(OS),$(filter MACOSX EMSCRIPTEN,$(OS)))
+ $(eval $(call gb_StaticLibrary_add_generated_cobjects,expat,\
+ 	UnpackedTarball/expat/lib/random_dev_urandom \
+ ))
