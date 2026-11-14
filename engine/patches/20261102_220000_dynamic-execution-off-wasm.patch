@@ -1,0 +1,45 @@
+link every module with -sDYNAMIC_EXECUTION=0, so the glue builds no function from a string (all modules).
+
+Embind builds each function invoker it exposes with the Function constructor (craftInvokerFunction ->
+newFunc(Function, ...) in soffice.js). A Content-Security-Policy that does not allow 'unsafe-eval' makes that throw an
+EvalError at startup in every module (measured by the W-8 work: documents, spreadsheets, presentations, pdf-docx, pdf-pptx),
+so the conversion worker's CSP has had to carry 'unsafe-eval'. With -sDYNAMIC_EXECUTION=0 (supported by the builder's
+Emscripten 3.1.51: embind.js has an #if DYNAMIC_EXECUTION == 0 closure-invoker path) the glue uses closure-based invokers and
+the worker can run under a CSP without 'unsafe-eval'.
+
+Cost, from reading the shipped glue and the Emscripten 3.1.51 sources (no build): the glue has two dynamic-code sites, both
+through newFunc(Function, ...): embind's invoker factory (craftInvokerFunction) and emval's method caller
+(__emval_get_method_caller, reached by val::call). DYNAMIC_EXECUTION=0 removes newFunc and both sites (embind.js and emval.js
+#if DYNAMIC_EXECUTION branches). The wasm registers the unoembind PrimaryBindings set (uno_Type, uno_Any and 6 free functions,
+static/source/unoembindhelpers/PrimaryBindings.cxx), about 35 invokers built once at startup; the closure invoker that replaces
+the generated one shares its argument buffers between calls, which would matter only for a re-entrant embind call. Nothing on
+the conversion path calls embind (conversion_worker.js uses cwrap/ccall; wasm_bridge.cpp is extern "C"), so the invokers are
+not on a hot path. soffice.js also holds one literal eval(text), LibreOffice's UNO script-URL runner (runUnoScriptUrls),
+which the conversion worker never calls; a CSP only refuses code that runs. No emscripten_run_script / eval_js import is
+present. No other Emscripten feature this build links with is affected (the only DYNAMIC_EXECUTION branches are those two
+embind/emval files, emscripten_run_script, and a node-only script loader), and only soffice_bin is linked with emcc (the build
+tools that generate the bindings are native).
+
+Universal (a *-wasm.patch name routes to every module): the flag is a link flag, and every module links the same way.
+Changing a patch changes the fingerprint, so the next build rebuilds all five modules. Verified by
+tests/gates/test_dynamic_execution_off.sh (the patch, its routing, that it applies to the pinned tree) and, on rebuilt
+modules, by tests/gates/test_strict_worker_csp.js (no Function-constructor invoker in the glue; a real conversion in every
+module under the strict policy with 0 violations).
+
+diff --git a/solenv/gbuild/platform/EMSCRIPTEN_INTEL_GCC.mk b/solenv/gbuild/platform/EMSCRIPTEN_INTEL_GCC.mk
+index 2bd3a3a..b8dccb3 100644
+--- a/solenv/gbuild/platform/EMSCRIPTEN_INTEL_GCC.mk
++++ b/solenv/gbuild/platform/EMSCRIPTEN_INTEL_GCC.mk
+@@ -55,6 +55,12 @@ gb_EMSCRIPTEN_LDFLAGS += --bind -s FORCE_FILESYSTEM=1 -s WASM_BIGINT=1 -s ERROR_
+ # which still hard-fails on any *called* symbol with no definition.
+ gb_EMSCRIPTEN_LDFLAGS += -Wno-error=undefined
+ 
++# W-8: no dynamic code in the glue. Embind builds its function invokers with the Function constructor
++# (craftInvokerFunction -> newFunc(Function, ...)), which a Content-Security-Policy needs 'unsafe-eval' to allow.
++# DYNAMIC_EXECUTION=0 makes the glue use closure-based invokers instead, so the conversion worker's CSP can drop
++# 'unsafe-eval'. The conversion path runs through C exports (cwrap/ccall), not embind, so the invokers are not hot.
++gb_EMSCRIPTEN_LDFLAGS += -sDYNAMIC_EXECUTION=0
++
+ gb_EMSCRIPTEN_QTDEFS := -DQT_NO_LINKED_LIST -DQT_NO_JAVA_STYLE_ITERATORS -DQT_NO_EXCEPTIONS -DQT_NO_DEBUG -DQT_WIDGETS_LIB -DQT_GUI_LIB -DQT_CORE_LIB
+ 
+ ifeq ($(ENABLE_EMSCRIPTEN_JSPI),TRUE)
