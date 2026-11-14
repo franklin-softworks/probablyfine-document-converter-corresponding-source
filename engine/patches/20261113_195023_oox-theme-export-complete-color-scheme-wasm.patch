@@ -1,0 +1,88 @@
+diff --git a/oox/source/export/ThemeExport.cxx b/oox/source/export/ThemeExport.cxx
+index 400e9a0..ad22e2a 100644
+--- a/oox/source/export/ThemeExport.cxx
++++ b/oox/source/export/ThemeExport.cxx
+@@ -35,6 +35,34 @@ void writeRelativeRectangle(sax_fastparser::FSHelperPtr pFS, sal_Int32 nToken,
+                          OString::number(rRelativeRectangle.mnRight), XML_b,
+                          OString::number(rRelativeRectangle.mnBottom));
+ }
++
++// BUG-79: a document that has no theme of its own (everything that did not come from OOXML) has a model::Theme made with only a name: its color set
++// is a null pointer. Office refuses a theme whose clrScheme lacks any of the 12 required colors (CT_ColorScheme: dk1, lt1, dk2, lt2, accent1-6, hlink,
++// folHlink, in that order), so write Office's own defaults (the Office 2013+ theme) for such a theme.
++void writeOfficeDefaultColorScheme(sax_fastparser::FSHelperPtr const& pFS)
++{
++    pFS->startElementNS(XML_a, XML_dk1);
++    pFS->singleElementNS(XML_a, XML_sysClr, XML_val, "windowText", XML_lastClr, "000000");
++    pFS->endElementNS(XML_a, XML_dk1);
++    pFS->startElementNS(XML_a, XML_lt1);
++    pFS->singleElementNS(XML_a, XML_sysClr, XML_val, "window", XML_lastClr, "FFFFFF");
++    pFS->endElementNS(XML_a, XML_lt1);
++
++    static const struct
++    {
++        sal_Int32 nToken;
++        const char* pRGB;
++    } aColors[] = { { XML_dk2, "44546A" },     { XML_lt2, "E7E6E6" },     { XML_accent1, "4472C4" },
++                    { XML_accent2, "ED7D31" }, { XML_accent3, "A5A5A5" }, { XML_accent4, "FFC000" },
++                    { XML_accent5, "5B9BD5" }, { XML_accent6, "70AD47" }, { XML_hlink, "0563C1" },
++                    { XML_folHlink, "954F72" } };
++    for (auto const& rColor : aColors)
++    {
++        pFS->startElementNS(XML_a, rColor.nToken);
++        pFS->singleElementNS(XML_a, XML_srgbClr, XML_val, rColor.pRGB);
++        pFS->endElementNS(XML_a, rColor.nToken);
++    }
++}
+ } // end anonymous namespace
+ 
+ ThemeExport::ThemeExport(oox::core::XmlFilterBase* pFilterBase,
+@@ -49,7 +77,10 @@ void ThemeExport::write(OUString const& rPath, model::Theme const& rTheme)
+     mpFS = mpFilterBase->openFragmentStreamWithSerializer(
+         rPath, u"application/vnd.openxmlformats-officedocument.theme+xml"_ustr);
+ 
++    // BUG-79: Office refuses a theme part whose theme, color scheme or font scheme name is empty, or whose color scheme lacks colors.
+     OUString aThemeName = rTheme.GetName();
++    if (aThemeName.isEmpty())
++        aThemeName = u"Office"_ustr;
+ 
+     mpFS->startElementNS(XML_a, XML_theme, FSNS(XML_xmlns, XML_a),
+                          mpFilterBase->getNamespaceURL(OOX_NS(dml)), FSNS(XML_xmlns, XML_r),
+@@ -57,14 +88,24 @@ void ThemeExport::write(OUString const& rPath, model::Theme const& rTheme)
+ 
+     mpFS->startElementNS(XML_a, XML_themeElements);
+ 
++    // A theme made without a color set (a null pointer) was dereferenced here: the name came out empty and no color was written.
+     const auto& pColorSet = rTheme.getColorSet();
+ 
+-    mpFS->startElementNS(XML_a, XML_clrScheme, XML_name, pColorSet->getName());
+-    writeColorSet(rTheme);
++    OUString aColorSchemeName = pColorSet ? pColorSet->getName() : OUString();
++    if (aColorSchemeName.isEmpty())
++        aColorSchemeName = u"Office"_ustr;
++    mpFS->startElementNS(XML_a, XML_clrScheme, XML_name, aColorSchemeName);
++    if (pColorSet)
++        writeColorSet(rTheme);
++    else
++        writeOfficeDefaultColorScheme(mpFS);
+     mpFS->endElementNS(XML_a, XML_clrScheme);
+ 
+     model::FontScheme const& rFontScheme = rTheme.getFontScheme();
+-    mpFS->startElementNS(XML_a, XML_fontScheme, XML_name, rFontScheme.getName());
++    OUString aFontSchemeName = rFontScheme.getName();
++    if (aFontSchemeName.isEmpty())
++        aFontSchemeName = u"Office"_ustr;
++    mpFS->startElementNS(XML_a, XML_fontScheme, XML_name, aFontSchemeName);
+     writeFontScheme(rFontScheme);
+     mpFS->endElementNS(XML_a, XML_fontScheme);
+ 
+@@ -284,7 +325,8 @@ void ThemeExport::writeColorSystem(model::ComplexColor const& rComplexColor)
+         mpFS->startElementNS(XML_a, XML_sysClr, XML_val, sValue);
+         //XML_lastClr
+         writeColorTransformations(rComplexColor.getTransformations());
+-        mpFS->endElementNS(XML_a, XML_schemeClr);
++        // BUG-86: a sysClr was closed with the schemeClr end tag (malformed XML, which Office refuses)
++        mpFS->endElementNS(XML_a, XML_sysClr);
+     }
+ }
+ 
