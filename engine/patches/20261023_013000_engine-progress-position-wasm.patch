@@ -1,0 +1,168 @@
+BUG-38: engine progress POSITION during the OOXML import and Writer layout.
+
+A DOCX with thousands of anchored shapes (our own PDF -> DOCX output) imports and lays
+out for minutes with no progress report: the OOXML import reports progress only when
+docProps declares a ParagraphCount (pdf-docx output declares 0), and the initial layout
+during view creation never starts a progress bar. The web driver's 30 s no-progress
+watchdog then stops a conversion that is working.
+
+These hooks give the bridge (engine/bridge/wasm_bridge.cpp, which holds the strong
+definitions and all the logic) first-time engine work to count:
+  - OOXMLDocumentImpl::incrementProgress (every paragraph end) and
+    OOXMLFastContextHandlerShape::sendShape (every shape): import position;
+  - SwLayAction::InternalAction (each page the layout loop visits): highest page reached;
+  - SwObjectFormatter::FormatObj_ (every anchored object, fly or drawing): the object's
+    SwFrameFormat, so the bridge counts distinct objects formatted at least once. Keyed by
+    the document-model format, not the layout frame, because a looping layout can delete
+    and recreate frames while the formats persist;
+  - SwFrame::AppendFly / SwFrame::AppendDrawObj (frame creation, before the layout loop: a
+    paragraph with thousands of anchors spends its first seconds here): distinct objects
+    attached for the first time, counted separately from those formatted;
+The hooks are weak no-ops here, so any other link of sw stays whole. WASM only.
+
+diff --git a/sw/source/core/layout/layact.cxx b/sw/source/core/layout/layact.cxx
+index 5439efae5bcf..1bb413ffa13a 100644
+--- a/sw/source/core/layout/layact.cxx
++++ b/sw/source/core/layout/layact.cxx
+@@ -72,6 +72,9 @@
+ #include <comphelper/diagnose_ex.hxx>
+ #include <comphelper/lok.hxx>
+ #include <drawdoc.hxx>
++#ifdef __EMSCRIPTEN__
++extern "C" void lo_wasm_progress_layout_page(int);   // BUG-38, weak in objectformatter.cxx
++#endif
+ 
+ void SwLayAction::CheckWaitCursor()
+ {
+@@ -565,6 +568,9 @@ void SwLayAction::InternalAction(OutputDevice* pRenderContext)
+             continue;
+         }
+ 
++#ifdef __EMSCRIPTEN__
++        lo_wasm_progress_layout_page(pPage->GetPhyPageNum());
++#endif
+         if ( m_nEndPage != USHRT_MAX && pPage->GetPhyPageNum() > nPercentPageNum )
+         {
+             nPercentPageNum = pPage->GetPhyPageNum();
+diff --git a/sw/source/core/layout/objectformatter.cxx b/sw/source/core/layout/objectformatter.cxx
+index 547aa3c550d5..278666cdd674 100644
+--- a/sw/source/core/layout/objectformatter.cxx
++++ b/sw/source/core/layout/objectformatter.cxx
+@@ -31,6 +31,14 @@
+ 
+ #include <vector>
+ 
++#ifdef __EMSCRIPTEN__
++// BUG-38: engine progress POSITION for the web driver (engine/bridge/wasm_bridge.cpp defines
++// the strong versions; these weak no-ops keep any other link of sw whole). The bridge turns
++// first-time work into an advancing position; repeated work never advances it.
++extern "C" __attribute__((weak)) void lo_wasm_progress_layout_object(const void*) {}
++extern "C" __attribute__((weak)) void lo_wasm_progress_layout_page(int) {}
++#endif
++
+ // --> #i26945# - Additionally the type of the anchor text frame
+ // is collected - by type is meant 'master' or 'follow'.
+ class SwPageNumAndTypeOfAnchors
+@@ -263,6 +271,11 @@ void SwObjectFormatter::FormatObjContent( SwAnchoredObject& _rAnchoredObj )
+ */
+ void SwObjectFormatter::FormatObj_( SwAnchoredObject& _rAnchoredObj )
+ {
++#ifdef __EMSCRIPTEN__
++    // Keyed by the document-model format, not the layout frame: a looping layout can
++    // delete and recreate frames, the formats persist, so the count is bounded.
++    lo_wasm_progress_layout_object(_rAnchoredObj.GetFrameFormat());
++#endif
+     // collect anchor object and its 'anchor' page number, if requested
+     if ( mpPgNumAndTypeOfAnchors )
+     {
+diff --git a/sw/source/writerfilter/ooxml/OOXMLDocumentImpl.cxx b/sw/source/writerfilter/ooxml/OOXMLDocumentImpl.cxx
+index 8caaddbc1e6a..6cfd751b2199 100644
+--- a/sw/source/writerfilter/ooxml/OOXMLDocumentImpl.cxx
++++ b/sw/source/writerfilter/ooxml/OOXMLDocumentImpl.cxx
+@@ -47,6 +47,13 @@
+ #include <sfx2/objsh.hxx>
+ #include <utility>
+ 
++#ifdef __EMSCRIPTEN__
++// BUG-38: import progress POSITION (paragraphs + shapes parsed) for the web driver; the strong
++// definition is in engine/bridge/wasm_bridge.cpp. Ticks even when docProps has no usable
++// ParagraphCount (pdf-docx output declares 0), where the status indicator never starts.
++extern "C" __attribute__((weak)) void lo_wasm_progress_import_tick() {}
++#endif
++
+ // this extern variable is declared in OOXMLStreamImpl.hxx
+ OUString customTarget;
+ OUString embeddingsTarget;
+@@ -542,6 +549,9 @@ void OOXMLDocumentImpl::resolve(Stream & rStream)
+ 
+ void OOXMLDocumentImpl::incrementProgress()
+ {
++#ifdef __EMSCRIPTEN__
++    lo_wasm_progress_import_tick();
++#endif
+     mnProgressCurrentPos++;
+     // 1) If we know the end
+     // 2) We progressed enough that updating makes sense
+diff --git a/sw/source/writerfilter/ooxml/OOXMLFastContextHandler.cxx b/sw/source/writerfilter/ooxml/OOXMLFastContextHandler.cxx
+index 26de01a3400a..513ceac82736 100644
+--- a/sw/source/writerfilter/ooxml/OOXMLFastContextHandler.cxx
++++ b/sw/source/writerfilter/ooxml/OOXMLFastContextHandler.cxx
+@@ -45,6 +45,10 @@
+ #include <unodraw.hxx>
+ #include "ShadowContext.hxx"
+ 
++#ifdef __EMSCRIPTEN__
++extern "C" void lo_wasm_progress_import_tick();   // BUG-38, weak in OOXMLDocumentImpl.cxx
++#endif
++
+ const sal_Unicode uCR = 0xd;
+ const sal_Unicode uFtnEdnRef = 0x2;
+ const sal_Unicode uFtnEdnSep = 0x3;
+@@ -1863,6 +1867,9 @@ void OOXMLFastContextHandlerShape::sendShape( Token_t Element )
+     mrShapeContext->setPosition(aPosition);
+     uno::Reference<drawing::XShape> xShape(mrShapeContext->getShape());
+     m_bShapeSent = true;
++#ifdef __EMSCRIPTEN__
++    lo_wasm_progress_import_tick();   // one per shape: a shape-heavy page has few paragraphs
++#endif
+     if (!xShape.is())
+         return;
+ 
+diff --git a/sw/source/core/layout/fly.cxx b/sw/source/core/layout/fly.cxx
+index 2f6974b..9203467 100644
+--- a/sw/source/core/layout/fly.cxx
++++ b/sw/source/core/layout/fly.cxx
+@@ -80,6 +80,13 @@
+ #include <ndtxt.hxx>
+ #include <formatflysplit.hxx>
+ 
++#ifdef __EMSCRIPTEN__
++// BUG-38: frame creation attaches every anchored object to its frames (before the layout
++// loop): a distinct object attached for the first time is engine progress too. Keyed by
++// its SwFrameFormat; the strong definition is in engine/bridge/wasm_bridge.cpp.
++extern "C" __attribute__((weak)) void lo_wasm_progress_layout_append(const void*) {}
++#endif
++
+ using namespace ::com::sun::star;
+ 
+ namespace
+@@ -2677,6 +2684,9 @@ void SwFlyFrame::Cut()
+ 
+ void SwFrame::AppendFly( SwFlyFrame *pNew )
+ {
++#ifdef __EMSCRIPTEN__
++    lo_wasm_progress_layout_append(pNew->GetFrameFormat());
++#endif
+     if (!m_pDrawObjs)
+     {
+         m_pDrawObjs.reset(new SwSortedObjs());
+@@ -2737,6 +2747,9 @@ void SwFrame::RemoveFly( SwFlyFrame *pToRemove )
+ 
+ void SwFrame::AppendDrawObj( SwAnchoredObject& _rNewObj )
+ {
++#ifdef __EMSCRIPTEN__
++    lo_wasm_progress_layout_append(_rNewObj.GetFrameFormat());
++#endif
+     assert(!m_pDrawObjs || m_pDrawObjs->is_sorted());
+ 
+     if ( dynamic_cast<const SwAnchoredDrawObject*>( &_rNewObj) ==  nullptr )

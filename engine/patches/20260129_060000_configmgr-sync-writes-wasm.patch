@@ -1,0 +1,28 @@
+diff --git a/configmgr/source/components.cxx b/configmgr/source/components.cxx
+index 85e66a1f27f6..6641f96cc677 100644
+--- a/configmgr/source/components.cxx
++++ b/configmgr/source/components.cxx
+@@ -305,12 +305,23 @@ void Components::writeModifications() {
+     case ModificationTarget::None:
+         break;
+     case ModificationTarget::File:
++#ifdef __EMSCRIPTEN__
++        // In WASM, write synchronously to avoid background thread deadlocks.
++        // The WriteThread uses condition variables and cross-thread signaling
++        // that deadlocks with the SolarMutex in WASM's threading model.
++        try {
++            writeModFile(*this, modificationFileUrl_, data_);
++        } catch (css::uno::RuntimeException &) {
++            TOOLS_WARN_EXCEPTION("configmgr", "error writing modifications");
++        }
++#else
+         if (!writeThread_.is()) {
+             writeThread_ = new WriteThread(
+                 &writeThread_, *this, modificationFileUrl_, data_);
+             writeThread_->launch();
+         }
+         writeThread_->trigger();
++#endif
+         break;
+     case ModificationTarget::Dconf:
+ #if ENABLE_DCONF

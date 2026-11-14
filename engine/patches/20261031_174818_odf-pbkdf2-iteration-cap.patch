@@ -1,0 +1,65 @@
+package: refuse an out-of-range PBKDF2 iteration count or derived key length in an encrypted ODF package.
+
+ZipFile::StaticGetCipher derives the content key with rtl_digest_PBKDF2 using the iteration
+count and the derived key length the document's manifest declares (manifest:iteration-count
+and manifest:key-size of the key-derivation element, read with OUString::toInt32()). The
+derivation runs before the cipher is created, so it runs for every encrypted entry, whether
+or not the password is right, in one uninterruptible single-threaded call. The count is passed
+as sal_uInt32: a negative value means about 4.29 billion rounds and 2147483647 about 2.1
+billion. The key length was only checked for being negative, and PBKDF2 derives that many
+bytes: a length of 1048576 with LibreOffice's own 100000 rounds is the same kind of stall. A
+small crafted file keeps the process busy for minutes to hours with no way to cancel and no
+message.
+
+Accept iteration counts 1 .. 10,000,000 (the bound the OOXML agile engine puts on spinCount,
+oox/source/crypto/AgileEngine.cxx) and key lengths up to 64 bytes (AES-256 uses 32), and
+otherwise throw ZipIOException with a clear text, before any work is done. LibreOffice itself
+writes 100000 rounds and 32 bytes. A missing count on the PBKDF2 path (the optional was
+dereferenced unchecked) is refused the same way. The Argon2 and gpg4libre paths keep their
+own checks; the key-length bound applies to them too, since the buffer is allocated first.
+
+diff --git a/package/source/zipapi/ZipFile.cxx b/package/source/zipapi/ZipFile.cxx
+--- a/package/source/zipapi/ZipFile.cxx
++++ b/package/source/zipapi/ZipFile.cxx
+@@ -154,12 +154,23 @@
+     return xDigestContext;
+ }
+ 
++namespace {
++// Same bound as the spin count of the OOXML "agile" encryption
++// (oox/source/crypto/AgileEngine.cxx).
++constexpr sal_Int32 nMaxPBKDF2IterationCount = 10000000;
++// The longest key any package cipher uses is 32 bytes (AES-256).
++constexpr sal_Int32 nMaxDerivedKeySize = 64;
++}
++
+ uno::Reference< xml::crypto::XCipherContext > ZipFile::StaticGetCipher( const uno::Reference< uno::XComponentContext >& xArgContext, const ::rtl::Reference< EncryptionData >& xEncryptionData, bool bEncrypt )
+ {
+     uno::Reference< xml::crypto::XCipherContext > xResult;
+ 
+-    if (xEncryptionData->m_nDerivedKeySize < 0)
++    if (xEncryptionData->m_nDerivedKeySize < 0
++        || xEncryptionData->m_nDerivedKeySize > nMaxDerivedKeySize)
+     {
++        // the length comes straight from the manifest of the document: PBKDF2
++        // derives that many bytes, so a large value is a long uninterruptible call
+         throw ZipIOException(u"Invalid derived key length!"_ustr );
+     }
+ 
+@@ -203,6 +214,16 @@
+             throw ZipIOException(u"argon2id_ctx failed to derive key"_ustr);
+         }
+     }
++    else if (!xEncryptionData->m_oPBKDFIterationCount
++             || *xEncryptionData->m_oPBKDFIterationCount < 1
++             || *xEncryptionData->m_oPBKDFIterationCount > nMaxPBKDF2IterationCount)
++    {
++        // the count comes straight from the manifest of the document and is
++        // passed on as unsigned: a negative value would mean billions of
++        // rounds in one uninterruptible call
++        SAL_WARN("package", "PBKDF2 iteration count is missing or out of range");
++        throw ZipIOException(u"PBKDF2 iteration count is out of range"_ustr);
++    }
+     else if ( rtl_Digest_E_None != rtl_digest_PBKDF2( reinterpret_cast< sal_uInt8* >( aDerivedKey.getArray() ),
+                         aDerivedKey.getLength(),
+                         reinterpret_cast< const sal_uInt8 * > (xEncryptionData->m_aKey.getConstArray() ),
