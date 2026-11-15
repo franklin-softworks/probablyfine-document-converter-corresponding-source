@@ -1,0 +1,23 @@
+diff --git a/oox/source/drawingml/textparagraphproperties.cxx b/oox/source/drawingml/textparagraphproperties.cxx
+index 54c1d23..ea30352 100644
+--- a/oox/source/drawingml/textparagraphproperties.cxx
++++ b/oox/source/drawingml/textparagraphproperties.cxx
+@@ -453,6 +453,18 @@ void TextParagraphProperties::pushToPropSet( const ::oox::core::XmlFilterBase* p
+             rioBulletMap.setProperty( PROP_FirstLineOffset, *noFirstLineIndentation);
+             noFirstLineIndentation.reset();
+         }
++#ifdef __EMSCRIPTEN__
++        // BUG-84: OOXML's indent defaults to 0. A bullet (a character) with NO indent anywhere in the chain (paragraph, list style, layout, master) was left
++        // with LibreOffice's own numbering-rule default, a hanging label (bullet 0.6 cm left of the text, label at least 0.6 cm wide): PowerPoint puts the
++        // bullet AT marL and the text right after it, with only the bullet's own width. Measured on the Office reference renders of the repository decks:
++        // the bullet is at the reference x with this (was 17 pt left of it), and a bulleted callout whose line fills its box no longer overflows by the
++        // extra 10 pt. Only a bullet character, and only when a bullet map is written.
++        else if ( nNumberingType == NumberingType::CHAR_SPECIAL && !rioBulletMap.empty() )
++        {
++            aPropSet.setProperty<sal_Int32>( PROP_ParaFirstLineIndent, 0);
++            rioBulletMap.setProperty( PROP_FirstLineOffset, sal_Int32(0));
++        }
++#endif
+         if ( nNumberingType != NumberingType::BITMAP && !rioBulletMap.hasProperty( PROP_BulletColor ) && pFilterBase )
+             rioBulletMap.setProperty( PROP_BulletColor, maTextCharacterProperties.maFillProperties.getBestSolidColor().getColor( pFilterBase->getGraphicHelper()));
+     }
