@@ -1,0 +1,147 @@
+From: Claude <claude@anthropic.com>
+Date: Tue, 28 Jul 2026 15:00:00 +0000
+Subject: [PATCH] Actually enable ENABLE_WASM_STRIP_HUNSPELL (it was wired to nothing)
+
+WHY IS HUNSPELL STILL LINKED?
+
+Not because a flag misbehaved -- because upstream built the entire strip
+mechanism and then never connected the switch to it.
+
+`ENABLE_WASM_STRIP_HUNSPELL` is consulted in six places, all of them complete
+and correct:
+
+  Repository.mk:376                          -- drops the hyphen/lnth/spell
+                                                library registrations
+  RepositoryExternal.mk:573                  -- drops gb_LinkTarget__use_hunspell
+                                                and gb_ExternalProject__use_hunspell
+  lingucomponent/Module_lingucomponent.mk:19 -- drops Library_hyphen, Library_lnth,
+                                                Library_spell, StaticLibrary_ulingu
+  external/hunspell/StaticLibrary_hunspell.mk:23 -- drops hunspell.cxx
+  external/hyphen/ExternalProject_hyphen.mk:12   -- drops the hunspell dependency
+  external/mythes/ExternalProject_mythes.mk:12   -- drops the hunspell dependency
+
+And the variable itself is hardcoded to the empty string:
+
+  config_host.mk.in:259  export ENABLE_WASM_STRIP_HUNSPELL=
+
+configure.ac never assigns it and never AC_SUBSTs it; the only mention there is
+line 3375, `#    AC_DEFINE(ENABLE_WASM_STRIP_HUNSPELL)`, commented out. So
+`ifneq ($(ENABLE_WASM_STRIP_HUNSPELL),TRUE)` is true in every build that has
+ever been made, and all six guards are dead code. The neighbouring
+ENABLE_WASM_STRIP_GUESSLANG (line 258) shows what the line was meant to say.
+
+This is why --without-fonts and --disable-gui had no effect on it: hunspell is
+not reached through either. It is reached because libspelllo.a / libhyphenlo.a /
+liblnthlo.a each declare a .component file, and solenv/gbuild/static.mk:66-67
+force-links EVERY library that has one into the static `components` library:
+
+    $(foreach lib,$(gb_Library_KNOWNLIBS),$(if $(call gb_Library__get_component,$(lib)), \
+        $(eval $(call gb_Library_use_libraries,components,$(lib)))))
+
+`components` is then linked into soffice_bin with -Wl,--whole-archive
+(desktop/Executable_soffice_bin.mk), and solenv/bin/native-code.py emits a
+static map naming lingucomponent_SpellChecker/Hyphenator/Thesaurus_get_implementation
+by symbol, so --gc-sections can never reach them. Feature flags are not part of
+that decision at any point.
+
+WHY IT IS SAFE
+
+The three services are already inert at runtime in this build. No dictionaries
+ship: the `dictionaries` module is not in BUILD_TYPE, there is not a single
+.aff/.dic/.dat hyphenation or spelling dictionary in instdir, and the runtime
+VFS (soffice.data) holds 86 files, none of them dictionary data. So
+SpellChecker/Hyphenator/Thesaurus register with zero locales today, and every
+consumer already takes the "no service" branch:
+
+  - sw/source/core/text/inftxt.cxx:1743-1763 SwTextFormatInfo::IsHyphenate()
+    returns false when xHyph->hasLocale() is false, which it already is. Line
+    breaking is unchanged, so PDF pagination is unchanged.
+  - linguistic/source/hyphdsp.cxx:283-287 returns nullptr (not throw) when no
+    service is registered for the locale; likewise createPossibleHyphens() and
+    queryAlternativeSpelling().
+  - editeng/source/misc/unolingu.cxx:483-533 LinguMgr::GetHyphenator() never
+    returns null -- it falls back to HyphDummy_Impl -- so the two unguarded
+    call sites (sw/source/core/text/guess.cxx:893, sw/source/core/edit/
+    acorrect.cxx:553) stay safe.
+  - linguistic/source/spelldsp.cxx:261 isValid_Impl() returns "word is fine".
+  - linguistic/source/lngsvcmgr.cxx:931-946 GetAvailableSpellSvcs_Impl() and
+    its siblings emplace an empty vector before enumerating, so an empty
+    component map is the handled case, not an edge case.
+
+Nothing throws; the sites that could complain use SAL_WARN or debug-only
+DBG_ASSERT/OSL_ENSURE.
+
+Document IMPORT never touches linguistics at all: grepping sw/source/filter/,
+sw/source/writerfilter/ and oox/ for LinguMgr|XSpellChecker|XHyphenator|
+XThesaurus returns nothing. Spell checking is reached only via SwLayIdle
+(sw/source/core/layout/layact.cxx:2245), gated on IsOnlineSpell().
+
+WHAT IS DELIBERATELY KEPT
+
+  - `linguistic` (liblnglo.a, 201.8 KiB of retained code). This is the
+    null-object layer -- LngSvcMgr, SpellCheckerDispatcher, HyphenatorDispatcher,
+    DicList -- that makes all of the graceful degradation above work. Removing
+    it is NOT covered by this patch and is not safe.
+  - `numbertext` (libnumbertextlo.a). NumberText lives in its own library and
+    Module_lingucomponent.mk:36-39 adds it OUTSIDE every guard, so this patch
+    does not touch it. It is genuinely live during conversion:
+    i18npool/source/nativenumber/nativenumbersupplier.cxx:605-623 uses it for
+    NatNum12 number formatting.
+
+PRECEDENT
+
+ENABLE_WASM_STRIP_GUESSLANG is already TRUE in this build and the identical
+removal worked: lingucomponent_LangGuess_get_implementation is absent from the
+generated services_constructors.list even though native-code.py:311 hardcodes
+it, and libguesslanglo.a is absent from services.rdb. Nothing regressed.
+
+MEASURED SAVING
+
+Retained code attributed to libspelllo.a + libhyphenlo.a + liblnthlo.a +
+libhunspell-1.7.a in the linked pre-wasm-opt soffice.wasm, by intersecting the
+binary's name section against each archive's WASM_SYMBOL_TABLE:
+
+    159 functions, 121,128 bytes exclusive (118.3 KiB)
+    largest: SpellChecker::GetSpellFailure 52,892 B
+             Thesaurus::queryMeanings      10,457 B
+             Hyphenator::hyphenate          5,362 B
+
+Plus hunspell's data tables: 399.7 KiB of data segments exist in
+libhunspell-1.7.a; scaling by the measured 27% code-retention ratio gives
+~100-110 KiB actually retained (ESTIMATE, not measured -- data segments cannot
+be attributed to an archive from the linked binary).
+
+Wire estimate ~55-75 KiB brotli, using the module's own raw->wire factor of
+0.202 (117,190,355 B linked -> 95,893,393 B after wasm-opt -> 23,700,411 B
+brotli) for the code and a worse ratio for the data tables.
+
+RISK / WHAT WOULD BREAK
+
+If a document requests automatic hyphenation, its line breaks would change --
+but only if a hyphenation dictionary were present, and none is, so this is a
+no-op today. If dictionaries are ever added to the VFS, this patch must be
+reverted first. The hyphenation layout tests already self-skip on
+`!xHyphenator->hasLocale(en-US)` (sw/qa/extras/layout/layout2.cxx:1218), which
+is direct evidence the services are already inert.
+
+Test that would catch a regression: `./tests/run_validation.sh --visual`
+(pixel-level PDF comparison) on a DOCX with automatic hyphenation enabled, plus
+`./tests/run_validation.sh --text`. The build-integration guard is that the
+services_constructors.list is regenerated from the built .component files, so a
+stale reference is impossible.
+
+diff --git a/config_host.mk.in b/config_host.mk.in
+--- a/config_host.mk.in
++++ b/config_host.mk.in
+@@ -256,7 +256,10 @@
+ export ENABLE_WASM_STRIP_EPUB=@ENABLE_WASM_STRIP@
+ export ENABLE_WASM_STRIP_EXTRA=@ENABLE_WASM_STRIP@
+ export ENABLE_WASM_STRIP_GUESSLANG=@ENABLE_WASM_STRIP@
+-export ENABLE_WASM_STRIP_HUNSPELL=
++# WASM: was hardcoded empty, which made all six ENABLE_WASM_STRIP_HUNSPELL
++# guards in the tree dead code. A headless converter never spell-checks and
++# this build ships no dictionaries, so follow GUESSLANG above.
++export ENABLE_WASM_STRIP_HUNSPELL=@ENABLE_WASM_STRIP@
+ export ENABLE_WASM_STRIP_LANGUAGETOOL=@ENABLE_WASM_STRIP@
+ export ENABLE_WASM_STRIP_LOCALES=@ENABLE_WASM_STRIP@
+ export ENABLE_WASM_STRIP_PINGUSER=@ENABLE_WASM_STRIP@
