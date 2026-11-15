@@ -1,0 +1,214 @@
+--- a/sc/source/filter/excel/xetable.cxx
++++ b/sc/source/filter/excel/xetable.cxx
+@@ -42,6 +42,9 @@
+ #include <xlcontent.hxx>
+ #include <xltools.hxx>
+ #include <tokenarray.hxx>
++#ifdef __EMSCRIPTEN__
++#include <rangenam.hxx>
++#endif
+ #include <formula/errorcodes.hxx>
+ #include <comphelper/threadpool.hxx>
+ #include <oox/token/tokens.hxx>
+@@ -939,11 +942,92 @@
+         mxStringRec->Save( rStrm );
+ }
+ 
++#ifdef __EMSCRIPTEN__
++namespace {
++
++/** BUG-89: the characters a defined name may have in xlsx (the formula text names it; a name with a space cannot be parsed). */
++bool lcl_IsFormulaNameParsable( const OUString& rName )
++{
++    if( rName.isEmpty() )
++        return false;
++    for( sal_Int32 i = 0; i < rName.getLength(); ++i )
++    {
++        const sal_Unicode c = rName[i];
++        const bool bLetter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '\\' || c > 0x7f;
++        const bool bDigitEtc = (c >= '0' && c <= '9') || c == '.' || c == '?';
++        if( !(bLetter || (i > 0 && bDigitEtc)) )
++            return false;
++    }
++    return true;
++}
++
++/** BUG-89: can the text of this formula be written to an xlsx file and read back by Excel? A formula Excel cannot parse makes Excel refuse the whole file. Not
++    expressible: an unresolved reference the import kept as a "bad" token (an external workbook of a BIFF5 file: the text comes out empty or as bare operators:
++    "+", "++", "(+)/"), a call of an unknown function (an Excel 4 macro function comes out as "#NAME!()": an error constant followed by an argument list), a name
++    Excel does not accept. Such a cell is written as its cached value only. */
++bool lcl_IsXmlFormulaExpressible( const ScTokenArray& rCode, const OUString& rText, const ScDocument& rDoc )
++{
++    const OUString aText = rText.trim();
++    if( aText.isEmpty() )
++        return false;
++    bool bOperand = false;
++    for( sal_Int32 i = 0; i < aText.getLength() && !bOperand; ++i )
++    {
++        const sal_Unicode c = aText[i];
++        bOperand = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '"' || c == '\'' || c == '#' || c == '[' || c == '{' || c == '_' || c > 0x7f;
++    }
++    if( !bOperand )
++        return false;
++    // an error constant followed by "(": #NAME!(), #REF!(), #N/A(
++    for( sal_Int32 i = aText.indexOf( '#' ); i >= 0; i = aText.indexOf( '#', i + 1 ) )
++    {
++        sal_Int32 j = i + 1;
++        while( j < aText.getLength() && ((aText[j] >= 'A' && aText[j] <= 'Z') || (aText[j] >= '0' && aText[j] <= '9') || aText[j] == '/') )
++            ++j;
++        if( j < aText.getLength() && (aText[j] == '!' || aText[j] == '?') )
++            ++j;
++        if( j > i + 1 && j < aText.getLength() && aText[j] == '(' )
++            return false;
++    }
++    const sal_uInt16 nLen = rCode.GetLen();
++    formula::FormulaToken** pTokens = rCode.GetArray();
++    for( sal_uInt16 i = 0; i < nLen; ++i )
++    {
++        const OpCode eOp = pTokens[i]->GetOpCode();
++        if( eOp == ocBad )
++            return false;
++        if( eOp == ocName )
++        {
++            const ScRangeData* pName = rDoc.FindRangeNameBySheetAndIndex( pTokens[i]->GetSheet(), pTokens[i]->GetIndex() );
++            if( pName && !lcl_IsFormulaNameParsable( pName->GetName() ) )
++                return false;
++        }
++    }
++    return true;
++}
++
++}
++#endif
++
+ void XclExpFormulaCell::SaveXml( XclExpXmlStream& rStrm )
+ {
+     const char* sType = nullptr;
+     OUString    sValue;
+     XclXmlUtils::GetFormulaTypeAndValue( mrScFmlaCell, sType, sValue );
++#ifdef __EMSCRIPTEN__
++    // BUG-89: the text of the formula is made once; a formula Excel cannot parse is written as its cached value only (no <f>)
++    OUString aFormulaText;
++    bool bExpressible = true;
++    if( mrScFmlaCell.GetMatrixFlag() != ScMatrixMode::Reference )
++    {
++        aFormulaText = XclXmlUtils::ToOUString( rStrm.GetRoot().GetCompileFormulaContext(), mrScFmlaCell.aPos, mrScFmlaCell.GetCode(),
++                                                mrScFmlaCell.GetErrCode() );
++        bExpressible = lcl_IsXmlFormulaExpressible( *mrScFmlaCell.GetCode(), aFormulaText, rStrm.GetRoot().GetDoc() );
++        // a string result without a formula is an inline string, not a "formula string"
++        if( !bExpressible && sType && strcmp( sType, "str" ) == 0 )
++            sType = "inlineStr";
++    }
++#endif
+     sax_fastparser::FSHelperPtr& rWorksheet = rStrm.GetCurrentStream();
+     rWorksheet->startElement( XML_c,
+             XML_r, XclXmlUtils::ToOString(rStrm.GetRoot().GetStringBuf(), GetXclPos()).getStr(),
+@@ -966,6 +1050,13 @@
+             break;
+         case ScMatrixMode::Formula:
+             {
++#ifdef __EMSCRIPTEN__
++                if( !bExpressible )
++                {
++                    bWriteFormula = false;
++                    break;
++                }
++#endif
+                 // origin of the matrix - find the used matrix range
+                 SCCOL nMatWidth;
+                 SCROW nMatHeight;
+@@ -1013,6 +1104,10 @@
+             break;
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    if( !bExpressible )
++        bWriteFormula = false;
++#endif
+     if (bWriteFormula)
+     {
+         if (!bTagStarted)
+@@ -1021,9 +1116,13 @@
+                     XML_aca, ToPsz( (mxTokArr && mxTokArr->IsVolatile()) ||
+                         (mxAddRec && mxAddRec->IsVolatile()) ) );
+         }
++#ifdef __EMSCRIPTEN__
++        rWorksheet->writeEscaped( aFormulaText );
++#else
+         rWorksheet->writeEscaped( XclXmlUtils::ToOUString(
+                     rStrm.GetRoot().GetCompileFormulaContext(), mrScFmlaCell.aPos, mrScFmlaCell.GetCode(),
+                     mrScFmlaCell.GetErrCode()));
++#endif
+         rWorksheet->endElement( XML_f );
+     }
+ 
+--- a/sc/source/filter/excel/xename.cxx
++++ b/sc/source/filter/excel/xename.cxx
+@@ -327,8 +327,48 @@
+     return rSymbol;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++namespace {
++
++/** BUG-89: may this defined name be written to an xlsx file? A name Excel refuses makes Excel refuse the whole file: a name with a space or another character a name
++    cannot have (Lotus-era "123Graph_ACHART 1="), an error value, and the auto-run names Excel 4 macros use (Auto_Open, Auto_Close, Auto_Activate, Auto_Deactivate,
++    imported as Excel_BuiltIn_Auto_Open ...): this converter never writes anything that runs. */
++bool lcl_IsDefinedNameWritable( const OUString& rName, const OUString& rSymbol, sal_Unicode cBuiltIn )
++{
++    if( cBuiltIn != EXC_BUILTIN_UNKNOWN )
++    {
++        if( cBuiltIn == EXC_BUILTIN_AUTOOPEN || cBuiltIn == EXC_BUILTIN_AUTOCLOSE || cBuiltIn == EXC_BUILTIN_AUTOACTIVATE || cBuiltIn == EXC_BUILTIN_AUTODEACTIVATE )
++            return false;
++        return true;
++    }
++    if( rName.isEmpty() || rName.getLength() > 255 )
++        return false;
++    for( sal_Int32 i = 0; i < rName.getLength(); ++i )
++    {
++        const sal_Unicode c = rName[i];
++        const bool bLetter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '\\' || c > 0x7f;
++        const bool bDigitEtc = (c >= '0' && c <= '9') || c == '.' || c == '?';
++        if( !(bLetter || (i > 0 && bDigitEtc)) )
++            return false;
++    }
++    if( rName.equalsIgnoreAsciiCase( u"Auto_Open" ) || rName.equalsIgnoreAsciiCase( u"Auto_Close" )
++        || rName.equalsIgnoreAsciiCase( u"Auto_Activate" ) || rName.equalsIgnoreAsciiCase( u"Auto_Deactivate" )
++        || rName.startsWithIgnoreAsciiCase( u"Excel_BuiltIn_Auto_" ) )
++        return false;
++    if( rSymbol.isEmpty() || rSymbol.startsWith( "#" ) )     // no definition (written as #NAME?) or an error value (#REF!)
++        return false;
++    return true;
++}
++
++}
++#endif
++
+ void XclExpName::SaveXml( XclExpXmlStream& rStrm )
+ {
++#ifdef __EMSCRIPTEN__
++    if( !lcl_IsDefinedNameWritable( maOrigName, msSymbol, mcBuiltIn ) )
++        return;
++#endif
+     sax_fastparser::FSHelperPtr& rWorkbook = rStrm.GetCurrentStream();
+     // Sheets where IsExportTab is not true are not exported, so use mnXclTab
+     // (1 based) to get the sheetid as of the exported document's perspective.
+@@ -545,6 +585,18 @@
+ {
+     if( maNameList.IsEmpty() )
+         return;
++#ifdef __EMSCRIPTEN__
++    // BUG-89: an empty <definedNames/> is not valid either
++    bool bAnyWritable = false;
++    for( size_t nPos = 0, nSize = maNameList.GetSize(); nPos < nSize && !bAnyWritable; ++nPos )
++    {
++        const XclExpName* pName = maNameList.GetRecord( nPos );
++        if( pName && lcl_IsDefinedNameWritable( pName->GetOrigName(), pName->GetSymbol(), pName->GetBuiltInName() ) )
++            bAnyWritable = true;
++    }
++    if( !bAnyWritable )
++        return;
++#endif
+     sax_fastparser::FSHelperPtr& rWorkbook = rStrm.GetCurrentStream();
+     rWorkbook->startElement(XML_definedNames);
+     maNameList.SaveXml( rStrm );

@@ -1,0 +1,22 @@
+diff --git a/external/cairo/ExternalProject_pixman.mk b/external/cairo/ExternalProject_pixman.mk
+index f95fcb626ccc..b2751ad02958 100644
+--- a/external/cairo/ExternalProject_pixman.mk
++++ b/external/cairo/ExternalProject_pixman.mk
+@@ -25,12 +25,11 @@ $(call gb_ExternalProject_get_state_target,pixman,build) :
+ 	$(call gb_ExternalProject_run,build,\
+ 		$(gb_RUN_CONFIGURE) ./configure \
+ 		$(if $(filter TRUE,$(DISABLE_DYNLOADING)),--disable-shared,--disable-static) \
+-		$(if $(filter ANDROID,$(OS)),--disable-arm-simd --disable-arm-neon --disable-arm-a64-neon --disable-arm-iwmmxt) \
+-		$(gb_CONFIGURE_PLATFORMS) \
+-		$(if $(CROSS_COMPILING),$(if $(filter INTEL ARM,$(CPUNAME)),ac_cv_c_bigendian=no)) \
+-		$(if $(filter EMSCRIPTEN,$(OS)),CFLAGS="-O3 -pthread -msimd128") \
+-		$(if $(filter -fsanitize=undefined,$(CC)),CC='$(CC) -fno-sanitize=function') \
+-		&& $(MAKE) \
++		                $(if $(filter ANDROID,$(OS)),--disable-arm-simd --disable-arm-neon --disable-arm-a64-neon --disable-arm-iwmmxt) \
++		                $(gb_CONFIGURE_PLATFORMS) \
++		                $(if $(CROSS_COMPILING),$(if $(filter INTEL ARM,$(CPUNAME)),ac_cv_c_bigendian=no)) \
++		                $(if $(filter EMSCRIPTEN,$(OS)),--disable-sse2 --disable-ssse3 --disable-vmx CFLAGS="-O3 -pthread") \
++		                $(if $(filter -fsanitize=undefined,$(CC)),CC='$(CC) -fno-sanitize=function') \		&& $(MAKE) \
+ 	)
+ 	$(call gb_Trace_EndRange,pixman,EXTERNAL)
+ 

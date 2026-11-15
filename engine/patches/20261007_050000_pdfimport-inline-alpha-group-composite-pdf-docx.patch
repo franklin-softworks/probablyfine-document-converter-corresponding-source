@@ -1,0 +1,464 @@
+diff --git a/sdext/source/pdfimport/inc/contentsink.hxx b/sdext/source/pdfimport/inc/contentsink.hxx
+index 8699399..bcf2cf5 100644
+--- a/sdext/source/pdfimport/inc/contentsink.hxx
++++ b/sdext/source/pdfimport/inc/contentsink.hxx
+@@ -199,4 +199,15 @@ namespace pdfi
+         virtual void shadedFill(const css::geometry::RealRectangle2D& rRect,
+                                 const css::uno::Sequence<css::beans::PropertyValue>& xImage) = 0;
++
++        /** FG-177: the records up to the matching endAlphaGroup() belong to a
++            transparency group painted at constant alpha fAlpha (< 1, the
++            product of every open group's alpha). The wrapper has already
++            multiplied fAlpha into each fill/stroke colour inside (FG-176),
++            which is exact only where the content does not overlap; a sink
++            that can composite the content as ONE shape should do so.
++            Groups nest. Default: ignore (per-element compositing).
++         */
++        virtual void beginAlphaGroup( double /*fAlpha*/ ) {}
++        virtual void endAlphaGroup() {}
+     };
+ 
+diff --git a/sdext/source/pdfimport/inc/pdfiprocessor.hxx b/sdext/source/pdfimport/inc/pdfiprocessor.hxx
+index 3d13268..43d3e79 100644
+--- a/sdext/source/pdfimport/inc/pdfiprocessor.hxx
++++ b/sdext/source/pdfimport/inc/pdfiprocessor.hxx
+@@ -167,4 +167,13 @@ namespace pdfi
+                                 const css::uno::Sequence<css::beans::PropertyValue>& xImage) override;
+ 
++        // FG-177: a transparency group painted at constant alpha. Where every
++        // element the group produced is an opaque fill of one colour (its
++        // alpha is exactly the group's), their UNION is emitted once at that
++        // alpha, which is the exact composite; overlapping members would
++        // otherwise stack to 1-(1-a)^n. Anything else (strokes, text, images,
++        // several colours, a nested group) keeps per-element compositing.
++        virtual void beginAlphaGroup( double fAlpha ) override;
++        virtual void endAlphaGroup() override;
++
+         void startIndicator( const OUString& rText );
+         void endIndicator();
+@@ -196,4 +205,13 @@ namespace pdfi
+         ImageContainer                     m_aImages;
+ 
++        /// FG-177: one open alpha group (they nest).
++        struct AlphaGroupFrame
++        {
++            Element* pParent = nullptr;  ///< m_pCurElement at begin
++            size_t   nChildrenBefore = 0; ///< pParent->Children.size() at begin
++            double   fAlpha = 1.0;
++        };
++        std::vector<AlphaGroupFrame>       m_aAlphaGroups;
++
+         sal_Int32                          m_nPages;
+         sal_Int32                          m_nNextZOrder;
+diff --git a/sdext/source/pdfimport/tree/pdfiprocessor.cxx b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+index 59699fc..8ec5656 100644
+--- a/sdext/source/pdfimport/tree/pdfiprocessor.cxx
++++ b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+@@ -35,4 +35,5 @@
+ #include <basegfx/polygon/b2dpolygontools.hxx>
+ #include <basegfx/polygon/b2dpolypolygoncutter.hxx>
++#include <basegfx/polygon/b2dpolypolygontools.hxx>
+ #include <basegfx/utils/canvastools.hxx>
+ #include <basegfx/vector/b2enums.hxx>
+@@ -519,4 +520,137 @@ void PDFIProcessor::shadedFill(const geometry::RealRectangle2D& rRect,
+ }
+ 
++// FG-177: transparency groups composited as ONE shape where that is exact.
++//
++// The wrapper multiplies a group's alpha into every fill it emits inside the
++// group (FG-176). That is the group's composite only where its members do
++// not overlap: n overlapping layers at alpha a show 1-(1-a)^n, the group a.
++// fahr page 17's background is two groups of 36 overlapping opaque ribbons
++// at /ca 0.30 -- per element they stacked into dark bands.
++//
++// When every element the group produced is a plain fill (no stroke, no
++// bitmap) of one colour at exactly the group's alpha, the group's composite
++// is that colour at that alpha over the UNION of the fills: emit the union
++// once. The members are already clipped and in device space (fillPath), so
++// differing clips inside the group do not matter. Anything else -- strokes,
++// text, images, several colours, an element whose own /ca was not 1, a
++// nested group (its merged element carries the inner alpha) -- keeps the
++// per-element approximation, as before this change.
++//
++// Cost is bounded: no merge when no two members' bounds overlap (per
++// element is exact then), and none above nMaxMembers / nMaxPoints (the
++// polygon cutter is quadratic in edges). Curves are subdivided first, so a
++// merged group is emitted as straight segments.
++void PDFIProcessor::beginAlphaGroup( double fAlpha )
++{
++    AlphaGroupFrame aFrame;
++    aFrame.pParent = m_pCurElement;
++    aFrame.nChildrenBefore = m_pCurElement ? m_pCurElement->Children.size() : 0;
++    aFrame.fAlpha = fAlpha;
++    m_aAlphaGroups.push_back(aFrame);
++}
++
++namespace
++{
++    basegfx::B2DPolyPolygon lcl_flattened( const basegfx::B2DPolyPolygon& rPoly )
++    {
++        return rPoly.areControlPointsUsed() ? basegfx::utils::adaptiveSubdivideByAngle(rPoly) : rPoly;
++    }
++    sal_uInt32 lcl_pointCount( const basegfx::B2DPolyPolygon& rPoly )
++    {
++        sal_uInt32 n = 0;
++        for (sal_uInt32 i = 0; i < rPoly.count(); ++i)
++            n += rPoly.getB2DPolygon(i).count();
++        return n;
++    }
++}
++
++void PDFIProcessor::endAlphaGroup()
++{
++    if (m_aAlphaGroups.empty())
++        return;
++    const AlphaGroupFrame aFrame = m_aAlphaGroups.back();
++    m_aAlphaGroups.pop_back();
++
++    Element* pParent = aFrame.pParent;
++    if (!pParent || pParent != m_pCurElement)
++        return;
++    if (pParent->Children.size() < aFrame.nChildrenBefore + 2)
++        return;
++
++    constexpr size_t nMaxMembers = 512;
++    constexpr sal_uInt32 nMaxPoints = 12000;
++
++    typedef std::list<std::unique_ptr<Element>>::iterator ChildIt;
++    std::vector<ChildIt> aMembers;
++    std::vector<basegfx::B2DRange> aRanges;
++    const GraphicsContext* pFirstGC = nullptr;
++    bool bOverlap = false;
++
++    ChildIt it = pParent->Children.begin();
++    std::advance(it, aFrame.nChildrenBefore);
++    for (; it != pParent->Children.end(); ++it)
++    {
++        PolyPolyElement* pPoly = dynamic_cast<PolyPolyElement*>(it->get());
++        if (!pPoly)
++            return; // text, an image frame, ...: not a plain fill group
++        if (pPoly->Action != PATH_FILL && pPoly->Action != PATH_EOFILL)
++            return;
++        if (pPoly->FillImage != -1)
++            return;
++        const GraphicsContext& rGC = getGraphicsContext(pPoly->GCId);
++        if (!pFirstGC)
++        {
++            // Alpha exactly the group's: the element's own /ca was 1.
++            if (!basegfx::fTools::equal(rGC.FillColor.Alpha, aFrame.fAlpha, 1e-4))
++                return;
++            pFirstGC = &rGC;
++        }
++        else if (rGC.FillColor.Red   != pFirstGC->FillColor.Red   ||
++                 rGC.FillColor.Green != pFirstGC->FillColor.Green ||
++                 rGC.FillColor.Blue  != pFirstGC->FillColor.Blue  ||
++                 rGC.FillColor.Alpha != pFirstGC->FillColor.Alpha ||
++                 rGC.BlendMode       != pFirstGC->BlendMode)
++        {
++            return;
++        }
++        if (aMembers.size() >= nMaxMembers)
++            return;
++        const basegfx::B2DRange aRange(pPoly->PolyPoly.getB2DRange());
++        if (!bOverlap)
++            for (const basegfx::B2DRange& rOther : aRanges)
++                if (aRange.overlaps(rOther)) { bOverlap = true; break; }
++        aRanges.push_back(aRange);
++        aMembers.push_back(it);
++    }
++    if (aMembers.size() < 2 || !bOverlap)
++        return;
++
++    basegfx::B2DPolyPolygonVector aInput;
++    aInput.reserve(aMembers.size());
++    sal_uInt32 nPoints = 0;
++    for (const ChildIt& rIt : aMembers)
++    {
++        basegfx::B2DPolyPolygon aPoly(lcl_flattened(static_cast<PolyPolyElement*>(rIt->get())->PolyPoly));
++        nPoints += lcl_pointCount(aPoly);
++        if (nPoints > nMaxPoints)
++            return;
++        aInput.push_back(aPoly);
++    }
++
++    const basegfx::B2DPolyPolygon aUnion(basegfx::utils::mergeToSinglePolyPolygon(aInput));
++    if (!aUnion.count())
++        return;
++
++    // The first member becomes the group: lowest z-order, its colour, its
++    // alpha (the group's). The union is solved, so nonzero and even-odd
++    // agree on it.
++    PolyPolyElement* pFirst = static_cast<PolyPolyElement*>(aMembers.front()->get());
++    pFirst->PolyPoly = aUnion;
++    pFirst->Action = PATH_FILL;
++    pFirst->updateGeometry();
++    for (size_t i = 1; i < aMembers.size(); ++i)
++        pParent->Children.erase(aMembers[i]);
++}
++
+ void PDFIProcessor::strokePath( const uno::Reference< rendering::XPolyPolygon2D >& rPath )
+ {
+diff --git a/sdext/source/pdfimport/tree/writertreevisiting.cxx b/sdext/source/pdfimport/tree/writertreevisiting.cxx
+index f4c7a04..9910fcc 100644
+--- a/sdext/source/pdfimport/tree/writertreevisiting.cxx
++++ b/sdext/source/pdfimport/tree/writertreevisiting.cxx
+@@ -237,5 +237,6 @@ void WriterXmlEmitter::visit( ParagraphElement& elem, const std::list< std::uniq
+ void WriterXmlEmitter::fillFrameProps( DrawElement&       rElem,
+                                        PropertyMap&       rProps,
+-                                       const EmitContext& rEmitContext )
++                                       const EmitContext& rEmitContext,
++                                       bool               bWasTransformed )
+ {
+     double rel_x = rElem.x, rel_y = rElem.y;
+@@ -306,9 +307,11 @@ void WriterXmlEmitter::fillFrameProps( DrawElement&       rElem,
+             aBuf.append("scale( 1.0 -1.0 )");
+         }
+-        if( fShearX != 0.0 )
++        // FG-177: for device-space geometry only the translation applies;
++        // the rotation and shear are already in the points.
++        if( fShearX != 0.0 && !bWasTransformed )
+         {
+             aBuf.append( "skewX( " + OUString::number(fShearX) + " )" );
+         }
+-        if( fRotate != 0.0 )
++        if( fRotate != 0.0 && !bWasTransformed )
+         {
+             if( !aBuf.isEmpty() )
+@@ -407,5 +410,11 @@ void WriterXmlEmitter::visit( PolyPolyElement& elem, const std::list< std::uniqu
+ 
+     PropertyMap aProps;
+-    fillFrameProps( elem, aProps, m_rEmitContext );
++    // FG-177: PDFIProcessor already transformed the path into device space,
++    // so the context's rotation/shear must not be emitted again. It was: a
++    // shading painted under a rotated "cm" (fahr page 17's shadow blobs)
++    // came back swung 45 degrees about its corner, over a neighbouring
++    // bubble. The Draw visitor has passed this flag since upstream fixed it
++    // there; this copy never did.
++    fillFrameProps( elem, aProps, m_rEmitContext, true );
+     aProps[ u"svg:viewBox"_ustr ] =
+         "0 0 "
+diff --git a/sdext/source/pdfimport/tree/writertreevisiting.hxx b/sdext/source/pdfimport/tree/writertreevisiting.hxx
+index b0644dd..bb9f86f 100644
+--- a/sdext/source/pdfimport/tree/writertreevisiting.hxx
++++ b/sdext/source/pdfimport/tree/writertreevisiting.hxx
+@@ -88,7 +88,12 @@ namespace pdfi
+         css::uno::Reference< css::i18n::XCharacterClassification > mxCharClass;
+         EmitContext& m_rEmitContext ;
++        /// bWasTransformed: the element's geometry is already in device
++        /// space (PDFIProcessor transforms paths, not images and text), so the
++        /// graphics context's rotation/shear must not be applied again. Same
++        /// contract as DrawXmlEmitter::fillFrameProps (FG-177).
+         static void fillFrameProps( DrawElement&       rElem,
+                              PropertyMap&       rProps,
+-                             const EmitContext& rEmitContext );
++                             const EmitContext& rEmitContext,
++                             bool               bWasTransformed = false );
+ 
+     public:
+diff --git a/sdext/source/pdfimport/wrapper/keyword_list b/sdext/source/pdfimport/wrapper/keyword_list
+index c11a405..0d58ec1 100644
+--- a/sdext/source/pdfimport/wrapper/keyword_list
++++ b/sdext/source/pdfimport/wrapper/keyword_list
+@@ -6,4 +6,5 @@ struct hash_entry { const char* name; enum parseKey eKey; };
+ 
+ %%
++beginAlphaGroup,BEGINALPHAGROUP
+ clipPath,CLIPPATH
+ clipToStrokePath,CLIPTOSTROKEPATH
+@@ -14,4 +15,5 @@ drawMask,DRAWMASK
+ drawMaskedImage,DRAWMASKEDIMAGE
+ drawSoftMaskedImage,DRAWSOFTMASKEDIMAGE
++endAlphaGroup,ENDALPHAGROUP
+ endPage,ENDPAGE
+ endTextObject,ENDTEXTOBJECT
+diff --git a/sdext/source/pdfimport/wrapper/wrapper.cxx b/sdext/source/pdfimport/wrapper/wrapper.cxx
+index e723b58..0c4e932 100644
+--- a/sdext/source/pdfimport/wrapper/wrapper.cxx
++++ b/sdext/source/pdfimport/wrapper/wrapper.cxx
+@@ -80,4 +80,5 @@ namespace
+ // converter
+ enum parseKey {
++    BEGINALPHAGROUP,
+     CLIPPATH,
+     CLIPTOSTROKEPATH,
+@@ -88,4 +89,5 @@ enum parseKey {
+     DRAWMASKEDIMAGE,
+     DRAWSOFTMASKEDIMAGE,
++    ENDALPHAGROUP,
+     ENDPAGE,
+     ENDTEXTOBJECT,
+@@ -909,4 +911,6 @@ void Parser::parseLine( std::string_view aLine )
+     switch( pEntry->eKey )
+     {
++        case BEGINALPHAGROUP:
++            m_pSink->beginAlphaGroup( lp.readDouble() ); break; // FG-177
+         case CLIPPATH:
+             m_pSink->intersectClip(lp.readPath()); break;
+@@ -925,4 +929,6 @@ void Parser::parseLine( std::string_view aLine )
+         case DRAWSOFTMASKEDIMAGE:
+             lp.readSoftMaskedImage(); break;
++        case ENDALPHAGROUP:
++            m_pSink->endAlphaGroup(); break; // FG-177
+         case ENDPAGE:
+             m_pSink->endPage(); break;
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+index 86c6a2e..2ebe5cf 100644
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+@@ -687,4 +687,10 @@ void PDFOutDev::startPage(int /*pageNum*/, GfxState* state
+     m_aSavedFillOpacity.clear();
+     m_aGroupAlphaStack.clear();
++    m_aGroupAlphaMarked.clear(); // FG-177
++    m_aSavedBlendMode.clear();
++    m_aGroupMultiply.clear();
++    m_aGroupKnockout.clear();
++    m_nMultiplyDepth = 0;
++    m_nKnockoutDepth = 0;
+     m_fGroupAlpha = 1.0;
+     // FG-175: spans are per page; the store set for this page is trusted
+@@ -747,4 +753,6 @@ void PDFOutDev::saveState(GfxState* state)
+     m_aTightClipStack.push_back(m_aTightClip);
+     m_aSavedFillOpacity.push_back(state ? state->getFillOpacity() : 1.0); // FG-176
++    m_aSavedBlendMode.push_back(state ? static_cast<int>(state->getBlendMode())
++                                      : static_cast<int>(gfxBlendNormal)); // FG-177
+     if (spanTrackerActive())
+         m_aSpans.saveState();
+@@ -761,4 +769,6 @@ void PDFOutDev::restoreState(GfxState* state)
+     if (!m_aSavedFillOpacity.empty())
+         m_aSavedFillOpacity.pop_back(); // FG-176
++    if (!m_aSavedBlendMode.empty())
++        m_aSavedBlendMode.pop_back(); // FG-177
+     printf( "restoreState\n" );
+     // After the record: a span resumed by Q emits its layer under the
+@@ -910,4 +920,14 @@ void PDFOutDev::emitSoftMaskLayer( GfxState* state, int nOrdinal )
+ }
+ 
++// FG-177: "beginAlphaGroup <alpha>" / "endAlphaGroup" around a transparency
++// group painted at alpha < 1 (see m_aGroupAlphaMarked).
++void PDFOutDev::emitAlphaGroupMark( bool bBegin )
++{
++    if (bBegin)
++        printf( "beginAlphaGroup %f\n", normalize(m_fGroupAlpha) );
++    else
++        printf( "endAlphaGroup\n" );
++}
++
+ // FG-175: an inline image whose data nobody read. Gfx::opBeginImage then
+ // scans the undecoded stream for "EI" from wherever the stream was left, so
+@@ -1045,4 +1065,10 @@ void PDFOutDev::updateFillColor(GfxState *state)
+ }
+ 
++// FG-177: see m_nMultiplyDepth. A direct /BM /Multiply counts as well.
++bool PDFOutDev::multiplyActive( const GfxState* state ) const
++{
++    return m_nMultiplyDepth > 0 || (state && state->getBlendMode() == gfxBlendMultiply);
++}
++
+ void PDFOutDev::updateStrokeColor(GfxState *state)
+ {
+@@ -1968,4 +1994,8 @@ poppler_bool PDFOutDev::shadedFillImpl( GfxState* state, GfxShading* shading,
+     if (m_bSkipImages)
+         return true;
++    // FG-177: a blend shadow's blob (see blendShadowShading): claimed, not
++    // painted. Composited Normal it would cover what the shadow falls on.
++    if (blendShadowShading(state))
++        return true;
+ 
+     // The region a shading paints is the current clip (Gfx::opShFill and
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
+index f6025cf..ee48249 100644
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.hxx
+@@ -173,4 +173,36 @@ namespace pdfi
+         std::vector<double>                     m_aGroupAlphaStack;
+         double                                  m_fGroupAlpha = 1.0; ///< product of the open groups' alphas
++        // FG-177: per-element compositing is wrong where the group's content
++        // OVERLAPS (n overlapping layers at alpha a stack to 1-(1-a)^n, where
++        // the group shows a flat a). Every group painted at alpha < 1 is
++        // bracketed by "beginAlphaGroup <alpha>" / "endAlphaGroup" records so
++        // the LibreOffice side can composite it as one shape where that is
++        // exact (PDFIProcessor::endAlphaGroup). One flag per open group.
++        // The record is written from the .cxx, where every record is (the
++        // pdf-docx build redirects printf there).
++        //
++        // Illustrator blend shadows are a MULTIPLY group (the /BM in force at
++        // the group's "Do", which Gfx::drawForm resets to Normal for the
++        // content -- mirrored across saveState/restoreState like the alpha)
++        // holding a KNOCKOUT group of ~30 nested shading blobs at rising
++        // alpha. Neither blend mode nor knockout exists for an ODF shape:
++        // composited Normal, the blobs' grey interiors paint over whatever
++        // the shadow falls on (fahr page 17: the orange ring, the yellow
++        // bubble), and converting them to "black at (1 - luminance)" stacks
++        // 30 layers where the source shows one. So shaded fills inside a
++        // knockout group inside a Multiply group are NOT emitted: a white
++        // one is invisible under Multiply anyway, a grey one is a soft shadow
++        // we lose. Everything else in a Multiply group is emitted as before.
++        std::vector<bool>                       m_aGroupAlphaMarked;
++        std::vector<int>                        m_aSavedBlendMode; ///< mirrors saveState/restoreState
++        std::vector<bool>                       m_aGroupMultiply;
++        std::vector<bool>                       m_aGroupKnockout;
++        int                                     m_nMultiplyDepth = 0;
++        int                                     m_nKnockoutDepth = 0;
++        bool multiplyActive( const GfxState* state ) const;
++        /// A shaded fill that would be composited by a blend shadow's knockout group.
++        bool blendShadowShading( const GfxState* state ) const
++        { return m_nKnockoutDepth > 0 && multiplyActive(state); }
++        void emitAlphaGroupMark( bool bBegin );
+ 
+         // FG-175: soft masks APPLIED. The span tracker is driven by the same
+@@ -405,8 +437,8 @@ namespace pdfi
+ #if POPPLER_CHECK_VERSION(25, 9, 0)
+         virtual void beginTransparencyGroup(GfxState* state, const std::array<double, 4>&,
+-                                            GfxColorSpace*, bool, bool, bool forSoftMask) override
++                                            GfxColorSpace*, bool, bool knockout, bool forSoftMask) override
+ #else
+         virtual void beginTransparencyGroup(GfxState* state, const double*,
+-                                            GfxColorSpace*, bool, bool, bool forSoftMask) override
++                                            GfxColorSpace*, bool, bool knockout, bool forSoftMask) override
+ #endif
+         {
+@@ -420,4 +452,21 @@ namespace pdfi
+             m_aGroupAlphaStack.push_back(m_fGroupAlpha);
+             m_fGroupAlpha *= fAlpha;
++            // FG-177: the group's blend mode, mirrored the same way.
++            const bool bMultiply = !forSoftMask && !m_aSavedBlendMode.empty()
++                && m_aSavedBlendMode.back() == static_cast<int>(gfxBlendMultiply);
++            m_aGroupMultiply.push_back(bMultiply);
++            if (bMultiply)
++                ++m_nMultiplyDepth;
++            const bool bKnockout = !forSoftMask && knockout;
++            m_aGroupKnockout.push_back(bKnockout);
++            if (bKnockout)
++                ++m_nKnockoutDepth;
++            // FG-177: bracket the group's records (see m_aGroupAlphaMarked).
++            // Not with images skipped: nothing is painted then, so there is
++            // nothing to composite, and the records stay as they were.
++            const bool bMark = fAlpha != 1.0 && !m_bSkipImages;
++            m_aGroupAlphaMarked.push_back(bMark);
++            if (bMark)
++                emitAlphaGroupMark(true);
+             if (fAlpha != 1.0)
+             {
+@@ -439,4 +488,22 @@ namespace pdfi
+                 m_aGroupAlphaStack.pop_back();
+             }
++            if (!m_aGroupAlphaMarked.empty())
++            {
++                if (m_aGroupAlphaMarked.back())
++                    emitAlphaGroupMark(false); // FG-177
++                m_aGroupAlphaMarked.pop_back();
++            }
++            if (!m_aGroupMultiply.empty())
++            {
++                if (m_aGroupMultiply.back() && m_nMultiplyDepth > 0)
++                    --m_nMultiplyDepth; // FG-177
++                m_aGroupMultiply.pop_back();
++            }
++            if (!m_aGroupKnockout.empty())
++            {
++                if (m_aGroupKnockout.back() && m_nKnockoutDepth > 0)
++                    --m_nKnockoutDepth; // FG-177
++                m_aGroupKnockout.pop_back();
++            }
+             if (m_aGroupIsSoftMask.empty())
+                 return;
