@@ -1,0 +1,37 @@
+diff --git a/vcl/source/font/PhysicalFontCollection.cxx b/vcl/source/font/PhysicalFontCollection.cxx
+index 6c3838772546..31d82fc48999 100644
+--- a/vcl/source/font/PhysicalFontCollection.cxx
++++ b/vcl/source/font/PhysicalFontCollection.cxx
+@@ -247,10 +247,29 @@ PhysicalFontFamily* PhysicalFontCollection::GetGlyphFallbackFont(FontSelectPatte
+             // font + applying a matrix to fake the missing italic.
+             for(;;)
+             {
++                 // Probe the cache into TEMPORARIES.
++                 //
++                 // GetFallbackForUnicode() writes through its out-parameters on a
++                 // cache HIT. Passing &rFontSelData.maSearchName here therefore
++                 // OVERWRITES the family the fallback hook just resolved, with
++                 // whatever font some earlier text run happened to cache for this
++                 // code point -- and the caller then looks that wrong family up,
++                 // silently rendering the run in a font that cannot draw it.
++                 //
++                 // A SPACE is enough to trigger it: any run containing U+0020
++                 // caches space -> that run's fallback font, and every later run
++                 // containing a space inherits it. Measured: an N'Ko line followed
++                 // by a Tifinagh line resolved 'notosanstifinagh' from the hook and
++                 // returned Noto Sans NKo, losing 8 of 12 characters from the page
++                 // AND from the PDF text layer. Reversing the two lines rendered
++                 // both correctly. See bugs/glyph_fallback_order_drops_text.md.
++                 OUString      aCachedName;
++                 bool          bCachedEmbolden = false;
++                 ItalicMatrix  aCachedMatrix;
+                  if (!pFontInstance->GetFallbackForUnicode(cChar, rFontSelData.GetWeight(),
+-                                                           &rFontSelData.maSearchName,
+-                                                           &rFontSelData.mbEmbolden,
+-                                                           &rFontSelData.maItalicMatrix))
++                                                           &aCachedName,
++                                                           &bCachedEmbolden,
++                                                           &aCachedMatrix))
+                  {
+                      pFontInstance->AddFallbackForUnicode(cChar, rFontSelData.GetWeight(),
+                                                           rFontSelData.maSearchName,
