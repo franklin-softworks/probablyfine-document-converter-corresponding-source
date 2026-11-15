@@ -1,0 +1,1109 @@
+FEAT-08: ODF AES (CBC and GCM) and the manifest digests over the linked OpenSSL.
+
+The ODF package code (package/source/zipapi/ZipFile.cxx) asks the UNO service com.sun.star.xml.crypto.NSSInitializer for exactly
+two things: a digest context (the SHA256_1K manifest checksum) and an AES-CBC / AES-GCM cipher context. That service exists only in
+the NSS-based xmlsecurity module, which this WebAssembly build does not have (TLS=OPENSSL), so every AES-encrypted ODF failed to read
+and every ODF output protection failed to write.
+
+This adds comphelper/source/crypto/OpenSSL{CipherContext,DigestContext,ContextSupplier}.{hxx,cxx}: a line-for-line port of
+xmlsecurity/source/xmlsec/nss/{ciphercontext,digestcontext}.cxx and ONSSInitializer::get{Cipher,Digest}Context from NSS PK11 to
+OpenSSL EVP, registered under our own implementation name for that service in comphelp.component and in the static constructor map
+(solenv/bin/native-code.py). The XNSSInitializer getters fail closed (no NSS profile). See docs/design/odf-aes-openssl.md for the port
+table, the five stated deviations (asserts become exceptions; the context is broken after every failure; GCM buffers grow by hand and
+are wiped before they are freed; buffers are cleansed; no secret in any message), the caller audit and the randomness finding.
+Tested natively under ASan/UBSan: tests/gates/odf_aes_native.
+
+diff --git a/comphelper/Library_comphelper.mk b/comphelper/Library_comphelper.mk
+--- a/comphelper/Library_comphelper.mk
++++ b/comphelper/Library_comphelper.mk
+@@ -78,6 +78,9 @@
+     comphelper/source/crypto/Crypto \
+     $(if $(filter NSS,$(TLS)), comphelper/source/crypto/Crypto_NSS) \
+     $(if $(filter OPENSSL,$(TLS)), comphelper/source/crypto/Crypto_OpenSSL) \
++    $(if $(filter OPENSSL,$(TLS)), comphelper/source/crypto/OpenSSLCipherContext) \
++    $(if $(filter OPENSSL,$(TLS)), comphelper/source/crypto/OpenSSLContextSupplier) \
++    $(if $(filter OPENSSL,$(TLS)), comphelper/source/crypto/OpenSSLDigestContext) \
+     $(if $(filter NSS OPENSSL,$(TLS)),,comphelper/source/crypto/Crypto_None) \
+     comphelper/source/eventattachermgr/eventattachermgr \
+     comphelper/source/misc/accessiblecomponenthelper \
+diff --git a/comphelper/util/comphelp.component b/comphelper/util/comphelp.component
+--- a/comphelper/util/comphelp.component
++++ b/comphelper/util/comphelp.component
+@@ -63,6 +63,12 @@
+     <service name="com.sun.star.util.OfficeInstallationDirectories"/>
+     <singleton name="com.sun.star.util.theOfficeInstallationDirectories"/>
+   </implementation>
++  <!-- FEAT-08: the ODF package code asks this service for its digest and AES contexts; without NSS (WebAssembly) it is
++       served over OpenSSL by comphelper/source/crypto/OpenSSLContextSupplier.cxx -->
++  <implementation name="com.sun.star.comp.comphelper.OpenSSLContextSupplier"
++      constructor="com_sun_star_comp_comphelper_OpenSSLContextSupplier_get_implementation">
++    <service name="com.sun.star.xml.crypto.NSSInitializer"/>
++  </implementation>
+   <implementation name="org.openoffice.comp.comphelper.EnumerableMap"
+       constructor="org_openoffice_comp_comphelper_EnumerableMap">
+     <service name="com.sun.star.container.EnumerableMap"/>
+diff --git a/solenv/bin/native-code.py b/solenv/bin/native-code.py
+--- a/solenv/bin/native-code.py
++++ b/solenv/bin/native-code.py
+@@ -97,6 +97,7 @@
+     "IndexedPropertyValuesContainer_get_implementation",
+     "NamedPropertyValuesContainer_get_implementation",
+     "com_sun_star_comp_comphelper_OPropertyBag",
++    ("com_sun_star_comp_comphelper_OpenSSLContextSupplier_get_implementation", "#if !HAVE_FEATURE_NSS"),
+     "com_sun_star_comp_SequenceInputStreamService",
+     "com_sun_star_comp_SequenceOutputStreamService",
+     "com_sun_star_comp_util_OfficeInstallationDirectories",
+diff --git a/comphelper/source/crypto/OpenSSLCleansingBuffer.hxx b/comphelper/source/crypto/OpenSSLCleansingBuffer.hxx
+new file mode 100644
+--- /dev/null
++++ b/comphelper/source/crypto/OpenSSLCleansingBuffer.hxx
+@@ -0,0 +1,106 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++#pragma once
++
++#include <sal/config.h>
++
++#include <algorithm>
++#include <cstddef>
++#include <cstring>
++
++#include <openssl/crypto.h>
++
++namespace comphelper::opensslctx
++{
++#ifdef ODFAES_TEST_HOOK
++// Test builds only: called with every block just before it is freed, after it was wiped, so a test can check that it is all zero.
++inline void (*g_pBeforeFree)(const unsigned char* pBlock, std::size_t nCapacity) = nullptr;
++#endif
++
++/**
++ * A byte buffer for secrets (a key, a plaintext that is being encrypted, a plaintext that was just decrypted).
++ *
++ * A plain std::vector or css::uno::Sequence that grows frees its OLD storage without wiping it, which leaves a copy of
++ * the document in freed heap for every growth step. This one grows by hand: allocate, copy, OPENSSL_cleanse the old
++ * block, free it; and it wipes in its destructor and in clear(). It grows geometrically (the reference implementation
++ * reallocated the whole buffer on every chunk: quadratic copying for a large entry).
++ */
++class CleansingBuffer
++{
++    unsigned char* m_pData = nullptr;
++    std::size_t m_nSize = 0;
++    std::size_t m_nCapacity = 0;
++
++    static void release(unsigned char* pBlock, std::size_t nCapacity)
++    {
++        if (!pBlock)
++            return;
++        OPENSSL_cleanse(pBlock, nCapacity);
++#ifdef ODFAES_TEST_HOOK
++        if (g_pBeforeFree)
++            g_pBeforeFree(pBlock, nCapacity);
++#endif
++        delete[] pBlock;
++    }
++
++public:
++    CleansingBuffer() = default;
++    CleansingBuffer(const CleansingBuffer&) = delete;
++    CleansingBuffer& operator=(const CleansingBuffer&) = delete;
++    ~CleansingBuffer() { clear(); }
++
++    std::size_t size() const { return m_nSize; }
++    unsigned char* data() { return m_pData; }
++    const unsigned char* data() const { return m_pData; }
++
++    /// make room for at least nWanted bytes in total; the old block is wiped and freed
++    void reserve(std::size_t nWanted)
++    {
++        if (nWanted <= m_nCapacity)
++            return;
++        std::size_t nNew = std::max<std::size_t>({ nWanted, m_nCapacity * 2, 64 });
++        unsigned char* pNew = new unsigned char[nNew];
++        if (m_nSize)
++            std::memcpy(pNew, m_pData, m_nSize);
++        release(m_pData, m_nCapacity);
++        m_pData = pNew;
++        m_nCapacity = nNew;
++    }
++
++    void append(const void* pBytes, std::size_t nBytes)
++    {
++        if (!nBytes)
++            return;
++        reserve(m_nSize + nBytes);
++        std::memcpy(m_pData + m_nSize, pBytes, nBytes);
++        m_nSize += nBytes;
++    }
++
++    /// set the size to nSize; bytes beyond the old size are zero
++    void resize(std::size_t nSize)
++    {
++        reserve(nSize);
++        if (nSize > m_nSize)
++            std::memset(m_pData + m_nSize, 0, nSize - m_nSize);
++        m_nSize = nSize;
++    }
++
++    void clear()
++    {
++        release(m_pData, m_nCapacity);
++        m_pData = nullptr;
++        m_nSize = 0;
++        m_nCapacity = 0;
++    }
++};
++
++} // namespace comphelper::opensslctx
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/comphelper/source/crypto/OpenSSLCipherContext.hxx b/comphelper/source/crypto/OpenSSLCipherContext.hxx
+new file mode 100644
+--- /dev/null
++++ b/comphelper/source/crypto/OpenSSLCipherContext.hxx
+@@ -0,0 +1,89 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++#pragma once
++
++#include <com/sun/star/xml/crypto/XCipherContext.hpp>
++
++#include <cppuhelper/implbase.hxx>
++#include <mutex>
++
++#include "OpenSSLCleansingBuffer.hxx"
++
++typedef struct evp_cipher_ctx_st EVP_CIPHER_CTX;
++
++namespace comphelper::opensslctx
++{
++/**
++ * XCipherContext over OpenSSL EVP: a line-for-line port of OCipherContext (xmlsecurity/source/xmlsec/nss/ciphercontext.cxx),
++ * which does the same job over NSS PK11. Only the primitive calls differ; the buffering, the hold-back of the last block(s),
++ * the W3C padding and the GCM framing are the reference's, so files interoperate with every other implementation. See
++ * docs/design/odf-aes-openssl.md for the table of reference lines and the stated deviations.
++ */
++class OpenSSLCipherContext : public cppu::WeakImplHelper<css::xml::crypto::XCipherContext>
++{
++public:
++    enum class Kind
++    {
++        AesCbc,
++        AesGcm
++    };
++
++private:
++    std::mutex m_aMutex;
++
++    EVP_CIPHER_CTX* m_pContext; // AES-CBC only; AES-GCM is done in one shot at finalise
++    CleansingBuffer m_aKey;
++    CleansingBuffer m_aGcmBuffer; // AES-GCM: everything that was fed in (plaintext when encrypting)
++
++    sal_Int32 m_nBlockSize;
++    css::uno::Sequence<sal_Int8> m_aLastBlock;
++    css::uno::Sequence<sal_Int8> m_AESGCMIV; // non-empty means AES-GCM
++
++    bool m_bEncryption;
++    bool m_bPadding;
++    bool m_bW3CPadding;
++    sal_Int64 m_nConverted;
++
++    bool m_bDisposed;
++    bool m_bBroken;
++
++    void Dispose();
++    /// the context is unusable from now on: wipe everything
++    void Break();
++
++    OpenSSLCipherContext()
++        : m_pContext(nullptr)
++        , m_nBlockSize(0)
++        , m_bEncryption(false)
++        , m_bPadding(false)
++        , m_bW3CPadding(false)
++        , m_nConverted(0)
++        , m_bDisposed(false)
++        , m_bBroken(false)
++    {
++    }
++
++public:
++    virtual ~OpenSSLCipherContext() override { Dispose(); }
++
++    static css::uno::Reference<css::xml::crypto::XCipherContext>
++    Create(Kind eKind, const css::uno::Sequence<sal_Int8>& aKey,
++           const css::uno::Sequence<sal_Int8>& aInitializationVector, bool bEncryption,
++           bool bW3CPadding);
++
++    // XCipherContext
++    virtual css::uno::Sequence<sal_Int8> SAL_CALL
++    convertWithCipherContext(const css::uno::Sequence<sal_Int8>& aData) override;
++    virtual css::uno::Sequence<sal_Int8> SAL_CALL finalizeCipherContextAndDispose() override;
++};
++
++} // namespace comphelper::opensslctx
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/comphelper/source/crypto/OpenSSLCipherContext.cxx b/comphelper/source/crypto/OpenSSLCipherContext.cxx
+new file mode 100644
+--- /dev/null
++++ b/comphelper/source/crypto/OpenSSLCipherContext.cxx
+@@ -0,0 +1,507 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * This file is a port of xmlsecurity/source/xmlsec/nss/ciphercontext.cxx (which incorporates work covered by the
++ * Apache License 2.0 notice in that file) from NSS PK11 to OpenSSL EVP. The "ref NNN" comments name the lines of
++ * that file each block follows.
++ */
++
++#include <sal/config.h>
++
++#include <com/sun/star/lang/DisposedException.hpp>
++#include <com/sun/star/lang/IllegalArgumentException.hpp>
++#include <rtl/random.h>
++#include <rtl/ref.hxx>
++
++#include <algorithm>
++#include <cstring>
++#include <memory>
++
++#include <openssl/crypto.h>
++#include <openssl/err.h>
++#include <openssl/evp.h>
++
++#include "OpenSSLCipherContext.hxx"
++
++using namespace ::com::sun::star;
++
++namespace comphelper::opensslctx
++{
++namespace
++{
++constexpr sal_Int32 nAESGCMIVSize = 12;
++constexpr sal_Int32 nAESGCMTagSize = 16;
++constexpr sal_Int32 nAESBlockSize = 16;
++
++struct CtxDeleter
++{
++    void operator()(EVP_CIPHER_CTX* p) const { EVP_CIPHER_CTX_free(p); }
++};
++typedef std::unique_ptr<EVP_CIPHER_CTX, CtxDeleter> CtxPtr;
++
++const EVP_CIPHER* cbcCipher(sal_Int32 nKeyLen)
++{
++    switch (nKeyLen)
++    {
++        case 16:
++            return EVP_aes_128_cbc();
++        case 24:
++            return EVP_aes_192_cbc();
++        case 32:
++            return EVP_aes_256_cbc();
++    }
++    return nullptr;
++}
++
++const EVP_CIPHER* gcmCipher(sal_Int32 nKeyLen)
++{
++    switch (nKeyLen)
++    {
++        case 16:
++            return EVP_aes_128_gcm();
++        case 24:
++            return EVP_aes_192_gcm();
++        case 32:
++            return EVP_aes_256_gcm();
++    }
++    return nullptr;
++}
++
++void cleanse(uno::Sequence<sal_Int8>& rSeq)
++{
++    if (rSeq.hasElements())
++        OPENSSL_cleanse(rSeq.getArray(), rSeq.getLength());
++}
++
++// Sequence::realloc frees the old block as it was, and a block that held plaintext (or the unfinished last block of
++// a CBC stream) would stay readable in freed heap. Resize by hand: allocate exactly, copy, wipe the old block, swap.
++void resize(uno::Sequence<sal_Int8>& rSeq, sal_Int32 nNewLen)
++{
++    if (rSeq.getLength() == nNewLen)
++        return;
++    uno::Sequence<sal_Int8> aNew(nNewLen);
++    const sal_Int32 nKeep = std::min(nNewLen, rSeq.getLength());
++    if (nKeep > 0)
++        memcpy(aNew.getArray(), rSeq.getConstArray(), nKeep);
++    cleanse(rSeq);
++    rSeq = std::move(aNew);
++}
++
++} // namespace
++
++// ref 36-117 (OCipherContext::Create). NSS slot/key import/params become an EVP context; all argument checks are made here
++// as well as by the supplier, so the context never trusts its caller (ref asserted the IV length: release builds did not).
++uno::Reference<xml::crypto::XCipherContext>
++OpenSSLCipherContext::Create(Kind eKind, const uno::Sequence<sal_Int8>& aKey,
++                             const uno::Sequence<sal_Int8>& aInitializationVector, bool bEncryption,
++                             bool bW3CPadding)
++{
++    ::rtl::Reference<OpenSSLCipherContext> xResult = new OpenSSLCipherContext;
++
++    const sal_Int32 nKeyLen = aKey.getLength();
++    if (nKeyLen != 16 && nKeyLen != 24 && nKeyLen != 32)
++        throw lang::IllegalArgumentException(u"Unexpected key length."_ustr, uno::Reference<uno::XInterface>(), 2);
++
++    const sal_Int32 nIVLen = aInitializationVector.getLength();
++    if (nIVLen != (eKind == Kind::AesGcm ? nAESGCMIVSize : nAESBlockSize))
++        throw lang::IllegalArgumentException(u"Unexpected length of initialization vector."_ustr,
++                                             uno::Reference<uno::XInterface>(), 3);
++
++    xResult->m_aKey.append(aKey.getConstArray(), nKeyLen);
++
++    if (eKind == Kind::AesGcm)
++    {
++        // ref 58-85: the GCM parameters (IV, no AAD, 128-bit tag) are used at finalise; nothing to create now
++        xResult->m_AESGCMIV = aInitializationVector;
++    }
++    else
++    {
++        // ref 86-104: CKM_AES_CBC (no padding mechanism): EVP padding OFF; the W3C padding is added by hand at finalise
++        xResult->m_pContext = EVP_CIPHER_CTX_new();
++        if (!xResult->m_pContext)
++        {
++            ERR_clear_error();
++            throw uno::RuntimeException(u"EVP_CIPHER_CTX_new failed"_ustr);
++        }
++        if (EVP_CipherInit_ex(xResult->m_pContext, cbcCipher(nKeyLen), nullptr, xResult->m_aKey.data(),
++                              reinterpret_cast<const unsigned char*>(aInitializationVector.getConstArray()),
++                              bEncryption ? 1 : 0)
++                != 1
++            || EVP_CIPHER_CTX_set_padding(xResult->m_pContext, 0) != 1)
++        {
++            ERR_clear_error();
++            throw uno::RuntimeException(u"EVP_CipherInit_ex failed"_ustr);
++        }
++    }
++
++    xResult->m_bEncryption = bEncryption;
++    xResult->m_bW3CPadding = bW3CPadding;
++    // ref 108: PK11_GetPadMechanism(CKM_AES_CBC) is CKM_AES_CBC_PAD, which is not the mechanism itself
++    xResult->m_bPadding = bW3CPadding;
++    // ref 109-110: 16 for AES, and the reference pins 16 for GCM too
++    xResult->m_nBlockSize = nAESBlockSize;
++    return xResult;
++}
++
++// ref 119-146
++void OpenSSLCipherContext::Dispose()
++{
++    if (m_pContext)
++    {
++        EVP_CIPHER_CTX_free(m_pContext);
++        m_pContext = nullptr;
++    }
++    m_aKey.clear();
++    m_aGcmBuffer.clear();
++    cleanse(m_aLastBlock);
++    m_aLastBlock = uno::Sequence<sal_Int8>();
++    m_bDisposed = true;
++}
++
++void OpenSSLCipherContext::Break()
++{
++    m_bBroken = true;
++    ERR_clear_error();
++    Dispose();
++}
++
++// ref 148-239
++uno::Sequence<sal_Int8> SAL_CALL
++OpenSSLCipherContext::convertWithCipherContext(const uno::Sequence<sal_Int8>& aData)
++{
++    std::unique_lock aGuard(m_aMutex);
++
++    if (m_bBroken)
++        throw uno::RuntimeException();
++
++    if (m_bDisposed)
++        throw lang::DisposedException();
++
++    if (m_AESGCMIV.getLength())
++    {
++        // ref 158-168: GCM buffers everything, with the INT32 overflow guard; only finalise produces output
++        if (static_cast<std::size_t>(SAL_MAX_INT32) - nAESGCMIVSize - nAESGCMTagSize
++            <= m_aGcmBuffer.size() + static_cast<std::size_t>(aData.getLength()))
++        {
++            Break();
++            throw uno::RuntimeException(u"overflow"_ustr);
++        }
++        m_aGcmBuffer.append(aData.getConstArray(), aData.getLength());
++        return {};
++    }
++
++    uno::Sequence<sal_Int8> aToConvert;
++    if (aData.hasElements())
++    {
++        sal_Int32 nOldLastBlockLen = m_aLastBlock.getLength();
++
++        sal_Int32 nAvailableData = nOldLastBlockLen + aData.getLength();
++        sal_Int32 nToConvertLen;
++        if (m_bEncryption || !m_bW3CPadding)
++        {
++            if (nOldLastBlockLen >= m_nBlockSize) // ref 179: assert
++            {
++                Break();
++                throw uno::RuntimeException(u"invalid state"_ustr);
++            }
++            if (nAvailableData % m_nBlockSize == 0)
++                nToConvertLen = nAvailableData;
++            else if (nAvailableData < m_nBlockSize)
++                nToConvertLen = 0;
++            else
++                nToConvertLen = nAvailableData - nAvailableData % m_nBlockSize;
++        }
++        else
++        {
++            if (nOldLastBlockLen >= m_nBlockSize * 2) // ref 189: assert
++            {
++                Break();
++                throw uno::RuntimeException(u"invalid state"_ustr);
++            }
++            // decryption with W3C padding needs at least one block for finalizing
++            if (nAvailableData < m_nBlockSize * 2)
++                nToConvertLen = 0;
++            else
++                nToConvertLen = nAvailableData - nAvailableData % m_nBlockSize - m_nBlockSize;
++        }
++
++        resize(aToConvert, nToConvertLen);
++        if (nToConvertLen == 0)
++        {
++            resize(m_aLastBlock, nOldLastBlockLen + aData.getLength());
++            memcpy(m_aLastBlock.getArray() + nOldLastBlockLen, aData.getConstArray(), aData.getLength());
++            // aToConvert stays empty
++        }
++        else if (nToConvertLen < nOldLastBlockLen)
++        {
++            memcpy(aToConvert.getArray(), m_aLastBlock.getConstArray(), nToConvertLen);
++            memcpy(m_aLastBlock.getArray(), m_aLastBlock.getConstArray() + nToConvertLen,
++                   nOldLastBlockLen - nToConvertLen);
++            resize(m_aLastBlock, nOldLastBlockLen - nToConvertLen + aData.getLength());
++            memcpy(m_aLastBlock.getArray() + nOldLastBlockLen - nToConvertLen, aData.getConstArray(),
++                   aData.getLength());
++        }
++        else
++        {
++            memcpy(aToConvert.getArray(), m_aLastBlock.getConstArray(), nOldLastBlockLen);
++            if (nToConvertLen > nOldLastBlockLen)
++                memcpy(aToConvert.getArray() + nOldLastBlockLen, aData.getConstArray(),
++                       nToConvertLen - nOldLastBlockLen);
++            resize(m_aLastBlock, nAvailableData - nToConvertLen);
++            memcpy(m_aLastBlock.getArray(), aData.getConstArray() + nToConvertLen - nOldLastBlockLen,
++                   nAvailableData - nToConvertLen);
++        }
++    }
++
++    uno::Sequence<sal_Int8> aResult;
++    if (aToConvert.getLength() % m_nBlockSize != 0) // ref 222: assert
++    {
++        cleanse(aToConvert);
++        Break();
++        throw uno::RuntimeException(u"invalid state"_ustr);
++    }
++    if (aToConvert.hasElements())
++    {
++        int nResultLen = 0;
++        resize(aResult, aToConvert.getLength() + m_nBlockSize);
++        if (EVP_CipherUpdate(m_pContext, reinterpret_cast<unsigned char*>(aResult.getArray()), &nResultLen,
++                             reinterpret_cast<const unsigned char*>(aToConvert.getConstArray()),
++                             aToConvert.getLength())
++            != 1)
++        {
++            cleanse(aToConvert);
++            cleanse(aResult);
++            Break();
++            throw uno::RuntimeException(u"EVP_CipherUpdate failed"_ustr);
++        }
++
++        m_nConverted += aToConvert.getLength();
++        resize(aResult, nResultLen);
++    }
++    cleanse(aToConvert);
++
++    return aResult;
++}
++
++// ref 241-388
++uno::Sequence<sal_Int8> SAL_CALL OpenSSLCipherContext::finalizeCipherContextAndDispose()
++{
++    std::unique_lock aGuard(m_aMutex);
++
++    if (m_bBroken)
++        throw uno::RuntimeException();
++
++    if (m_bDisposed)
++        throw lang::DisposedException();
++
++    if (m_AESGCMIV.getLength())
++    {
++        // ref 251-304: AES-GCM, W3C framing IV(12) || ciphertext || tag(16), no AAD, one shot
++        const sal_Int32 nKeyLen = static_cast<sal_Int32>(m_aKey.size());
++        const EVP_CIPHER* pCipher = gcmCipher(nKeyLen);
++        const std::size_t nBuffered = m_aGcmBuffer.size();
++        uno::Sequence<sal_Int8> aResult;
++        if (!pCipher)
++        {
++            Break();
++            throw uno::RuntimeException(u"invalid state"_ustr);
++        }
++        CtxPtr xCtx(EVP_CIPHER_CTX_new());
++        if (!xCtx)
++        {
++            Break();
++            throw uno::RuntimeException(u"EVP_CIPHER_CTX_new failed"_ustr);
++        }
++        if (m_bEncryption)
++        {
++            if (nBuffered > static_cast<std::size_t>(SAL_MAX_INT32) - nAESGCMIVSize - nAESGCMTagSize)
++            {
++                Break();
++                throw uno::RuntimeException(u"overflow"_ustr);
++            }
++            // add space for IV and tag; W3C xmlenc-core1 requires the IV preceding the ciphertext
++            resize(aResult, static_cast<sal_Int32>(nBuffered) + nAESGCMIVSize + nAESGCMTagSize);
++            auto* pOut = reinterpret_cast<unsigned char*>(aResult.getArray());
++            memcpy(pOut, m_AESGCMIV.getConstArray(), nAESGCMIVSize);
++            int nOutLen = 0, nFinLen = 0;
++            std::size_t nTotal = 0;
++            bool bOk = EVP_EncryptInit_ex(xCtx.get(), pCipher, nullptr, nullptr, nullptr) == 1
++                       && EVP_CIPHER_CTX_ctrl(xCtx.get(), EVP_CTRL_GCM_SET_IVLEN, nAESGCMIVSize, nullptr) == 1
++                       && EVP_EncryptInit_ex(xCtx.get(), nullptr, nullptr, m_aKey.data(),
++                                             reinterpret_cast<const unsigned char*>(m_AESGCMIV.getConstArray()))
++                              == 1;
++            if (bOk && nBuffered)
++            {
++                bOk = EVP_EncryptUpdate(xCtx.get(), pOut + nAESGCMIVSize, &nOutLen, m_aGcmBuffer.data(),
++                                        static_cast<int>(nBuffered))
++                      == 1;
++                nTotal += nOutLen;
++            }
++            if (bOk)
++            {
++                bOk = EVP_EncryptFinal_ex(xCtx.get(), pOut + nAESGCMIVSize + nTotal, &nFinLen) == 1;
++                nTotal += nFinLen;
++            }
++            if (bOk && nTotal == nBuffered)
++                bOk = EVP_CIPHER_CTX_ctrl(xCtx.get(), EVP_CTRL_GCM_GET_TAG, nAESGCMTagSize,
++                                          pOut + nAESGCMIVSize + nTotal)
++                      == 1;
++            else
++                bOk = false;
++            if (!bOk)
++            {
++                cleanse(aResult);
++                Break();
++                throw uno::RuntimeException(u"AES-GCM encryption failed"_ustr);
++            }
++        }
++        else if (static_cast<std::size_t>(nAESGCMIVSize) + nAESGCMTagSize < nBuffered)
++        {
++            // ref 275: strictly more than IV + tag, so an empty GCM stream (28 bytes) is refused, as in the reference
++            if (0 != memcmp(m_AESGCMIV.getConstArray(), m_aGcmBuffer.data(), nAESGCMIVSize))
++            {
++                Break();
++                throw uno::RuntimeException(u"inconsistent IV"_ustr);
++            }
++            const std::size_t nCipherLen = nBuffered - nAESGCMIVSize - nAESGCMTagSize;
++            CleansingBuffer aPlain; // released to the caller only after the tag verified
++            aPlain.resize(nCipherLen);
++            int nOutLen = 0, nFinLen = 0;
++            bool bOk = EVP_DecryptInit_ex(xCtx.get(), pCipher, nullptr, nullptr, nullptr) == 1
++                       && EVP_CIPHER_CTX_ctrl(xCtx.get(), EVP_CTRL_GCM_SET_IVLEN, nAESGCMIVSize, nullptr) == 1
++                       && EVP_DecryptInit_ex(xCtx.get(), nullptr, nullptr, m_aKey.data(),
++                                             reinterpret_cast<const unsigned char*>(m_AESGCMIV.getConstArray()))
++                              == 1
++                       && EVP_DecryptUpdate(xCtx.get(), aPlain.data(), &nOutLen,
++                                            m_aGcmBuffer.data() + nAESGCMIVSize, static_cast<int>(nCipherLen))
++                              == 1
++                       // the tag is set BEFORE the final step, which is where it is verified
++                       && EVP_CIPHER_CTX_ctrl(xCtx.get(), EVP_CTRL_GCM_SET_TAG, nAESGCMTagSize,
++                                              m_aGcmBuffer.data() + nAESGCMIVSize + nCipherLen)
++                              == 1
++                       && EVP_DecryptFinal_ex(xCtx.get(), aPlain.data() + nOutLen, &nFinLen) == 1;
++            if (!bOk || static_cast<std::size_t>(nOutLen) + nFinLen != nCipherLen)
++            {
++                // wrong key and tampering both end here; aPlain is wiped by its destructor, nothing is returned
++                Break();
++                throw uno::RuntimeException(u"AES-GCM decryption failed"_ustr);
++            }
++            resize(aResult, static_cast<sal_Int32>(nCipherLen));
++            memcpy(aResult.getArray(), aPlain.data(), nCipherLen);
++        }
++        else
++        {
++            Break();
++            throw uno::RuntimeException(u"incorrect size of input"_ustr);
++        }
++        Dispose();
++        return aResult;
++    }
++
++    if (m_aLastBlock.getLength() >= m_nBlockSize * 2 || m_nConverted % m_nBlockSize != 0) // ref 306-307: asserts
++    {
++        Break();
++        throw uno::RuntimeException(u"invalid state"_ustr);
++    }
++    sal_Int32 nSizeForPadding = (m_nConverted + m_aLastBlock.getLength()) % m_nBlockSize;
++
++    // if it is decryption, the amount of data should be rounded to the block size even in case of padding
++    if ((!m_bPadding || !m_bEncryption) && nSizeForPadding)
++    {
++        // ref 311-312 throws without breaking the context; the port is stricter (WAF-approved deviation)
++        Break();
++        throw uno::RuntimeException(u"The data should contain complete blocks only."_ustr);
++    }
++
++    if (m_bW3CPadding && m_bEncryption)
++    {
++        // in this case the last block should be smaller than standard block
++        // it will be increased with the padding
++        if (m_aLastBlock.getLength() >= m_nBlockSize) // ref 318: assert
++        {
++            Break();
++            throw uno::RuntimeException(u"invalid state"_ustr);
++        }
++
++        // W3CPadding handling for encryption
++        sal_Int32 nPaddingSize = m_nBlockSize - nSizeForPadding;
++        sal_Int32 nOldLastBlockLen = m_aLastBlock.getLength();
++        resize(m_aLastBlock, nOldLastBlockLen + nPaddingSize);
++        auto pLastBlock = m_aLastBlock.getArray();
++
++        if (nPaddingSize > 1)
++        {
++            if (rtl_random_getBytes(nullptr, pLastBlock + nOldLastBlockLen, nPaddingSize - 1) != rtl_Random_E_None)
++            {
++                Break();
++                throw uno::RuntimeException(u"rtl_random_getBytes failed"_ustr);
++            }
++        }
++        pLastBlock[m_aLastBlock.getLength() - 1] = static_cast<sal_Int8>(nPaddingSize);
++    }
++
++    // finally should the last block be smaller than two standard blocks
++    uno::Sequence<sal_Int8> aResult;
++    if (m_aLastBlock.hasElements())
++    {
++        int nPrefResLen = 0;
++        resize(aResult, m_aLastBlock.getLength() + m_nBlockSize);
++        if (EVP_CipherUpdate(m_pContext, reinterpret_cast<unsigned char*>(aResult.getArray()), &nPrefResLen,
++                             reinterpret_cast<const unsigned char*>(m_aLastBlock.getConstArray()),
++                             m_aLastBlock.getLength())
++            != 1)
++        {
++            cleanse(aResult);
++            Break();
++            throw uno::RuntimeException(u"EVP_CipherUpdate failed"_ustr);
++        }
++
++        resize(aResult, nPrefResLen);
++        cleanse(m_aLastBlock);
++        resize(m_aLastBlock, 0);
++    }
++
++    sal_Int32 nPrefixLen = aResult.getLength();
++    resize(aResult, nPrefixLen + m_nBlockSize * 2);
++    int nFinalLen = 0;
++    if (EVP_CipherFinal_ex(m_pContext, reinterpret_cast<unsigned char*>(aResult.getArray() + nPrefixLen), &nFinalLen)
++        != 1)
++    {
++        cleanse(aResult);
++        Break();
++        throw uno::RuntimeException(u"EVP_CipherFinal_ex failed"_ustr);
++    }
++
++    resize(aResult, nPrefixLen + nFinalLen);
++
++    if (m_bW3CPadding && !m_bEncryption)
++    {
++        // W3CPadding handling for decryption
++        // aResult should have enough data, except if the input was completely empty
++
++        // see https://www.w3.org/TR/xmlenc-core1/#sec-Alg-Block
++        // (the last byte is a signed sal_Int8 as in the reference: 1..16 is valid, 0 and 0x80..0xFF are not)
++        if (aResult.getLength() < m_nBlockSize || aResult[aResult.getLength() - 1] <= 0
++            || m_nBlockSize < aResult[aResult.getLength() - 1])
++        {
++            cleanse(aResult);
++            Break();
++            throw uno::RuntimeException(u"incorrect size of padding"_ustr);
++        }
++
++        resize(aResult, aResult.getLength() - aResult[aResult.getLength() - 1]);
++    }
++
++    Dispose();
++
++    return aResult;
++}
++
++} // namespace comphelper::opensslctx
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/comphelper/source/crypto/OpenSSLDigestContext.hxx b/comphelper/source/crypto/OpenSSLDigestContext.hxx
+new file mode 100644
+--- /dev/null
++++ b/comphelper/source/crypto/OpenSSLDigestContext.hxx
+@@ -0,0 +1,58 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++#pragma once
++
++#include <com/sun/star/xml/crypto/XDigestContext.hpp>
++
++#include <cppuhelper/implbase.hxx>
++#include <mutex>
++
++typedef struct evp_md_ctx_st EVP_MD_CTX;
++
++namespace comphelper::opensslctx
++{
++/// XDigestContext over OpenSSL EVP: a port of ODigestContext (xmlsecurity/source/xmlsec/nss/digestcontext.cxx).
++class OpenSSLDigestContext : public cppu::WeakImplHelper<css::xml::crypto::XDigestContext>
++{
++private:
++    std::mutex m_aMutex;
++
++    EVP_MD_CTX* m_pContext;
++    sal_Int32 const m_nDigestLength;
++    bool const m_b1KData;
++    sal_Int32 m_nDigested;
++
++    bool m_bDisposed;
++    bool m_bBroken;
++
++    void Free();
++
++public:
++    /// takes ownership of pContext (an initialised digest context)
++    OpenSSLDigestContext(EVP_MD_CTX* pContext, sal_Int32 nDigestLength, bool b1KData)
++        : m_pContext(pContext)
++        , m_nDigestLength(nDigestLength)
++        , m_b1KData(b1KData)
++        , m_nDigested(0)
++        , m_bDisposed(false)
++        , m_bBroken(false)
++    {
++    }
++
++    virtual ~OpenSSLDigestContext() override;
++
++    // XDigestContext
++    virtual void SAL_CALL updateDigest(const css::uno::Sequence<sal_Int8>& aData) override;
++    virtual css::uno::Sequence<sal_Int8> SAL_CALL finalizeDigestAndDispose() override;
++};
++
++} // namespace comphelper::opensslctx
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/comphelper/source/crypto/OpenSSLDigestContext.cxx b/comphelper/source/crypto/OpenSSLDigestContext.cxx
+new file mode 100644
+--- /dev/null
++++ b/comphelper/source/crypto/OpenSSLDigestContext.cxx
+@@ -0,0 +1,101 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * This file is a port of xmlsecurity/source/xmlsec/nss/digestcontext.cxx (which incorporates work covered by the
++ * Apache License 2.0 notice in that file) from NSS PK11 to OpenSSL EVP. The "ref NNN" comments name the lines of
++ * that file each block follows.
++ */
++
++#include <sal/config.h>
++
++#include <com/sun/star/lang/DisposedException.hpp>
++
++#include <openssl/err.h>
++#include <openssl/evp.h>
++
++#include "OpenSSLDigestContext.hxx"
++
++using namespace ::com::sun::star;
++
++namespace comphelper::opensslctx
++{
++// ref 28-33
++OpenSSLDigestContext::~OpenSSLDigestContext() { Free(); }
++
++void OpenSSLDigestContext::Free()
++{
++    if (m_pContext)
++    {
++        EVP_MD_CTX_free(m_pContext);
++        m_pContext = nullptr;
++    }
++}
++
++// ref 35-65
++void SAL_CALL OpenSSLDigestContext::updateDigest(const uno::Sequence<sal_Int8>& aData)
++{
++    std::scoped_lock aGuard(m_aMutex);
++
++    if (m_bBroken)
++        throw uno::RuntimeException();
++
++    if (m_bDisposed)
++        throw lang::DisposedException();
++
++    // the _1K variants hash the first 1024 bytes only and ignore the rest
++    if (m_b1KData && m_nDigested >= 1024)
++        return;
++
++    sal_Int32 nToDigest = aData.getLength();
++    if (m_b1KData && m_nDigested + nToDigest > 1024)
++        nToDigest = 1024 - m_nDigested;
++
++    if (nToDigest > 0
++        && EVP_DigestUpdate(m_pContext, aData.getConstArray(), static_cast<size_t>(nToDigest)) != 1)
++    {
++        ERR_clear_error();
++        Free();
++        m_bBroken = true;
++        throw uno::RuntimeException();
++    }
++
++    m_nDigested += nToDigest;
++}
++
++// ref 67-90
++uno::Sequence<sal_Int8> SAL_CALL OpenSSLDigestContext::finalizeDigestAndDispose()
++{
++    std::scoped_lock aGuard(m_aMutex);
++
++    if (m_bBroken)
++        throw uno::RuntimeException();
++
++    if (m_bDisposed)
++        throw lang::DisposedException();
++
++    uno::Sequence<sal_Int8> aResult(m_nDigestLength);
++    unsigned int nResultLen = 0;
++    if (EVP_DigestFinal_ex(m_pContext, reinterpret_cast<unsigned char*>(aResult.getArray()), &nResultLen) != 1
++        || nResultLen != static_cast<unsigned int>(m_nDigestLength))
++    {
++        ERR_clear_error();
++        Free();
++        m_bBroken = true;
++        throw uno::RuntimeException();
++    }
++
++    Free();
++    m_bDisposed = true;
++
++    aResult.realloc(nResultLen);
++    return aResult;
++}
++
++} // namespace comphelper::opensslctx
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/comphelper/source/crypto/OpenSSLContextSupplier.cxx b/comphelper/source/crypto/OpenSSLContextSupplier.cxx
+new file mode 100644
+--- /dev/null
++++ b/comphelper/source/crypto/OpenSSLContextSupplier.cxx
+@@ -0,0 +1,163 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * The XNSSInitializer service over OpenSSL, for builds without NSS (WebAssembly): the package code asks the UNO service
++ * com.sun.star.xml.crypto.NSSInitializer for exactly two things, a digest context (the manifest checksum) and an AES-CBC /
++ * AES-GCM cipher context. This is a port of ONSSInitializer::get{Digest,Cipher}Context
++ * (xmlsecurity/source/xmlsec/nss/nssinitializer.cxx, which incorporates work covered by the Apache License 2.0 notice
++ * in that file). Everything NSS-specific (profiles, certificates, signatures) fails closed: there is no NSS here.
++ */
++
++#include <sal/config.h>
++
++#include <com/sun/star/beans/NamedValue.hpp>
++#include <com/sun/star/lang/IllegalArgumentException.hpp>
++#include <com/sun/star/xml/crypto/CipherID.hpp>
++#include <com/sun/star/xml/crypto/DigestID.hpp>
++#include <com/sun/star/xml/crypto/NSSProfile.hpp>
++#include <com/sun/star/xml/crypto/XNSSInitializer.hpp>
++#include <com/sun/star/lang/XServiceInfo.hpp>
++#include <com/sun/star/uno/XComponentContext.hpp>
++#include <cppuhelper/implbase.hxx>
++#include <cppuhelper/supportsservice.hxx>
++
++#include <openssl/err.h>
++#include <openssl/evp.h>
++
++#include "OpenSSLCipherContext.hxx"
++#include "OpenSSLDigestContext.hxx"
++
++using namespace ::com::sun::star;
++
++namespace
++{
++inline constexpr OUString NSS_SERVICE_NAME = u"com.sun.star.xml.crypto.NSSInitializer"_ustr;
++
++class OpenSSLContextSupplier
++    : public cppu::WeakImplHelper<css::xml::crypto::XNSSInitializer, css::lang::XServiceInfo>
++{
++public:
++    OpenSSLContextSupplier() = default;
++
++    /* XNSSInitializer: there is no NSS, so there is no profile and nothing is initialised (callers: certificate dialogs
++       and the NSS security environment, none of which exists in this build) */
++    virtual OUString SAL_CALL getNSSPath() override { return OUString(); }
++    virtual sal_Bool SAL_CALL getIsNSSinitialized() override { return false; }
++    virtual css::uno::Sequence<css::xml::crypto::NSSProfile> SAL_CALL getNSSProfiles() override
++    {
++        return css::uno::Sequence<css::xml::crypto::NSSProfile>();
++    }
++
++    /* XDigestContextSupplier: ref nssinitializer.cxx 543-583 */
++    virtual css::uno::Reference<css::xml::crypto::XDigestContext> SAL_CALL
++    getDigestContext(::sal_Int32 nDigestID, const css::uno::Sequence<css::beans::NamedValue>& aParams) override
++    {
++        const EVP_MD* pMd = nullptr;
++        sal_Int32 nDigestLength = 0;
++        bool b1KData = false;
++        if (nDigestID == css::xml::crypto::DigestID::SHA256 || nDigestID == css::xml::crypto::DigestID::SHA256_1K)
++        {
++            pMd = EVP_sha256();
++            nDigestLength = 32;
++            b1KData = (nDigestID == css::xml::crypto::DigestID::SHA256_1K);
++        }
++        else if (nDigestID == css::xml::crypto::DigestID::SHA1 || nDigestID == css::xml::crypto::DigestID::SHA1_1K)
++        {
++            pMd = EVP_sha1();
++            nDigestLength = 20;
++            b1KData = (nDigestID == css::xml::crypto::DigestID::SHA1_1K);
++        }
++        else if (nDigestID == css::xml::crypto::DigestID::SHA512 || nDigestID == css::xml::crypto::DigestID::SHA512_1K)
++        {
++            pMd = EVP_sha512();
++            nDigestLength = 64;
++            b1KData = (nDigestID == css::xml::crypto::DigestID::SHA512_1K);
++        }
++        else
++            throw css::lang::IllegalArgumentException(u"Unexpected digest requested."_ustr,
++                                                      css::uno::Reference<css::uno::XInterface>(), 1);
++
++        if (aParams.hasElements())
++            throw css::lang::IllegalArgumentException(u"Unexpected arguments provided for digest creation."_ustr,
++                                                      css::uno::Reference<css::uno::XInterface>(), 2);
++
++        EVP_MD_CTX* pContext = EVP_MD_CTX_new();
++        if (!pContext || EVP_DigestInit_ex(pContext, pMd, nullptr) != 1)
++        {
++            ERR_clear_error();
++            if (pContext)
++                EVP_MD_CTX_free(pContext);
++            return nullptr;
++        }
++
++        return new comphelper::opensslctx::OpenSSLDigestContext(pContext, nDigestLength, b1KData);
++    }
++
++    /* XCipherContextSupplier: ref nssinitializer.cxx 585-620 */
++    virtual css::uno::Reference<css::xml::crypto::XCipherContext> SAL_CALL
++    getCipherContext(::sal_Int32 nCipherID, const css::uno::Sequence<::sal_Int8>& aKey,
++                     const css::uno::Sequence<::sal_Int8>& aInitializationVector, sal_Bool bEncryption,
++                     const css::uno::Sequence<css::beans::NamedValue>& aParams) override
++    {
++        comphelper::opensslctx::OpenSSLCipherContext::Kind eKind;
++        bool bW3CPadding = false;
++        switch (nCipherID)
++        {
++            case css::xml::crypto::CipherID::AES_CBC_W3C_PADDING:
++                eKind = comphelper::opensslctx::OpenSSLCipherContext::Kind::AesCbc;
++                bW3CPadding = true;
++                break;
++            case css::xml::crypto::CipherID::AES_GCM_W3C:
++                eKind = comphelper::opensslctx::OpenSSLCipherContext::Kind::AesGcm;
++                break;
++            default:
++                throw css::lang::IllegalArgumentException(u"Unexpected cipher requested."_ustr,
++                                                          css::uno::Reference<css::uno::XInterface>(), 1);
++        }
++
++        if (aKey.getLength() != 16 && aKey.getLength() != 24 && aKey.getLength() != 32)
++            throw css::lang::IllegalArgumentException(u"Unexpected key length."_ustr,
++                                                      css::uno::Reference<css::uno::XInterface>(), 2);
++
++        if (aParams.hasElements())
++            throw css::lang::IllegalArgumentException(u"Unexpected arguments provided for cipher creation."_ustr,
++                                                      css::uno::Reference<css::uno::XInterface>(), 5);
++
++        // the IV length is checked explicitly: 16 (CBC) or 12 (GCM)
++        if (aInitializationVector.getLength() != (eKind == comphelper::opensslctx::OpenSSLCipherContext::Kind::AesGcm ? 12 : 16))
++            throw css::lang::IllegalArgumentException(u"Unexpected length of initialization vector."_ustr,
++                                                      css::uno::Reference<css::uno::XInterface>(), 3);
++
++        return comphelper::opensslctx::OpenSSLCipherContext::Create(eKind, aKey, aInitializationVector, bEncryption,
++                                                                    bW3CPadding);
++    }
++
++    /* XServiceInfo */
++    virtual OUString SAL_CALL getImplementationName() override
++    {
++        return u"com.sun.star.comp.comphelper.OpenSSLContextSupplier"_ustr;
++    }
++    virtual sal_Bool SAL_CALL supportsService(const OUString& rServiceName) override
++    {
++        return cppu::supportsService(this, rServiceName);
++    }
++    virtual css::uno::Sequence<OUString> SAL_CALL getSupportedServiceNames() override
++    {
++        return { NSS_SERVICE_NAME };
++    }
++};
++} // namespace
++
++extern "C" SAL_DLLPUBLIC_EXPORT css::uno::XInterface*
++com_sun_star_comp_comphelper_OpenSSLContextSupplier_get_implementation(
++    css::uno::XComponentContext* /*pCtx*/, css::uno::Sequence<css::uno::Any> const& /*rSeq*/)
++{
++    return cppu::acquire(new OpenSSLContextSupplier);
++}
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */

@@ -1,0 +1,33 @@
+diff --git a/sc/source/filter/excel/xlroot.cxx b/sc/source/filter/excel/xlroot.cxx
+--- a/sc/source/filter/excel/xlroot.cxx
++++ b/sc/source/filter/excel/xlroot.cxx
+@@ -38,6 +38,7 @@
+ #include <sfx2/sfxsids.hrc>
+ #include <vcl/font.hxx>
+ #include <vcl/settings.hxx>
++#include <i18nlangtag/mslangid.hxx>
+ #include <vcl/virdev.hxx>
+ #include <comphelper/diagnose_ex.hxx>
+ 
+@@ -92,8 +93,21 @@
+     mxRootStrg(std::move( xRootStrg )),
+     mrDoc( rDoc ),
+     meTextEnc( eTextEnc ),
++#ifdef __EMSCRIPTEN__
++    // FG-183: VCL's language is never set in WASM (LibreOfficeKit init skips
++    // setLanguageAndLocale; measured: Application::GetSettings().GetLanguageTag()
++    // is "zxx"), so the built-in number-format table (XclNumFmtBuffer, keyed on
++    // meSysLang) fell to the language-neutral default: en-US built-in 14 became
++    // MM/DD/YYYY instead of M/D/YYYY and a date that fits on desktop printed ###.
++    // Use the process locale instead: LANG, which the worker sets from INIT's
++    // formatLocale, and which desktop's VCL language is derived from. Setting
++    // VCL's language itself (Application::SetSettings) traps in this build.
++    meSysLang( MsLangId::getSystemLanguage() ),
++    meDocLang( MsLangId::getSystemLanguage() ),
++#else
+     meSysLang( Application::GetSettings().GetLanguageTag().getLanguageType() ),
+     meDocLang( Application::GetSettings().GetLanguageTag().getLanguageType() ),
++#endif
+     meUILang( Application::GetSettings().GetUILanguageTag().getLanguageType() ),
+     mnDefApiScript( ApiScriptType::LATIN ),
+     maScMaxPos( mrDoc.MaxCol(), mrDoc.MaxRow(), MAXTAB ),
