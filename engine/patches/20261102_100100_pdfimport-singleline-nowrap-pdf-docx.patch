@@ -1,0 +1,35 @@
+pdfimport: a PDF text box that holds a single line does not wrap it (pdf-docx module only).
+
+WriterXmlFinalizer::visit(FrameElement) now always writes fo:wrap-option in the graphic style of a text box: "no-wrap" when its
+only child is one ParagraphElement that isSingleLined(), "wrap" otherwise. A reader that draws a wider font than the PDF's would
+otherwise break the line inside a box sized to the PDF's own text ("2017" shown as "201" and "7"); with word wrap off the box
+grows sideways instead. A box with more than one line keeps wrapping, because its width is the paragraph's, so a multi-line
+paragraph never becomes one long line. Both values are written because the drawing model's default for word wrap is off
+(svdmodel.cxx: SetUserDefaultItem(makeSdrTextWordWrapItem(false))): a box left unmarked reads as "no-wrap" and the export could
+not tell it from a single line. Pairs with oox-docx-textshape-nowrap-pdf-docx.patch, which makes the DOCX export write
+wrap="none" for a no-wrap box and leaves wrap="square" for the others. Routed to pdf-docx only (*-pdf-docx.patch default arm).
+
+diff --git a/sdext/source/pdfimport/tree/writertreevisiting.cxx b/sdext/source/pdfimport/tree/writertreevisiting.cxx
+index f92375b..82d10b5 100644
+--- a/sdext/source/pdfimport/tree/writertreevisiting.cxx
++++ b/sdext/source/pdfimport/tree/writertreevisiting.cxx
+@@ -1364,6 +1364,19 @@ void WriterXmlFinalizer::visit( FrameElement& elem, const std::list< std::unique
+             aGCProps[ u"draw:image-opacity"_ustr ] = getPercentString(rGC.FillColor.Alpha * 100.0);
+     }
+ 
++    // BUG-43: a text box that holds exactly one line must not wrap it. A reader that draws a wider font than the PDF's
++    // would otherwise break the line inside a box sized to the PDF's own text ("2017" shown as "201" and "7"); with word
++    // wrap off the box grows sideways instead. A box with more than one line keeps wrapping (its width is the paragraph's).
++    // The value is always written, because the drawing model's default for word wrap is "off": a box left unmarked could not
++    // be told from one marked no-wrap, and the DOCX export (oox-docx-textshape-nowrap-pdf-docx.patch) reads it back.
++    bool bSingleLine = false;
++    if( elem.Children.size() == 1 )
++    {
++        auto* pPara = dynamic_cast<ParagraphElement*>( elem.Children.front().get() );
++        bSingleLine = pPara && pPara->isSingleLined( m_rProcessor );
++    }
++    aGCProps[ u"fo:wrap-option"_ustr ] = bSingleLine ? u"no-wrap"_ustr : u"wrap"_ustr;
++
+     StyleContainer::Style aStyle( "style:style"_ostr, std::move(aProps) );
+     StyleContainer::Style aSubStyle( "style:graphic-properties"_ostr, std::move(aGCProps) );
+     aStyle.SubStyles.push_back( &aSubStyle );
