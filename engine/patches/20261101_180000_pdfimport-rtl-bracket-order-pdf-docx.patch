@@ -1,0 +1,221 @@
+BUG-42: do not mirror brackets after reversing a right-to-left PDF run when the font stores logical code points.
+
+The PDF import writes a right-to-left run in visual (left to right) order and reverses it, mirroring every
+Bidi_Mirrored code point on the way (SubstituteBidiMirrored). That is right for producers that store the
+code point that LOOKS like the glyph ("(" reads "(" from left to right) and wrong for producers whose
+ToUnicode stores the LOGICAL code point and draws the glyph mirrored (a closing ")" comes first in the
+stream): the heading «بياناتي» came out as »بياناتي« in every build.
+
+PDFIProcessor::noteBracketGlyph counts, per font FAMILY (subset prefix and style suffix dropped: a FontId is per
+size and weight, which split the evidence of a heading font too thin) and in stream order, bracket pairs in lines
+that have right-to-left letters: an opener followed by its closer is visual order, a closer with no opener before
+it is a logical code point. isLogicalBracketFont(font id) is true only when the closer-first pairs are at least 3
+and more than twice the opener-first ones. Both mirroring sites (Writer and Draw emitters) skip the mirroring for
+such a font. No evidence, or a mix, keeps the old behaviour. Corpus measurement of the stream order (closer-first
+vs opener-first): cma_board_guide 4 vs 70 (unchanged), fahr_ab0ae96a 160 vs 6, dghr_parttime_contract 22 vs 4,
+fahr_5f757ead 9 vs 2 (changed), taqeem_draft_contract 57 vs 52 (mixed, unchanged).
+
+KNOWN LIMITS (a review on 2026-11-02 listed them; an "edge adjacency" rework was measured and was WORSE, it flipped
+visual-order documents, so they stay):
+- a pair votes only when a right-to-left letter came earlier in the same chunk, and chunks split on any wide gap, so
+  a bracket group at the very start of a chunk casts no vote (the family is usually decided by its other chunks);
+- a Latin pair in a right-to-left chunk, "(DGHR)", votes "visual" and dilutes a logical family's count;
+- a document whose bracket glyphs come from many subsets or producers pooled under one family name decides together.
+
+ROUTING. This file is named *-pdf-docx.patch, which pipeline/lib/fingerprint.sh sends to the pdf-docx module ONLY.
+The Draw emitter hunk is therefore not used (pdf-docx imports into Writer): PDF to PPTX keeps the old bracket
+behaviour until the patch is routed to pdf-pptx as well, a separate decision whose output must be measured first.
+The hunks avoid the lines that differ between the pdf-docx and pdf-pptx series (pdf-pptx lacks the BUG-28 guards in
+pdfiprocessor.cxx, BUG-39); both series were replayed and the patch applies to each.
+
+diff --git a/sdext/source/pdfimport/inc/pdfiprocessor.hxx b/sdext/source/pdfimport/inc/pdfiprocessor.hxx
+--- a/sdext/source/pdfimport/inc/pdfiprocessor.hxx
++++ b/sdext/source/pdfimport/inc/pdfiprocessor.hxx
+@@ -33,6 +33,7 @@
+ 
+ #include <memory>
+ #include <unordered_map>
++#include <vector>
+ 
+ #include "imagecontainer.hxx"
+ #include "contentsink.hxx"
+@@ -82,6 +83,19 @@
+ 
+         static OUString SubstituteBidiMirrored(std::u16string_view rString);
+ 
++        /** BUG-42: does this font store the LOGICAL code point of a mirrored bracket?
++
++            A right-to-left run is stored in visual (left to right) order. Some producers store, for a
++            bracket the shaping mirrored, the code point that LOOKS like the glyph ("(" reads left to
++            right), others the logical one (a closing ")" comes first in the stream and the glyph is
++            drawn mirrored). Mirroring after the reversal is right for the first kind and wrong for the
++            second, which then shows "»x«" for «x». The kind is read from the document's own bracket
++            pairs per font FAMILY (noteBracketGlyph, called for every glyph; a FontId is per size and
++            weight, which would split the evidence too thin): true only when the pairs
++            overwhelmingly read closer-first. No evidence, or a mix, keeps the old behaviour (mirror).
++        */
++        bool isLogicalBracketFont(sal_Int32 nFontId) const;
++
+     private:
+         void processGlyphLine();
+ 
+@@ -195,6 +209,11 @@
+         Element*                           m_pCurElement;
+         sal_Int32                          m_nNextFontId;
+         IdToFontMap                        m_aIdToFont;
++        // BUG-42: closer-first versus opener-first bracket pairs seen per font, in stream order
++        struct BracketOrder { sal_Int32 nVisual = 0; sal_Int32 nLogical = 0; bool bRtlSeen = false; std::vector<sal_uInt32> aClosers; };
++        std::unordered_map<OUString, BracketOrder> m_aBracketOrder;   // keyed by the font FAMILY (a FontId is per size)
++        void noteBracketGlyph(sal_Int32 nFontId, std::u16string_view aGlyph);
++        OUString bracketFamilyOf(sal_Int32 nFontId) const;
+         FontToIdMap                        m_aFontToId;
+ 
+         GraphicsContextStack               m_aGCStack;
+diff --git a/sdext/source/pdfimport/tree/pdfiprocessor.cxx b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+--- a/sdext/source/pdfimport/tree/pdfiprocessor.cxx
++++ b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+@@ -209,6 +209,11 @@
+ // line diagnose block - start
+ void PDFIProcessor::processGlyphLine()
+ {
++    for (auto& rEntry : m_aBracketOrder)   // BUG-42: a pair never spans lines
++    {
++        rEntry.second.aClosers.clear();
++        rEntry.second.bRtlSeen = false;
++    }
+     if (m_GlyphsList.empty())
+         return;
+ 
+@@ -363,6 +368,7 @@
+     CharGlyph aGlyph(m_pCurElement, getCurrentContext(), charWidth, prevSpaceWidth, rGlyphs);
+     aGlyph.getGC().Transformation = totalTextMatrix1;
+     m_GlyphsList.push_back(aGlyph);
++    noteBracketGlyph(getCurrentContext().FontId, rGlyphs);   // BUG-42
+ 
+     prevCharWidth = charWidth;
+     prevTextMatrix = totalTextMatrix1;
+@@ -1176,6 +1182,92 @@
+     pEle->Children.sort(lr_tb_sort);
+ }
+ 
++namespace {
++
++bool lcl_isRtlLetter(sal_uInt32 c)
++{
++    return (c >= 0x0590 && c <= 0x08FF) || (c >= 0xFB1D && c <= 0xFDFF) || (c >= 0xFE70 && c <= 0xFEFF);
++}
++
++// the closing bracket that pairs with an opening one, or 0
++sal_uInt32 lcl_closerOf(sal_uInt32 c)
++{
++    switch (c)
++    {
++        case '(': return ')';
++        case '[': return ']';
++        case '{': return '}';
++        case '<': return '>';
++        case 0x00AB: return 0x00BB;   // « »
++        case 0x2039: return 0x203A;   // ‹ ›
++        default: return 0;
++    }
++}
++
++bool lcl_isCloser(sal_uInt32 c)
++{
++    return c == ')' || c == ']' || c == '}' || c == '>' || c == 0x00BB || c == 0x203A;
++}
++
++}
++
++// BUG-42: count the bracket pairs of a font by the order they appear in the stream. A pair that reads
++// opener-first is visual order (the glyph is stored as it looks); a closer with no opener before it,
++// seen in right-to-left text, is a logical code point drawn mirrored. Only pairs in a line that has
++// right-to-left letters count, so Latin "(a)" in the same font does not vote.
++// "LUSIXU+TheMixArab-Bold" and "TheMixArab" are one family: drop the subset prefix and the style suffix.
++OUString PDFIProcessor::bracketFamilyOf(sal_Int32 nFontId) const
++{
++    OUString aName = getFont(nFontId).familyName;
++    const sal_Int32 nPlus = aName.indexOf('+');
++    if (nPlus == 6)
++        aName = aName.copy(nPlus + 1);
++    const sal_Int32 nCut = aName.indexOf(u'-', 1);
++    sal_Int32 nEnd = nCut >= 0 ? nCut : aName.getLength();
++    const sal_Int32 nComma = aName.indexOf(',');
++    if (nComma >= 0 && nComma < nEnd)
++        nEnd = nComma;
++    return aName.copy(0, nEnd);
++}
++
++void PDFIProcessor::noteBracketGlyph(sal_Int32 nFontId, std::u16string_view aGlyph)
++{
++    BracketOrder& rEntry = m_aBracketOrder[bracketFamilyOf(nFontId)];
++    for (sal_Int32 i = 0; i < static_cast<sal_Int32>(aGlyph.size());)
++    {
++        const sal_uInt32 c = o3tl::iterateCodePoints(aGlyph, &i);
++        if (lcl_isRtlLetter(c))
++        {
++            rEntry.bRtlSeen = true;
++        }
++        else if (const sal_uInt32 nCloser = lcl_closerOf(c))
++        {
++            if (rEntry.aClosers.size() < 64)
++                rEntry.aClosers.push_back(nCloser);
++        }
++        else if (lcl_isCloser(c))
++        {
++            if (!rEntry.aClosers.empty() && rEntry.aClosers.back() == c)
++            {
++                rEntry.aClosers.pop_back();
++                if (rEntry.bRtlSeen)
++                    ++rEntry.nVisual;
++            }
++            else if (rEntry.bRtlSeen)
++            {
++                ++rEntry.nLogical;
++            }
++        }
++    }
++}
++
++bool PDFIProcessor::isLogicalBracketFont(sal_Int32 nFontId) const
++{
++    const auto it = m_aBracketOrder.find(bracketFamilyOf(nFontId));
++    return it != m_aBracketOrder.end() && it->second.nLogical >= 3
++           && it->second.nLogical > 2 * it->second.nVisual;
++}
++
+ /* Produce mirrored-image for each code point which has the Bidi_Mirrored property, within a string.
+    This need to be done in forward order.
+ */
+diff --git a/sdext/source/pdfimport/tree/writertreevisiting.cxx b/sdext/source/pdfimport/tree/writertreevisiting.cxx
+--- a/sdext/source/pdfimport/tree/writertreevisiting.cxx
++++ b/sdext/source/pdfimport/tree/writertreevisiting.cxx
+@@ -175,8 +175,10 @@
+ 
+     if (isRTL)  // If so, reverse string
+     {
+-        // First, produce mirrored-image for each code point which has the Bidi_Mirrored property.
+-        str = PDFIProcessor::SubstituteBidiMirrored(str);
++        // First, produce mirrored-image for each code point which has the Bidi_Mirrored property,
++        // unless this font stores the logical code point of its brackets already (BUG-42).
++        if (!m_rEmitContext.rProcessor.isLogicalBracketFont(elem.FontId))
++            str = PDFIProcessor::SubstituteBidiMirrored(str);
+         // Then, reverse the code points in the string, in backward order.
+         str = ::comphelper::string::reverseCodePoints(str);
+     }
+diff --git a/sdext/source/pdfimport/tree/drawtreevisiting.cxx b/sdext/source/pdfimport/tree/drawtreevisiting.cxx
+--- a/sdext/source/pdfimport/tree/drawtreevisiting.cxx
++++ b/sdext/source/pdfimport/tree/drawtreevisiting.cxx
+@@ -167,8 +167,10 @@
+ 
+     if (isRTL)  // If so, reverse string
+     {
+-        // First, produce mirrored-image for each code point which has the Bidi_Mirrored property.
+-        str = PDFIProcessor::SubstituteBidiMirrored(str);
++        // First, produce mirrored-image for each code point which has the Bidi_Mirrored property,
++        // unless this font stores the logical code point of its brackets already (BUG-42).
++        if (!m_rEmitContext.rProcessor.isLogicalBracketFont(elem.FontId))
++            str = PDFIProcessor::SubstituteBidiMirrored(str);
+         // Then, reverse the code points in the string, in backward order.
+         str = ::comphelper::string::reverseCodePoints(str);
+     }
