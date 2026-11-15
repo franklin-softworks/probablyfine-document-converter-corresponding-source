@@ -1,0 +1,16 @@
+diff --git a/sw/source/filter/html/htmlforw.cxx b/sw/source/filter/html/htmlforw.cxx
+--- a/sw/source/filter/html/htmlforw.cxx
++++ b/sw/source/filter/html/htmlforw.cxx
+@@ -338,6 +338,12 @@ void SwHTMLWriter::OutHiddenForms()
+ {
+     // Without DrawModel there can't be controls. Then you also can't access the
+     // document via UNO, because otherwise a DrawModel would be created.
++#ifdef __EMSCRIPTEN__
++    // Forms service not available in WASM build - skip hidden forms export
++    // This prevents XFormsSupplier query failure during HTML export
++    return;
++#endif
++
+     if( !m_pDoc->getIDocumentDrawModelAccess().GetDrawModel() )
+         return;
+
