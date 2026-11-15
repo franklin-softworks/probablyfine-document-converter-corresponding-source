@@ -1,0 +1,43 @@
+--- a/oox/source/ppt/pptshape.cxx
++++ b/oox/source/ppt/pptshape.cxx
+@@ -245,6 +245,40 @@
+                                     // and looks for time format in the 4 bits after that
+                                     sal_Int32 nDateTimeFormat = static_cast<sal_Int32>(eDateFormat) |
+                                                                 static_cast<sal_Int32>(eTimeFormat) << 4;
++#ifdef __EMSCRIPTEN__
++                                    // Item 13. THIS is what makes the header/footer
++                                    // date live: IsDateTimeFixed=false, so Impress
++                                    // formats DateTime::SYSTEM at render time and a
++                                    // converted deck carries the CONVERSION date.
++                                    // DateTimeText is never set at all, which is why
++                                    // the sdmod2 fallback measured text='' and could
++                                    // not repair it downstream — the value only
++                                    // exists HERE, in the placeholder's own cached
++                                    // <a:t> ("1/22/16" in sat15.pptx).
++                                    //
++                                    // Capture it and mark the setting fixed, so the
++                                    // deck shows the date the DOCUMENT shows. Same
++                                    // reasoning as the oox <a:fld> path: a converter
++                                    // reproduces the file, output stays
++                                    // deterministic (so a dated deck can be blessed
++                                    // once instead of re-flagging every run), and the
++                                    // conversion time is not leaked.
++                                    //
++                                    // Empty cached text falls through to the original
++                                    // live behaviour — a blank date placeholder would
++                                    // be a worse defect than a wrong one.
++                                    {
++                                        const OUString aCachedDate = pTextRun->getText();
++                                        if (!aCachedDate.isEmpty())
++                                        {
++                                            xPropertySet->setPropertyValue( u"IsDateTimeVisible"_ustr, Any(true) );
++                                            xPropertySet->setPropertyValue( u"IsDateTimeFixed"_ustr, Any(true) );
++                                            xPropertySet->setPropertyValue( u"DateTimeText"_ustr, Any(aCachedDate) );
++                                            xPropertySet->setPropertyValue( u"DateTimeFormat"_ustr, Any(nDateTimeFormat) );
++                                            return;
++                                        }
++                                    }
++#endif
+                                     xPropertySet->setPropertyValue( u"IsDateTimeVisible"_ustr, Any(true) );
+                                     xPropertySet->setPropertyValue( u"IsDateTimeFixed"_ustr, Any(false) );
+                                     xPropertySet->setPropertyValue( u"DateTimeFormat"_ustr, Any(nDateTimeFormat) );

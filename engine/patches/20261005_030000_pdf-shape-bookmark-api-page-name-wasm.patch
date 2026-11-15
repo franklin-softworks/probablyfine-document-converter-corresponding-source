@@ -1,0 +1,21 @@
+diff --git a/sd/source/ui/unoidl/unomodel.cxx b/sd/source/ui/unoidl/unomodel.cxx
+index 4e1ea601c37c..c422ed38dedb 100644
+--- a/sd/source/ui/unoidl/unomodel.cxx
++++ b/sd/source/ui/unoidl/unomodel.cxx
+@@ -3174,6 +3174,16 @@ static sal_Int32 ImplPDFGetBookmarkPage( const OUString& rBookmark, SdDrawDocume
+     bool        bIsMasterPage;
+     sal_uInt16  nPgNum = rDoc.GetPageByName( aBookmark, bIsMasterPage );
+ 
++#ifdef __EMSCRIPTEN__
++    // FG-158: a shape's "Bookmark" property hands back the page's API name
++    // ("page2", unoobj.cxx WID_BOOKMARK -> getPageApiNameFromUiName), while
++    // GetPageByName compares UI names ("Slide 2"). So every shape-level jump to
++    // an unnamed slide (PPTX hlinksldjump, ODP) found no page and the PDF link
++    // was silently dropped. Retry with the API name translated back.
++    if ( nPgNum == SDRPAGE_NOTFOUND )
++        nPgNum = rDoc.GetPageByName( SdDrawPage::getUiNameFromPageApiName( aBookmark ), bIsMasterPage );
++#endif
++
+     if ( nPgNum == SDRPAGE_NOTFOUND )
+     {
+         // is the bookmark an object ?
