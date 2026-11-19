@@ -1,0 +1,120 @@
+msfilter: use the declared key size for RC4 CryptoAPI (40-bit keys were initialised wrongly).
+
+MSCodec_CryptoAPI::InitCipher always initialised RC4 with the first 16 bytes of the
+SHA-1 hash, whatever EncryptionHeader.KeySize says. For a 40-bit key [MS-OFFCRYPTO]
+2.3.5.2 uses the first 5 bytes of the hash followed by 11 zero bytes (to 128 bits), so
+every .xls and .doc written with 40-bit RC4 CryptoAPI (for instance by Apache POI's
+default for those formats) failed to open: the verifier never matched, the user was
+told the password was wrong when it was right.
+
+Keep the key size the header declares in the codec (SetKeyBits), pass it from the XLS
+reader (XclImpBiff8CryptoAPIDecrypter, including its clone constructor) and the DOC reader
+(after lclReadCryptoAPIHeader), and zero-pad the key when it is 40 bits. Every other
+size keeps the 128-bit key it used before.
+
+diff --git a/filter/source/msfilter/mscodec.cxx b/filter/source/msfilter/mscodec.cxx
+--- a/filter/source/msfilter/mscodec.cxx
++++ b/filter/source/msfilter/mscodec.cxx
+@@ -479,9 +479,18 @@
+     std::vector<unsigned char> const hash(::comphelper::Hash::calculateHash(
+             aKeyData.data(), aKeyData.size(), ::comphelper::HashType::SHA1));
+ 
++    // The key is the first KeyBits/8 bytes of the hash; a 40-bit key is padded with zero bytes to
++    // 128 bits ([MS-OFFCRYPTO] 2.3.5.2). All other sizes keep using 128 bits, as before.
++    std::vector<sal_uInt8> aKey(hash.begin(), hash.begin() + ENCRYPT_KEY_SIZE_AES_128/8);
++    if (m_nKeyBits == 40)
++    {
++        for (size_t i = 5; i < aKey.size(); ++i)
++            aKey[i] = 0;
++    }
++
+     rtlCipherError result =
+         rtl_cipher_init(m_hCipher, rtl_Cipher_DirectionDecode,
+-                        hash.data(), ENCRYPT_KEY_SIZE_AES_128/8, nullptr, 0);
++                        aKey.data(), aKey.size(), nullptr, 0);
+ 
+     return (result == rtl_Cipher_E_None);
+ }
+diff --git a/include/filter/msfilter/mscodec.hxx b/include/filter/msfilter/mscodec.hxx
+--- a/include/filter/msfilter/mscodec.hxx
++++ b/include/filter/msfilter/mscodec.hxx
+@@ -400,9 +400,14 @@
+ {
+ private:
+     css::uno::Sequence<sal_Int8> m_aStd97Key;
++    sal_uInt32 m_nKeyBits = 128;
+ public:
+     MSCodec_CryptoAPI();
+ 
++    /** Key size in bits from the EncryptionHeader (default 128). A 40-bit key is the first 5 bytes
++        of the hash, zero padded to 128 bits ([MS-OFFCRYPTO] 2.3.5.2). Call before VerifyKey(). */
++    void SetKeyBits(sal_uInt32 nKeyBits) { m_nKeyBits = nKeyBits; }
++
+     virtual void InitKey(const sal_uInt16 pPassData[16],
+                          const sal_uInt8 pDocId[16]) override;
+     virtual bool InitCipher(sal_uInt32 nCounter) override;
+diff --git a/sc/source/filter/excel/xicontent.cxx b/sc/source/filter/excel/xicontent.cxx
+--- a/sc/source/filter/excel/xicontent.cxx
++++ b/sc/source/filter/excel/xicontent.cxx
+@@ -1200,7 +1200,8 @@
+         std::vector<sal_uInt8>(info.verifier.encryptedVerifier,
+             info.verifier.encryptedVerifier + SAL_N_ELEMENTS(info.verifier.encryptedVerifier)),
+         std::vector<sal_uInt8>(info.verifier.encryptedVerifierHash,
+-            info.verifier.encryptedVerifierHash + SAL_N_ELEMENTS(info.verifier.encryptedVerifierHash)));
++            info.verifier.encryptedVerifierHash + SAL_N_ELEMENTS(info.verifier.encryptedVerifierHash)),
++        info.header.keyBits);
+ 
+     return xDecr;
+ }
+diff --git a/sc/source/filter/excel/xistream.cxx b/sc/source/filter/excel/xistream.cxx
+--- a/sc/source/filter/excel/xistream.cxx
++++ b/sc/source/filter/excel/xistream.cxx
+@@ -234,8 +234,10 @@
+ 
+ XclImpBiff8CryptoAPIDecrypter::XclImpBiff8CryptoAPIDecrypter(const XclImpBiff8CryptoAPIDecrypter& rSrc)
+     : XclImpBiff8Decrypter(rSrc)
++    , mnKeyBits(rSrc.mnKeyBits)
+ {
+     mpCodec = &maCodec;
++    maCodec.SetKeyBits(mnKeyBits);
+     if (IsValid())
+         maCodec.InitCodec(maEncryptionData);
+ }
+diff --git a/sc/source/filter/inc/xistream.hxx b/sc/source/filter/inc/xistream.hxx
+--- a/sc/source/filter/inc/xistream.hxx
++++ b/sc/source/filter/inc/xistream.hxx
+@@ -176,10 +176,13 @@
+ public:
+     explicit XclImpBiff8CryptoAPIDecrypter( std::vector<sal_uInt8>&& rSalt,
+                                             std::vector<sal_uInt8>&& rVerifier,
+-                                            std::vector<sal_uInt8>&& rVerifierHash)
++                                            std::vector<sal_uInt8>&& rVerifierHash,
++                                            sal_uInt32 nKeyBits = 128)
+         : XclImpBiff8Decrypter(std::move(rSalt), std::move(rVerifier), std::move(rVerifierHash))
++        , mnKeyBits(nKeyBits)
+     {
+         mpCodec = &maCodec;
++        maCodec.SetKeyBits(nKeyBits);
+     }
+ 
+ private:
+@@ -191,6 +194,7 @@
+ 
+ private:
+     ::msfilter::MSCodec_CryptoAPI maCodec;       /// Crypto algorithm implementation.
++    sal_uInt32 mnKeyBits;                        /// Key size in bits from the FILEPASS header.
+ };
+ 
+ // Stream
+diff --git a/sw/source/filter/ww8/ww8par.cxx b/sw/source/filter/ww8/ww8par.cxx
+--- a/sw/source/filter/ww8/ww8par.cxx
++++ b/sw/source/filter/ww8/ww8par.cxx
+@@ -5745,6 +5745,8 @@
+                     {
+                         xCtx.reset(new msfilter::MSCodec_CryptoAPI);
+                         bCouldReadHeaders = lclReadCryptoAPIHeader(info, *m_pTableStream);
++                        if (bCouldReadHeaders)
++                            static_cast<msfilter::MSCodec_CryptoAPI&>(*xCtx).SetKeyBits(info.header.keyBits);
+                     }
+ 
+                     // if initialization has failed the EncryptionData should be empty
