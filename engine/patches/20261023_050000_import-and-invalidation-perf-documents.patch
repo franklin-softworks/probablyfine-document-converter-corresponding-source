@@ -1,0 +1,217 @@
+BUG-38, second set: three more superlinear costs in documents with thousands of anchored
+objects, found with a named CPU profile of the import of 8,000 generated shapes (after the
+first set) and of cma's layout. All exact; not WASM-specific.
+
+1. SdrCustomShapeGeometryItem is pooled through HashedItemInstanceManager
+   (svx/source/items/customshapeitem.cxx, include/svx/sdasitm.hxx). It had no instance
+   manager, so the default one found an equal item by a linear search with operator== over
+   every geometry in the document: 4.5 s of a 23.6 s import. hashCode() returns the item's
+   own content hash (comphelper::anyToHash of the property sequence, which operator== already
+   compares before the sequences), or 0 when that hash is unusable; so equal items hash equal
+   by construction, and the unusable ones are told apart by operator== as before.
+2. DelFlyInRange (sw/source/core/doc/docedt.cxx) visits only the formats anchored on the
+   range's own nodes (SwNode::GetAnchoredFlys), in the order of the full scan (descending
+   table position), instead of every format in the document on every call: the import's
+   DeleteAndJoin (once per text box) made it O(n^2), 3.0 s of the import. Every branch of
+   IsSelectFrameAnchoredAtPara / IsDestroyFrameAnchoredAtChar bounds the anchor node by the
+   range's, so the candidates are a superset of what the scan selects; the same predicate
+   decides. A candidate deleted along the way is skipped. The full scan, unchanged, remains
+   for a range spanning more nodes than there are formats.
+3. SwViewShellImp::AddPendingLOKInvalidation de-duplicated each invalidation with a linear
+   std::find over all pending ones (O(n^2): 6 s of cma's layout). A hash set alongside the
+   vector now does the check; the vector, its order and its contents are the same, so
+   nothing downstream sees a difference.
+
+Documents module only for now.
+
+diff --git a/sw/source/core/inc/viewimp.hxx b/sw/source/core/inc/viewimp.hxx
+index d47bf63..50de379 100644
+--- a/sw/source/core/inc/viewimp.hxx
++++ b/sw/source/core/inc/viewimp.hxx
+@@ -26,6 +26,7 @@
+ #include <swregion.hxx>
+ #include <memory>
+ #include <optional>
++#include <unordered_set>
+ #include <vector>
+ 
+ class OutputDevice;
+@@ -85,6 +86,19 @@ class SwViewShellImp
+     std::optional<SwRegionRects> m_oPaintRegion; // Collector of Paintrects from the LayAction
+ 
+     std::vector<SwRect> m_pendingLOKInvalidations;
++    // The same rectangles, for the duplicate check: a search of the vector made collecting n
++    // invalidations O(n^2) (thousands of anchored objects, each invalidating while laid out).
++    struct SwRectHash
++    {
++        size_t operator()(const SwRect& r) const
++        {
++            size_t h = std::hash<tools::Long>()(r.Left());
++            h = h * 31 + std::hash<tools::Long>()(r.Top());
++            h = h * 31 + std::hash<tools::Long>()(r.Width());
++            return h * 31 + std::hash<tools::Long>()(r.Height());
++        }
++    };
++    std::unordered_set<SwRect, SwRectHash> m_pendingLOKInvalidationSet;
+ 
+     SwLayAction   *m_pLayAction;      // Is set if an Action object exists
+                                  // Is registered by the SwLayAction ctor and deregistered by the dtor
+diff --git a/sw/source/core/view/viewimp.cxx b/sw/source/core/view/viewimp.cxx
+index 4a093f2..17c73fb 100644
+--- a/sw/source/core/view/viewimp.cxx
++++ b/sw/source/core/view/viewimp.cxx
+@@ -170,8 +170,9 @@ void SwViewShellImp::AddPendingLOKInvalidation( const SwRect& rRect )
+     std::vector<SwRect>& l = m_pendingLOKInvalidations;
+     if(l.empty() && m_rShell.GetSfxViewShell()) // Announce that these invalidations will need flushing.
+         m_rShell.GetSfxViewShell()->libreOfficeKitViewAddPendingInvalidateTiles();
+-    // These are often repeated, so check first for duplicates.
+-    if( std::find( l.begin(), l.end(), rRect ) == l.end())
++    // These are often repeated, so check first for duplicates (by hash; the vector keeps the
++    // order in which they arrived).
++    if (m_pendingLOKInvalidationSet.insert(rRect).second)
+         l.push_back( rRect );
+ }
+ 
+@@ -179,6 +180,7 @@ std::vector<SwRect> SwViewShellImp::TakePendingLOKInvalidations()
+ {
+     std::vector<SwRect> ret;
+     std::swap(ret, m_pendingLOKInvalidations);
++    m_pendingLOKInvalidationSet.clear();
+     return ret;
+ }
+ 
+diff --git a/include/svx/sdasitm.hxx b/include/svx/sdasitm.hxx
+index 4e45758..b9b7400 100644
+--- a/include/svx/sdasitm.hxx
++++ b/include/svx/sdasitm.hxx
+@@ -58,6 +58,11 @@ private:
+     inline void UpdateHash() const;
+     inline void InvalidateHash();
+ 
++protected:
++    // Pooled through a hash, not by a linear search with operator== over every geometry in
++    // the document (one per custom shape: thousands in a converted PDF).
++    SAL_DLLPRIVATE virtual ItemInstanceManager* getItemInstanceManager() const override;
++
+     public:
+ 
+             SAL_DLLPRIVATE SdrCustomShapeGeometryItem();
+@@ -71,6 +76,7 @@ private:
+             SdrCustomShapeGeometryItem & operator =(SdrCustomShapeGeometryItem &&) = delete; // due to SfxPoolItem
+ 
+             SAL_DLLPRIVATE virtual bool                operator==( const SfxPoolItem& ) const override;
++            SAL_DLLPRIVATE virtual size_t              hashCode() const override;
+ 
+             SAL_DLLPRIVATE virtual bool GetPresentation(SfxItemPresentation ePresentation,
+                                          MapUnit eCoreMetric, MapUnit ePresentationMetric,
+diff --git a/svx/source/items/customshapeitem.cxx b/svx/source/items/customshapeitem.cxx
+index 24944bf..2caec7a 100644
+--- a/svx/source/items/customshapeitem.cxx
++++ b/svx/source/items/customshapeitem.cxx
+@@ -244,6 +244,21 @@ bool SdrCustomShapeGeometryItem::operator==( const SfxPoolItem& rCmp ) const
+     return m_aPropSeq == other.m_aPropSeq;
+ }
+ 
++ItemInstanceManager* SdrCustomShapeGeometryItem::getItemInstanceManager() const
++{
++    static HashedItemInstanceManager aInstanceManager(ItemType());
++    return &aInstanceManager;
++}
++
++// Agrees with operator== by construction: two equal items have the same hash state and, when it
++// is valid, the same hash (operator== compares exactly these before the sequences). Items with
++// an unusable hash all share one value and are told apart by operator==, as before.
++size_t SdrCustomShapeGeometryItem::hashCode() const
++{
++    UpdateHash();
++    return m_aHashState == HashState::Valid ? m_aHash : 0;
++}
++
+ void SdrCustomShapeGeometryItem::UpdateHash() const
+ {
+     if( m_aHashState != HashState::Unknown )
+diff --git a/sw/source/core/doc/docedt.cxx b/sw/source/core/doc/docedt.cxx
+index 43449de..11fddd0 100644
+--- a/sw/source/core/doc/docedt.cxx
++++ b/sw/source/core/doc/docedt.cxx
+@@ -224,20 +224,71 @@ void DelFlyInRange( SwNode& rMkNd,
+ 
+     SwDoc& rDoc = rMkNd.GetDoc();
+     sw::SpzFrameFormats& rTable = *rDoc.GetSpzFrameFormats();
+-    for ( auto i = rTable.size(); i; )
++    const DelContentType nDelType = oPtContentIdx
++        ? DelContentType::AllMask|DelContentType::WriterfilterHack
++        : DelContentType::AllMask|DelContentType::WriterfilterHack|DelContentType::CheckNoCntnt;
++    auto isSelected = [&](const sw::SpzFrameFormat* pFormat)
+     {
+-        sw::SpzFrameFormat* pFormat = rTable[--i];
+         const SwFormatAnchor &rAnch = pFormat->GetAnchor();
+         SwPosition const*const pAPos = rAnch.GetContentAnchor();
+-        if (pAPos &&
++        return pAPos &&
+             (((rAnch.GetAnchorId() == RndStdIds::FLY_AT_PARA)
+-                && IsSelectFrameAnchoredAtPara(*pAPos, rStart, rEnd, oPtContentIdx
+-                    ? DelContentType::AllMask|DelContentType::WriterfilterHack
+-                    : DelContentType::AllMask|DelContentType::WriterfilterHack|DelContentType::CheckNoCntnt))
++                && IsSelectFrameAnchoredAtPara(*pAPos, rStart, rEnd, nDelType))
+             || ((rAnch.GetAnchorId() == RndStdIds::FLY_AT_CHAR)
+-                && IsDestroyFrameAnchoredAtChar(*pAPos, rStart, rEnd, oPtContentIdx
+-                    ? DelContentType::AllMask|DelContentType::WriterfilterHack
+-                    : DelContentType::AllMask|DelContentType::WriterfilterHack|DelContentType::CheckNoCntnt))))
++                && IsDestroyFrameAnchoredAtChar(*pAPos, rStart, rEnd, nDelType)));
++    };
++    // As in the scan below: a fly's content flys first, then the format itself.
++    auto deleteSelected = [&](sw::SpzFrameFormat* pFormat)
++    {
++        // If the Fly is deleted, all Flys in its content have to be deleted too.
++        const SwFormatContent &rContent = pFormat->GetContent();
++        // But only fly formats own their content, not draw formats.
++        if (rContent.GetContentIdx() && pFormat->Which() == RES_FLYFRMFMT)
++        {
++            DelFlyInRange( rContent.GetContentIdx()->GetNode(),
++                           *rContent.GetContentIdx()->
++                                    GetNode().EndOfSectionNode() );
++        }
++        rDoc.getIDocumentLayoutAccess().DelLayoutFormat( pFormat );
++    };
++
++    // Every branch of IsSelectFrameAnchoredAtPara / IsDestroyFrameAnchoredAtChar bounds the
++    // anchor's node by rStart's and rEnd's, so only formats anchored on the range's own nodes
++    // can be selected. Visit those (SwNode::GetAnchoredFlys), in the order of the scan below
++    // (descending table position), instead of every format in the document on every call:
++    // the import deletes and joins once per text box, which made it O(n^2) in the formats.
++    const SwNodeOffset nFirst = rStart.GetNodeIndex();
++    const SwNodeOffset nLast = rEnd.GetNodeIndex();
++    if (nLast - nFirst + 1 < SwNodeOffset(sal_Int32(rTable.size())))
++    {
++        std::vector<std::pair<size_t, sw::SpzFrameFormat*>> aCandidates;
++        for (SwNodeOffset n = nFirst; n <= nLast; ++n)
++        {
++            for (SwFrameFormat* pFly : rDoc.GetNodes()[n]->GetAnchoredFlys())
++            {
++                auto pFormat = static_cast<sw::SpzFrameFormat*>(pFly);
++                auto it = rTable.find(pFormat);
++                if (it != rTable.end())
++                    aCandidates.emplace_back(std::distance(rTable.begin(), it), pFormat);
++            }
++        }
++        std::sort(aCandidates.begin(), aCandidates.end(),
++                  [](const auto& a, const auto& b) { return a.first > b.first; });
++        for (const auto& [nPos, pFormat] : aCandidates)
++        {
++            (void)nPos;
++            // A deletion can take others with it (DelLayoutFormat): skip what is gone.
++            if (!rTable.ContainsFormat(pFormat) || !isSelected(pFormat))
++                continue;
++            deleteSelected(pFormat);
++        }
++        return;
++    }
++
++    for ( auto i = rTable.size(); i; )
++    {
++        sw::SpzFrameFormat* pFormat = rTable[--i];
++        if (isSelected(pFormat))
+         {
+             // If the Fly is deleted, all Flys in its content have to be deleted too.
+             const SwFormatContent &rContent = pFormat->GetContent();
