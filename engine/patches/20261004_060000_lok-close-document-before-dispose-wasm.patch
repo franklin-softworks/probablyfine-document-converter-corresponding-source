@@ -1,0 +1,104 @@
+diff --git a/desktop/source/lib/init.cxx b/desktop/source/lib/init.cxx
+--- a/desktop/source/lib/init.cxx
++++ b/desktop/source/lib/init.cxx
+@@ -99,6 +99,9 @@
+ #include <com/sun/star/container/XNameAccess.hpp>
+ #include <com/sun/star/document/XTypeDetection.hpp>
+ #include <com/sun/star/frame/Desktop.hpp>
++#include <com/sun/star/util/XCloseable.hpp>
++#include <com/sun/star/util/XModifiable.hpp>
++#include <com/sun/star/frame/XFrames.hpp>
+ #include <com/sun/star/frame/DispatchResultEvent.hpp>
+ #include <com/sun/star/frame/DispatchResultState.hpp>
+ #include <com/sun/star/frame/XDispatchProvider.hpp>
+@@ -1563,6 +1566,25 @@
+     forceSetClipboardForCurrentView(this);
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// WASM: live task-frame count, for the frame-leak measurement in the destructor below.
++static void lcl_logLiveFrames(const char* pWhen)
++{
++    try
++    {
++        uno::Reference<frame::XDesktop2> xDesktop
++            = frame::Desktop::create(comphelper::getProcessComponentContext());
++        uno::Reference<frame::XFrames> xFrames = xDesktop->getFrames();
++        std::cerr << "[LOK] frames alive " << pWhen << ": "
++                  << (xFrames.is() ? xFrames->getCount() : -1) << std::endl;
++    }
++    catch (const uno::Exception&)
++    {
++        std::cerr << "[LOK] frames alive " << pWhen << ": unknown" << std::endl;
++    }
++}
++#endif
++
+ LibLODocument_Impl::~LibLODocument_Impl()
+ {
+     if (comphelper::LibreOfficeKit::isForkedChild())
+@@ -1578,6 +1600,49 @@
+         return;
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    // Measured before the close as well as after, so a count of 0 afterwards cannot
++    // be vacuous: the same container must have shown this document's frame first.
++    lcl_logLiveFrames("before document close");
++
++    // WASM: close the document before disposing it, the way stock
++    // `soffice --convert-to` does (desktop/source/app/dispatchwatcher.cxx,
++    // XCloseable::close(true)). dispose() alone releases the document but not the
++    // frame it was loaded into. The bridge's .uno:CloseDoc normally closes it first,
++    // but that dispatch goes to the desktop's CURRENT frame, and a hidden Writer
++    // document that has a real view (frmload.cxx, FG-096) never becomes current, so
++    // there it fails ("Failed to dispatch .uno:CloseDoc") and the frame survived.
++    // close(true) routes through SfxBaseModel::close(), where the NTH-10 patch
++    // closes the frame. A document .uno:CloseDoc already closed throws
++    // DisposedException here, which is the expected, harmless case.
++    try
++    {
++        // Drop the modified flag first. Closing the frame (NTH-10) runs
++        // SfxBaseController::suspend -> SfxObjectShell::PrepareClose, which for a
++        // MODIFIED document with a real view builds the query-save dialog; its .ui
++        // file is stripped from the VFS (slim_soffice_data.py), so the dialog is null
++        // and WASM traps -- after a successful export, losing the result. Nothing in a
++        // conversion is ever saved back to the source, so the flag carries nothing.
++        uno::Reference<util::XModifiable> xModifiable(mxComponent, uno::UNO_QUERY);
++        if (xModifiable.is() && xModifiable->isModified())
++        {
++            std::cerr << "[LOK] document was modified at destroy; clearing before close" << std::endl;
++            xModifiable->setModified(false);
++        }
++
++        uno::Reference<util::XCloseable> xCloseable(mxComponent, uno::UNO_QUERY);
++        if (xCloseable.is())
++            xCloseable->close(true);
++    }
++    catch (const css::lang::DisposedException&)
++    {
++    }
++    catch (const uno::Exception&)
++    {
++        TOOLS_WARN_EXCEPTION("lok", "WASM: close before dispose failed");
++    }
++#endif
++
+     try
+     {
+         mxComponent->dispose();
+@@ -1586,6 +1651,14 @@
+     {
+         TOOLS_WARN_EXCEPTION("lok", "failed to dispose document");
+     }
++
++#ifdef __EMSCRIPTEN__
++    // WASM: direct frame-leak measurement for tests/test_frame_leak.js. Every
++    // conversion loads one document into one task frame; after it is destroyed
++    // there should be none left. Read the Desktop's frame container rather than
++    // infer it from log lines that only some close paths print.
++    lcl_logLiveFrames("after document destroy");
++#endif
+ }
+ 
+ static OUString getGenerator()

@@ -1,0 +1,13 @@
+diff --git a/external/poppler/poppler-config.patch.1 b/external/poppler/poppler-config.patch.1
+index 8f71e987b2b9..56e49fbf39a3 100644
+--- a/external/poppler/poppler-config.patch.1
++++ b/external/poppler/poppler-config.patch.1
+@@ -212,6 +212,8 @@ index 0fbd336a..451213f8 100644
+ +#elif defined (_WIN32)
+ +/* Use win32 font configuration backend */
+ +#define WITH_FONTCONFIGURATION_WIN32 1
+++#elif defined(__EMSCRIPTEN__)
+++/* No font configuration backend for WASM */
+ +#elif defined (__ANDROID__)
+ +/* Use android font configuration backend */
+ +#define WITH_FONTCONFIGURATION_ANDROID 1
