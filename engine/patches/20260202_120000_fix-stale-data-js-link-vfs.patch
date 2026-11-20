@@ -1,0 +1,35 @@
+From: Claude Code <noreply@anthropic.com>
+Subject: Fix stale soffice.data.js.link causing missing VFS directories
+
+The Emscripten file packager generates soffice.data.js with FS_createPath
+entries for all directories needed by files in soffice.data. This file is
+copied to soffice.data.js.link via gb_Helper_copy_if_different_and_touch,
+which only updates the target if content differs. The .link file is then
+used by the linker to embed VFS setup into soffice.js.
+
+When build flags change (e.g., adding --enable-cairo-canvas), the file
+packager regenerates soffice.data.js with new directory entries, but
+gb_Helper_copy_if_different_and_touch may not detect the change if the
+.link file has a newer timestamp (due to .PRECIOUS preventing deletion).
+This causes soffice.js to embed stale FS_createPath entries that don't
+match the actual files in soffice.data, resulting in "ErrnoError: No such
+file or directory" at runtime.
+
+Fix: Remove .PRECIOUS so make can delete stale intermediates, and replace
+gb_Helper_copy_if_different_and_touch with unconditional cp to ensure
+the .link file always matches the latest .data.js.
+
+diff --git a/static/CustomTarget_emscripten_fs_image.mk b/static/CustomTarget_emscripten_fs_image.mk
+--- a/static/CustomTarget_emscripten_fs_image.mk
++++ b/static/CustomTarget_emscripten_fs_image.mk
+@@ -1797,9 +1797,8 @@
+
+ $(emscripten_fs_image_WORKDIR)/soffice.data $(emscripten_fs_image_WORKDIR)/soffice.data.js : $(emscripten_fs_image_WORKDIR)/soffice.data.js.metadata
+
+-.PRECIOUS: $(emscripten_fs_image_WORKDIR)/soffice.data.js.link
+ $(emscripten_fs_image_WORKDIR)/soffice.data.js.link: $(emscripten_fs_image_WORKDIR)/soffice.data.js
+-	$(call gb_Helper_copy_if_different_and_touch,$^,$@)
++	cp $^ $@
+
+ .PHONY: $(emscripten_fs_image_WORKDIR)/soffice.data.concat_lists
+ $(emscripten_fs_image_WORKDIR)/soffice.data.concat_lists: $(gb_emscripten_fs_image_filelists) $(gb_emscripten_fs_image_autoinstall)
