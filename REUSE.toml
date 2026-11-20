@@ -1,0 +1,19 @@
+version = 1
+
+# First-party configuration and data that cannot carry a comment header (the build passes some of these files to
+# other tools as they are). Every first-party code file carries its own SPDX header.
+[[annotations]]
+path = [
+  "engine/modules/**",
+  "docker/Dockerfile.builder",
+  "engine/upstream.json",
+  "engine/linked_libraries.txt",
+  "engine/third_party_libraries.json",
+  "engine/LIBRARY_SOURCE_INDEX.tsv",
+  "MANIFEST.sha256",
+  "README.md",
+  "CONTRIBUTING.md",
+  "REUSE.toml",
+]
+SPDX-FileCopyrightText = "2025-2026 Franklin Softworks LLC"
+SPDX-License-Identifier = "GPL-3.0-only"

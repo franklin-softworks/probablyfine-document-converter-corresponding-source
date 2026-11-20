@@ -1,0 +1,42 @@
+diff --git a/sw/source/core/unocore/unoredline.cxx b/sw/source/core/unocore/unoredline.cxx
+index b25d3d358408..bc24d79310ef 100644
+--- a/sw/source/core/unocore/unoredline.cxx
++++ b/sw/source/core/unocore/unoredline.cxx
+@@ -225,6 +225,18 @@ uno::Any SwXRedlineAutoStyle::getPropertyDefault(const OUString& /*rPropertyName
+     return uno::Any();
+ }
+ 
++// BUG-80 (same input and settings give the same output bytes): the redline's identifier, which ODF export writes as the tracked change's id ("ct<digits>"), used to be the
++// redline object's ADDRESS: different on every run, so two conversions of one document wrote different files. It is now the redline's position in the document's
++// redline table (sorted by document position, so it is the same on every run and unique within the document). A redline that is not in the table keeps the address.
++static OUString lcl_GetRedlineIdentifier(const SwRangeRedline& rRedline)
++{
++    const SwRedlineTable& rTable = rRedline.GetDoc().getIDocumentRedlineAccess().GetRedlineTable();
++    const SwRedlineTable::size_type nPos = rTable.GetPos(&rRedline);
++    if (nPos != SwRedlineTable::npos)
++        return OUString::number(static_cast<sal_Int64>(nPos));
++    return OUString::number(sal::static_int_cast<sal_Int64>(reinterpret_cast<sal_IntPtr>(&rRedline)));
++}
++
+ /// If this format redline has old direct formatting, return it as an autostyle.
+ uno::Reference<beans::XPropertySet> GetRedlineAutoFormat(const SwRangeRedline& rRedline)
+ {
+@@ -285,7 +297,7 @@ std::optional<uno::Any> GetRedlinePortionPropertyValue(std::u16string_view rProp
+     }
+     else if (rPropertyName == UNO_NAME_REDLINE_IDENTIFIER)
+     {
+-        aRet <<= OUString::number(reinterpret_cast<sal_IntPtr>(&rRedline));
++        aRet <<= lcl_GetRedlineIdentifier(rRedline);
+     }
+     else if (rPropertyName == UNO_NAME_IS_IN_HEADER_FOOTER)
+     {
+@@ -509,8 +521,7 @@ uno::Sequence< beans::PropertyValue > SwXRedlinePortion::CreateRedlineProperties
+     pRet[nPropIdx].Name = UNO_NAME_REDLINE_TYPE;
+     pRet[nPropIdx++].Value <<= SwRedlineTypeToOUString(rRedline.GetType());
+     pRet[nPropIdx].Name = UNO_NAME_REDLINE_IDENTIFIER;
+-    pRet[nPropIdx++].Value <<= OUString::number(
+-        sal::static_int_cast< sal_Int64 >( reinterpret_cast< sal_IntPtr >(&rRedline) ) );
++    pRet[nPropIdx++].Value <<= lcl_GetRedlineIdentifier(rRedline);
+     pRet[nPropIdx].Name = UNO_NAME_IS_COLLAPSED;
+     pRet[nPropIdx++].Value <<= !rRedline.HasMark();
+ 
