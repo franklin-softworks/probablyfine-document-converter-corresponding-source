@@ -1,0 +1,102 @@
+--- a/sc/source/filter/excel/impop.cxx
++++ b/sc/source/filter/excel/impop.cxx
+@@ -67,6 +67,14 @@
+ 
+ #if defined(_WIN32)
+ #include <math.h>
++#ifdef __EMSCRIPTEN__
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++#include <rangenam.hxx>
++#include <tokenarray.hxx>
++#include <refdata.hxx>
++#endif
+ #endif
+ 
+ using namespace ::com::sun::star;
+@@ -1225,6 +1233,65 @@
+     pExcRoot->eDateiTyp = eDatei;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++namespace {
++
++/** BUG-89: what to do with an Excel 4.0 macro sheet (BIFF5/BIFF8 BOF subtype 0x0040) of an .xls file. Selectable, default "values": the sheet stays (name, position
++    and visibility as in the file, so no sheet is ever dropped) but holds the values its formulas had, never the macro formulas, and the names that point into it
++    are dropped. "keep" is the behaviour before this change (the macro formulas stay formulas). The choice is read from the environment of the engine
++    (LO_WASM_XLM_SHEETS) so that a setting can be plugged in later without touching this code; nothing else selects it yet. */
++bool lcl_XlmSheetsAsValues()
++{
++    const char* pMode = std::getenv( "LO_WASM_XLM_SHEETS" );
++    return !(pMode && std::strcmp( pMode, "keep" ) == 0);
++}
++
++bool lcl_NameReferencesTab( const ScDocument& rDoc, const ScRangeData& rData, SCTAB nTab )
++{
++    const ScTokenArray* pCode = rData.GetCode();
++    if( !pCode )
++        return false;
++    const ScAddress aPos = rData.GetPos();
++    formula::FormulaToken** pTokens = pCode->GetArray();
++    for( sal_uInt16 i = 0, nLen = pCode->GetLen(); i < nLen; ++i )
++    {
++        switch( pTokens[i]->GetType() )
++        {
++            case formula::svSingleRef:
++                if( const ScSingleRefData* pRef = pTokens[i]->GetSingleRef() )
++                    if( pRef->toAbs( rDoc, aPos ).Tab() == nTab )
++                        return true;
++                break;
++            case formula::svDoubleRef:
++                if( const ScComplexRefData* pRef = pTokens[i]->GetDoubleRef() )
++                {
++                    const ScRange aRange = pRef->toAbs( rDoc, aPos );
++                    if( aRange.aStart.Tab() <= nTab && nTab <= aRange.aEnd.Tab() )
++                        return true;
++                }
++                break;
++            default:
++                break;
++        }
++    }
++    return false;
++}
++
++void lcl_EraseNamesOnTab( const ScDocument& rDoc, ScRangeName* pNames, SCTAB nTab )
++{
++    if( !pNames )
++        return;
++    std::vector<const ScRangeData*> aErase;
++    for( const auto& rEntry : *pNames )
++        if( lcl_NameReferencesTab( rDoc, *rEntry.second, nTab ) )
++            aErase.push_back( rEntry.second.get() );
++    for( const ScRangeData* pData : aErase )
++        pNames->erase( *pData );
++}
++
++}
++#endif
++
+ void ImportExcel::EndSheet()
+ {
+     pExcRoot->pExtSheetBuff->Reset();
+@@ -1236,6 +1303,18 @@
+     }
+ 
+     FinalizeTable();
++
++#ifdef __EMSCRIPTEN__
++    if( (pExcRoot->eDateiTyp == Biff5M4 || pExcRoot->eDateiTyp == Biff8M4) && lcl_XlmSheetsAsValues() )
++    {
++        // BUG-89: an Excel 4.0 macro sheet keeps its values, not its macro formulas; the names that point into it (Auto_Open, the macro names) are dropped
++        const SCTAB nTab = GetCurrScTab();
++        rD.ConvertFormulaToValue( ScRange( 0, 0, nTab, rD.MaxCol(), rD.MaxRow(), nTab ), nullptr );
++        lcl_EraseNamesOnTab( rD, rD.GetRangeName(), nTab );
++        for( SCTAB nLocal = 0, nCount = rD.GetTableCount(); nLocal < nCount; ++nLocal )
++            lcl_EraseNamesOnTab( rD, rD.GetRangeName( nLocal ), nTab );
++    }
++#endif
+ }
+ 
+ void ImportExcel::NewTable()

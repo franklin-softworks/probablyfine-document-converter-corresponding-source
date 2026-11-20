@@ -1,0 +1,87 @@
+diff --git a/sfx2/source/view/sfxbasecontroller.cxx b/sfx2/source/view/sfxbasecontroller.cxx
+index c4a255e7722f..790d8d95b2a3 100644
+--- a/sfx2/source/view/sfxbasecontroller.cxx
++++ b/sfx2/source/view/sfxbasecontroller.cxx
+@@ -156,12 +156,20 @@ static sal_Int32 m_nInReschedule = 0;  /// static counter for rescheduling
+ 
+ static void reschedule()
+ {
++#ifdef __EMSCRIPTEN__
++    // In WASM, Application::Reschedule() can cause deadlocks when called
++    // repeatedly during long operations like PDF export. The reschedule
++    // is meant to keep the UI responsive, but in headless WASM mode
++    // there's no UI to update, so we can safely skip it.
++    (void)m_nInReschedule; // suppress unused variable warning
++#else
+     if ( m_nInReschedule == 0 )
+     {
+         ++m_nInReschedule;
+         Application::Reschedule();
+         --m_nInReschedule;
+     }
++#endif
+ }
+ 
+ namespace {
+@@ -363,6 +371,9 @@ struct IMPL_SfxBaseController_DataContainer
+     bool                                    m_bSuspendState         ;
+     rtl::Reference< ::framework::TitleHelper > m_xTitleHelper          ;
+     Sequence< PropertyValue >               m_aCreationArgs         ;
++#ifdef __EMSCRIPTEN__
++    Reference< css::frame::XModel >         m_xHeadlessModel        ;  // WASM: model for headless controller (no ViewShell)
++#endif
+ 
+     IMPL_SfxBaseController_DataContainer(   ::osl::Mutex&              aMutex      ,
+                                             SfxViewShell*       pViewShell  ,
+@@ -425,6 +436,12 @@ void SAL_CALL IMPL_SfxBaseController_ListenerHelper::disposing( const lang::Even
+ SfxBaseController::SfxBaseController( SfxViewShell* pViewShell )
+     :   m_pData ( new IMPL_SfxBaseController_DataContainer( m_aMutex, pViewShell, this ))
+ {
++#ifdef __EMSCRIPTEN__
++    // WASM: Allow headless controller creation without a ViewShell.
++    // ScTabViewShell crashes in WASM, so we create a controller with
++    // null ViewShell to connect the model to the frame for LOK export.
++    if (pViewShell)
++#endif
+     m_pData->m_pViewShell->SetController( this );
+ }
+ 
+@@ -444,7 +461,14 @@ Reference< XWindow > SAL_CALL SfxBaseController::getComponentWindow()
+ {
+     SolarMutexGuard aGuard;
+     if ( !m_pData->m_pViewShell )
++    {
++#ifdef __EMSCRIPTEN__
++        // WASM: Return empty reference for headless controller (no ViewShell).
++        return Reference< XWindow >();
++#else
+         throw DisposedException();
++#endif
++    }
+ 
+     return Reference< XWindow >( GetViewFrame_Impl().GetFrame().GetWindow().GetComponentInterface(), UNO_QUERY_THROW );
+ }
+@@ -550,6 +574,12 @@ sal_Bool SAL_CALL SfxBaseController::attachModel( const Reference< frame::XModel
+         return false;
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    // WASM: Store model directly for headless controller (no ViewShell).
++    if ( !m_pData->m_pViewShell )
++        m_pData->m_xHeadlessModel = xModel;
++#endif
++
+     Reference < util::XCloseBroadcaster > xCloseable( xModel, uno::UNO_QUERY );
+     if ( xCloseable.is() )
+         xCloseable->addCloseListener( m_pData->m_xCloseListener );
+@@ -664,6 +694,10 @@ Reference< frame::XFrame > SAL_CALL SfxBaseController::getFrame()
+ Reference< frame::XModel > SAL_CALL SfxBaseController::getModel()
+ {
+     SolarMutexGuard aGuard;
++#ifdef __EMSCRIPTEN__
++    if ( !m_pData->m_pViewShell )
++        return m_pData->m_xHeadlessModel;
++#endif
+     return m_pData->m_pViewShell ? m_pData->m_pViewShell->GetObjectShell()->GetModel() : Reference < frame::XModel > () ;
+ }
+ 
