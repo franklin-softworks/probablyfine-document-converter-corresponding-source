@@ -1,0 +1,37 @@
+P3, the forms/xforms part (owner-approved 2026-10-18): backport of the forms hunk of
+upstream LibreOffice c3355f20dcd5 (= 6b218b521d38 on libreoffice-26-2), "don't bother
+loading exotic protocols for document-supplied data". An XForms model no longer loads
+an instance document from an exotic-protocol URL the document supplies
+(forms/source/xforms/model.cxx, Model::loadInstance).
+
+Carried separately from the sc hunks (*calc-data-provider-hardening-backport-wasm-
+spreadsheets.patch) because forms/ is compiled into every module, so it is built in
+FG-072's all-module cycle. Unconditional, like upstream.
+
+diff --git a/forms/source/xforms/model.cxx b/forms/source/xforms/model.cxx
+index 105f7f449963..27844c6398d5 100644
+--- a/forms/source/xforms/model.cxx
++++ b/forms/source/xforms/model.cxx
+@@ -32,7 +32,9 @@
+ 
+ #include <rtl/ustring.hxx>
+ #include <rtl/ustrbuf.hxx>
++#include <sal/log.hxx>
+ #include <tools/debug.hxx>
++#include <tools/urlobj.hxx>
+ 
+ #include <comphelper/processfactory.hxx>
+ #include <comphelper/servicehelper.hxx>
+@@ -318,6 +320,12 @@ void Model::loadInstance( sal_Int32 nInstance )
+     if( sURL.isEmpty() )
+         return;
+ 
++    if( INetURLObject( sURL ).IsExoticProtocol() )
++    {
++        SAL_WARN("forms.xforms", "Model::loadInstance: blocked exotic protocol: \"" << sURL << "\"");
++        return;
++    }
++
+     try
+     {
+         Reference<XInputStream> xInput =
