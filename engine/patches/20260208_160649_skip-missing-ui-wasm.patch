@@ -1,0 +1,38 @@
+diff --git a/include/vcl/widgetbuilder.hxx b/include/vcl/widgetbuilder.hxx
+index 4b3409af6899..3fa050eb6264 100644
+--- a/include/vcl/widgetbuilder.hxx
++++ b/include/vcl/widgetbuilder.hxx
+@@ -71,10 +71,19 @@ protected:
+         }
+         catch (const css::uno::Exception& rExcept)
+         {
++#ifdef __EMSCRIPTEN__
++            // WASM headless: silently skip missing .ui files.
++            // Missing .ui files are expected when VFS is slimmed for bandwidth.
++            // Dialogs are never displayed; callers handle nullptr from get().
++            SAL_WARN("vcl.builder", "WASM: skipping missing .ui file: " << getUIFileUrl());
++            (void)rExcept;
++            return;
++#else
+             TOOLS_WARN_EXCEPTION("vcl.builder", "Unable to read .ui file " << getUIFileUrl());
+             reportException(rExcept);
+             assert(false && "missing ui file or missing gb_CppunitTest_use_uiconfigs dependency");
+             throw;
++#endif
+         }
+ 
+         // Set Mnemonic widgets when everything has been imported
+diff --git a/vcl/source/window/builder.cxx b/vcl/source/window/builder.cxx
+index a50581f12ea1..e7a0f0a0cd7f 100644
+--- a/vcl/source/window/builder.cxx
++++ b/vcl/source/window/builder.cxx
+@@ -655,7 +655,8 @@ VclBuilder::VclBuilder(vcl::Window* pParent, std::u16string_view sUIDir, const O
+         for (auto const& elem : sizeGroup.m_aWidgets)
+         {
+             vcl::Window* pWindow = get(elem);
+-            pWindow->add_to_size_group(xGroup);
++            if (pWindow)
++                pWindow->add_to_size_group(xGroup);
+         }
+     }
+ 

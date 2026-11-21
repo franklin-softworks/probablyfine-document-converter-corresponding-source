@@ -1,0 +1,90 @@
+BUG-38: lcl_NotifyContent looks for flys in content only in a frame that has one.
+
+Every time an anchored object moves, Notify_Background notifies each content frame of the
+page, and lcl_NotifyContent then walked all of that frame's anchored objects to pass the
+notification on to the content of flys anchored as character. A paragraph that anchors n
+objects (our PDF -> DOCX output anchors thousands in one paragraph) paid n per notification,
+and each of its objects' moves sends one: 1.9 billion objects looked at, and 0 flys in content
+found, in the first 180 s of a 7,716-anchor document; 22 s of its 200 s layout.
+
+SwSortedObjs now counts its flys in content (in Insert and Remove, the only places the list
+changes; a fly is in content from construction, SwFlyInContentFrame), and lcl_NotifyContent
+skips the walk when the count is 0. The walk did nothing for such a frame.
+
+Not WASM-specific. Documents module only for now.
+
+diff --git a/sw/source/core/inc/sortedobjs.hxx b/sw/source/core/inc/sortedobjs.hxx
+--- a/sw/source/core/inc/sortedobjs.hxx
++++ b/sw/source/core/inc/sortedobjs.hxx
+@@ -51,6 +51,8 @@
+         std::vector< SwAnchoredObject* > maSortedObjLst;
+         /// Verified sorted in the current BulkInsertScope (see there).
+         bool mbVerifiedInBulk = false;
++        /// How many of the listed objects are flys in content (anchored as character).
++        size_t mnFlysInContent = 0;
+     public:
+         /** Frame creation appends the anchored objects of a range of nodes one after another,
+             and nothing changes a sort criterion of a listed object in between: a list that is
+@@ -111,6 +113,10 @@
+         size_t ListPosOf( const SwAnchoredObject& _rAnchoredObj ) const;
+ 
+         bool is_sorted() const;
++        /// Whether the list holds a fly in content (SwFlyFrame::IsFlyInContentFrame): a fly is
++        /// one from construction (SwFlyInContentFrame), and the list changes only in Insert and
++        /// Remove, which keep the count.
++        bool HasFlyInContent() const { return mnFlysInContent != 0; }
+ };
+ 
+ #endif
+diff --git a/sw/source/core/layout/sortedobjs.cxx b/sw/source/core/layout/sortedobjs.cxx
+--- a/sw/source/core/layout/sortedobjs.cxx
++++ b/sw/source/core/layout/sortedobjs.cxx
+@@ -29,6 +29,16 @@
+ #include <svx/svdobj.hxx>
+ #include <IDocumentDrawModelAccess.hxx>
+ #include <osl/diagnose.h>
++#include <flyfrm.hxx>
++
++namespace
++{
++bool lcl_IsFlyInContent(const SwAnchoredObject& rObj)
++{
++    const SwFlyFrame* pFly = rObj.DynCastFlyFrame();
++    return pFly && pFly->IsFlyInContentFrame();
++}
++}
+ 
+ using namespace ::com::sun::star;
+ 
+@@ -281,6 +291,8 @@
+ 
+     // insert object into list
+     maSortedObjLst.insert( aInsPosIter, &_rAnchoredObj );
++    if (lcl_IsFlyInContent(_rAnchoredObj))
++        ++mnFlysInContent;
+ 
+     return Contains( _rAnchoredObj );
+ }
+@@ -298,6 +310,8 @@
+     else
+     {
+         maSortedObjLst.erase( aDelPosIter );
++        if (lcl_IsFlyInContent(_rAnchoredObj))
++            --mnFlysInContent;
+     }
+ }
+ 
+diff --git a/sw/source/core/layout/frmtool.cxx b/sw/source/core/layout/frmtool.cxx
+--- a/sw/source/core/layout/frmtool.cxx
++++ b/sw/source/core/layout/frmtool.cxx
+@@ -3405,7 +3405,9 @@
+     // printing area overlaps with the given rectangle.
+     else if ( aCntPrt.Overlaps( rRect ) )
+         pCnt->Prepare( eHint, static_cast<void*>(&aCntPrt.Intersection_( rRect )) );
+-    if ( !pCnt->GetDrawObjs() )
++    // Only flys in content pass the notification on; a frame with thousands of objects
++    // anchored at its characters and none in content need not look at each of them.
++    if ( !pCnt->GetDrawObjs() || !pCnt->GetDrawObjs()->HasFlyInContent() )
+         return;
+ 
+     const SwSortedObjs &rObjs = *pCnt->GetDrawObjs();

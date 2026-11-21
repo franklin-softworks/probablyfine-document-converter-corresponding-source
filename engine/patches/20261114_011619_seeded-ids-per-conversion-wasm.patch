@@ -1,0 +1,210 @@
+diff --git a/comphelper/source/misc/random.cxx b/comphelper/source/misc/random.cxx
+index 5e763be..a07d017 100644
+--- a/comphelper/source/misc/random.cxx
++++ b/comphelper/source/misc/random.cxx
+@@ -18,6 +18,7 @@
+ #include <random>
+ #include <rtl/random.h>
+ #include <stdexcept>
++#include <cstdlib>
+ #if defined HAVE_VALGRIND_HEADERS
+ #include <valgrind/memcheck.h>
+ #endif
+@@ -45,6 +46,19 @@ struct RandomNumberGenerator
+ 
+     void reseed()
+     {
++        // BUG-80: SAL_RAND_SEED=<decimal> seeds this generator with that value (the converter sets it per conversion from a hash of the input and
++        // the settings, so the same input gives the same ids: rsids, chart axis ids, list ids). It reaches ONLY this generator, never the random
++        // source of the cryptographic code (rtl_random_getBytes: salts, IVs, keys), which stays unseeded.
++        if (const char* pSeed = getenv("SAL_RAND_SEED"))
++        {
++            char* pEnd = nullptr;
++            const unsigned long long nSeed = strtoull(pSeed, &pEnd, 10);
++            if (pEnd != pSeed && *pEnd == '\0')
++            {
++                global_rng.seed(static_cast<std::mt19937::result_type>(nSeed ^ (nSeed >> 32)));
++                return;
++            }
++        }
+         // make RR easier to use, breaks easily without the RNG being repeatable
+         bool bRepeatable = (getenv("SAL_RAND_REPEATABLE") != nullptr) || (getenv("RR") != nullptr);
+         // valgrind on some platforms (e.g.Ubuntu16.04) does not support the new Intel RDRAND instructions,
+diff --git a/comphelper/source/xml/xmltools.cxx b/comphelper/source/xml/xmltools.cxx
+index 155436a..995fab1 100644
+--- a/comphelper/source/xml/xmltools.cxx
++++ b/comphelper/source/xml/xmltools.cxx
+@@ -8,6 +8,8 @@
+  */
+ 
+ #include <comphelper/xmltools.hxx>
++#include <comphelper/random.hxx>
++#include <cstdlib>
+ #include <rtl/random.h>
+ #include <tools/Guid.hxx>
+ #include <vector>
+@@ -92,6 +94,17 @@ namespace comphelper::xml
+ 
+         OString generateGUIDString()
+         {
++            // BUG-80: with SAL_RAND_SEED set the GUID comes from the seeded generator (an RFC 4122 version 4 layout), so the same input gives the same
++            // ids. These GUIDs only name things in the document (field and shape ids); nothing secret is derived from them.
++            if (getenv("SAL_RAND_SEED"))
++            {
++                sal_uInt8 aBytes[16];
++                for (auto& rByte : aBytes)
++                    rByte = static_cast<sal_uInt8>(comphelper::rng::uniform_uint_distribution(0, 255));
++                aBytes[6] = (aBytes[6] & 0x0F) | 0x40;
++                aBytes[8] = (aBytes[8] & 0x3F) | 0x80;
++                return tools::Guid(aBytes).getString();
++            }
+             tools::Guid aGuid(tools::Guid::Generate);
+             return aGuid.getString();
+         }
+diff --git a/sc/source/core/tool/interpr8.cxx b/sc/source/core/tool/interpr8.cxx
+index 1c53c7b..9558833 100644
+--- a/sc/source/core/tool/interpr8.cxx
++++ b/sc/source/core/tool/interpr8.cxx
+@@ -18,6 +18,9 @@
+ 
+ #include <cmath>
+ #include <memory>
++#include <mutex>
++#include <random>
++#include <rtl/random.h>
+ #include <vector>
+ 
+ using namespace formula;
+@@ -965,8 +968,17 @@ void ScETSForecastCalculation::GetSamplesInPeriod( double& rVal )
+ double ScETSForecastCalculation::RandDev()
+ {
+     // return a random deviation given the standard deviation
+-    return ( mfRMSE * ScInterpreter::gaussinv(
+-             ::comphelper::rng::uniform_real_distribution( 0.5, 1.0 ) ) );
++    // BUG-80: a random VALUE of a formula (not an id): stays random when comphelper::rng is seeded for the ids
++    static std::mutex aMutex;
++    static std::mt19937 aGenerator = []() {
++        sal_uInt32 nSeed = 0;
++        if (rtl_random_getBytes(nullptr, &nSeed, sizeof(nSeed)) != rtl_Random_E_None)
++            nSeed = ::comphelper::rng::uniform_uint_distribution(0, SAL_MAX_UINT32);
++        return std::mt19937(nSeed);
++    }();
++    std::uniform_real_distribution<double> aDist(0.5, 1.0);
++    std::scoped_lock<std::mutex> aGuard(aMutex);
++    return ( mfRMSE * ScInterpreter::gaussinv( aDist(aGenerator) ) );
+ }
+ 
+ void ScETSForecastCalculation::GetETSPredictionIntervals( const ScMatrixRef& rTMat, const ScMatrixRef& rPIMat, double fPILevel )
+diff --git a/sc/source/core/tool/interpretercontext.cxx b/sc/source/core/tool/interpretercontext.cxx
+index a8627a3..d5b7c7c 100644
+--- a/sc/source/core/tool/interpretercontext.cxx
++++ b/sc/source/core/tool/interpretercontext.cxx
+@@ -27,17 +27,30 @@
+ #include <lookupcache.hxx>
+ #include <rangecache.hxx>
+ #include <algorithm>
++#include <rtl/random.h>
+ 
+ ScInterpreterContextPool ScInterpreterContextPool::aThreadedInterpreterPool(true);
+ ScInterpreterContextPool ScInterpreterContextPool::aNonThreadedInterpreterPool(false);
+ 
++namespace
++{
++// BUG-80: the values of RAND, RANDBETWEEN.NV and RANDARRAY are NOT ids: they must stay random even when the engine seeds comphelper::rng so that the
++// same input gives the same ids. Seed this generator from the operating system's random source instead (FEAT-21 will later let a user choose a seed).
++sal_uInt32 unseededRandomSeed()
++{
++    sal_uInt32 nSeed = 0;
++    if (rtl_random_getBytes(nullptr, &nSeed, sizeof(nSeed)) != rtl_Random_E_None)
++        nSeed = comphelper::rng::uniform_uint_distribution(0, std::numeric_limits<sal_uInt32>::max());
++    return nSeed;
++}
++}
++
+ ScInterpreterContext::ScInterpreterContext(const ScDocument& rDoc, SvNumberFormatter* pFormatter)
+     : mpDoc(&rDoc)
+     , mnTokenCachePos(0)
+     , maTokens(TOKEN_CACHE_SIZE, nullptr)
+-    // create a per-interpreter Random Number Generator, seeded from the global rng, so we don't have
+-    // to lock a mutex to generate a random number
+-    , aRNG(comphelper::rng::uniform_uint_distribution(0, std::numeric_limits<sal_uInt32>::max()))
++    // create a per-interpreter Random Number Generator, so we don't have to lock a mutex to generate a random number
++    , aRNG(unseededRandomSeed())
+     , pInterpreter(nullptr)
+     , mpFormatter(pFormatter)
+ {
+diff --git a/sc/source/filter/excel/xecontent.cxx b/sc/source/filter/excel/xecontent.cxx
+index 9de0d67..9ee1de3 100644
+--- a/sc/source/filter/excel/xecontent.cxx
++++ b/sc/source/filter/excel/xecontent.cxx
+@@ -52,6 +52,8 @@
+ #include <xltools.hxx>
+ #include <xeformula.hxx>
+ #include <rtl/uuid.h>
++#include <comphelper/random.hxx>
++#include <cstdlib>
+ #include <sal/log.hxx>
+ #include <oox/export/utils.hxx>
+ #include <oox/token/namespaces.hxx>
+@@ -1310,7 +1312,15 @@ OString createGuidStringFromInt(sal_uInt8 nGuid[16])
+ OString generateGUIDString()
+ {
+     sal_uInt8 nGuid[16];
+-    rtl_createUuid(nGuid, nullptr, true);
++    if (getenv("SAL_RAND_SEED")) // BUG-80: from the seeded generator, so the same input gives the same ids
++    {
++        for (auto& rByte : nGuid)
++            rByte = static_cast<sal_uInt8>(comphelper::rng::uniform_uint_distribution(0, 255));
++        nGuid[6] = (nGuid[6] & 0x0F) | 0x40;
++        nGuid[8] = (nGuid[8] & 0x3F) | 0x80;
++    }
++    else
++        rtl_createUuid(nGuid, nullptr, true);
+     return createGuidStringFromInt(nGuid);
+ }
+ 
+diff --git a/scaddins/source/analysis/analysis.cxx b/scaddins/source/analysis/analysis.cxx
+index bccddc8..6ffd4c7 100644
+--- a/scaddins/source/analysis/analysis.cxx
++++ b/scaddins/source/analysis/analysis.cxx
+@@ -29,6 +29,9 @@
+ #include <unotools/resmgr.hxx>
+ #include <i18nlangtag/languagetag.hxx>
+ #include <algorithm>
++#include <mutex>
++#include <random>
++#include <rtl/random.h>
+ #include <cmath>
+ #include <float.h>
+ 
+@@ -566,6 +569,21 @@ double SAL_CALL AnalysisAddIn::getSqrtpi( double fNum )
+     return finiteOrThrow( fRet );
+ }
+ 
++// BUG-80: a formula's random VALUE is not an id and must stay random when comphelper::rng is seeded for the ids (see ScInterpreterContext).
++static double unseededUniformReal(double fMin, double fMax)
++{
++    static std::mutex aMutex;
++    static std::mt19937 aGenerator = []() {
++        sal_uInt32 nSeed = 0;
++        if (rtl_random_getBytes(nullptr, &nSeed, sizeof(nSeed)) != rtl_Random_E_None)
++            nSeed = comphelper::rng::uniform_uint_distribution(0, SAL_MAX_UINT32);
++        return std::mt19937(nSeed);
++    }();
++    std::uniform_real_distribution<double> aDist(fMin, fMax);
++    std::scoped_lock<std::mutex> aGuard(aMutex);
++    return aDist(aGenerator);
++}
++
+ double SAL_CALL AnalysisAddIn::getRandbetween( double fMin, double fMax )
+ {
+     fMin = ::rtl::math::round( fMin, 0, rtl_math_RoundingMode_Up );
+@@ -573,7 +591,7 @@ double SAL_CALL AnalysisAddIn::getRandbetween( double fMin, double fMax )
+     if( fMin > fMax )
+         throw lang::IllegalArgumentException();
+ 
+-    double fRet = floor(comphelper::rng::uniform_real_distribution(fMin, nextafter(fMax+1, -DBL_MAX)));
++    double fRet = floor(unseededUniformReal(fMin, nextafter(fMax+1, -DBL_MAX)));
+     return finiteOrThrow( fRet );
+ }
+ 
