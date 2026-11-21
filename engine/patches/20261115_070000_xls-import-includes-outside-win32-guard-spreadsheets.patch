@@ -1,0 +1,20 @@
+diff --git a/sc/source/filter/excel/impop.cxx b/sc/source/filter/excel/impop.cxx
+index 21a93eda19ca..93aa4b39719c 100644
+--- a/sc/source/filter/excel/impop.cxx
++++ b/sc/source/filter/excel/impop.cxx
+@@ -67,6 +67,7 @@
+ 
+ #if defined(_WIN32)
+ #include <math.h>
++#endif
+ #ifdef __EMSCRIPTEN__
+ #include <cstdlib>
+ #include <cstring>
+@@ -75,7 +76,6 @@
+ #include <tokenarray.hxx>
+ #include <refdata.hxx>
+ #endif
+-#endif
+ 
+ using namespace ::com::sun::star;
+ 

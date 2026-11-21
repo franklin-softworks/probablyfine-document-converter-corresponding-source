@@ -1,0 +1,21 @@
+diff --git a/desktop/Executable_soffice_bin.mk b/desktop/Executable_soffice_bin.mk
+--- a/desktop/Executable_soffice_bin.mk	2026-01-29 12:33:08.802132034 +0000
++++ b/desktop/Executable_soffice_bin.mk	2026-01-29 12:33:54.013318881 +0000
+@@ -58,11 +58,16 @@
+ $(call gb_LinkTarget_get_headers_target,$(call gb_Executable_get_linktarget,soffice_bin)) : $(call gb_StaticLibrary_get_headers_target,unoembind)
+ $(call gb_LinkTarget__static_lib_dummy_depend,unoembind)
+ 
++$(eval $(call gb_Executable_add_exception_objects,soffice_bin,\
++    desktop/source/app/wasm_bridge \
++))
++
+ $(call gb_Executable_get_linktarget_target,soffice_bin): \
+     $(gb_CustomTarget_workdir)/desktop/soffice_bin-emscripten-exports/exports
+ 
++# Presentations module: add UCB/SFX libraries for whole-archive linking
+ $(eval $(call gb_Executable_add_ldflags,soffice_bin,\
+-	-s EXPORTED_FUNCTIONS=@$(gb_CustomTarget_workdir)/desktop/soffice_bin-emscripten-exports/exports -Wl$(COMMA)--whole-archive $(call gb_StaticLibrary_get_target,unoembind) -Wl$(COMMA)--no-whole-archive \
++	-s EXPORTED_FUNCTIONS=@$(gb_CustomTarget_workdir)/desktop/soffice_bin-emscripten-exports/exports -Wl$(COMMA)--whole-archive $(call gb_StaticLibrary_get_target,unoembind) $(call gb_Library_get_target,sofficeapp) $(call gb_Library_get_target,sfx) $(call gb_Library_get_target,sd) $(call gb_Library_get_target,sdd) $(call gb_Library_get_target,oox) $(call gb_Library_get_target,filterconfig) $(call gb_Library_get_target,components) $(call gb_Library_get_target,ucb1) $(call gb_Library_get_target,ucpfile1) $(call gb_Library_get_target,fwk) -Wl$(COMMA)--no-whole-archive \
+ 	$(if $(ENABLE_EMSCRIPTEN_PROXY_TO_PTHREAD), \
+ 	    -sPROXY_TO_PTHREAD=1 \
+ 	    $(if $(DISABLE_GUI),, \
