@@ -1,0 +1,44 @@
+diff --git a/vcl/source/bitmap/BitmapBasicMorphologyFilter.cxx b/vcl/source/bitmap/BitmapBasicMorphologyFilter.cxx
+index dcaacdad8bcb..106f8ce224f5 100644
+--- a/vcl/source/bitmap/BitmapBasicMorphologyFilter.cxx
++++ b/vcl/source/bitmap/BitmapBasicMorphologyFilter.cxx
+@@ -301,7 +301,11 @@ template <int nComponentWidth>
+ void runFilter(Bitmap& rBitmap, BasicMorphologyOp op, sal_Int32 nRadius, bool bUseValueOutside,
+                sal_uInt8 nValueOutside)
+ {
++#ifdef __EMSCRIPTEN__
++    const bool bParallel = false;  // WASM: ThreadPool can deadlock
++#else
+     const bool bParallel = true;
++#endif
+ 
+     if (op == BasicMorphologyOp::erode)
+         runFilter<ErodeOp, nComponentWidth>(rBitmap, nRadius, bParallel, bUseValueOutside,
+diff --git a/vcl/source/bitmap/BitmapFilterStackBlur.cxx b/vcl/source/bitmap/BitmapFilterStackBlur.cxx
+index dc8b33e64243..a467e9d72c77 100644
+--- a/vcl/source/bitmap/BitmapFilterStackBlur.cxx
++++ b/vcl/source/bitmap/BitmapFilterStackBlur.cxx
+@@ -561,7 +561,11 @@ void runStackBlur(Bitmap& rBitmap, const sal_Int32 nRadius, const sal_Int32 nCom
+ 
+ void stackBlur24(Bitmap& rBitmap, sal_Int32 nRadius, sal_Int32 nComponentWidth)
+ {
++#ifdef __EMSCRIPTEN__
++    const bool bParallel = false;  // WASM: ThreadPool can deadlock
++#else
+     const bool bParallel = true;
++#endif
+     // Limit radius
+     nRadius = std::clamp<sal_Int32>(nRadius, 2, 254);
+     const sal_Int32 nColorChannels = 3; // 3 color channel
+@@ -575,7 +579,11 @@ void stackBlur24(Bitmap& rBitmap, sal_Int32 nRadius, sal_Int32 nComponentWidth)
+ 
+ void stackBlur8(Bitmap& rBitmap, sal_Int32 nRadius, sal_Int32 nComponentWidth)
+ {
++#ifdef __EMSCRIPTEN__
++    const bool bParallel = false;  // WASM: ThreadPool can deadlock
++#else
+     const bool bParallel = true;
++#endif
+     // Limit radius
+     nRadius = std::clamp<sal_Int32>(nRadius, 2, 254);
+     const sal_Int32 nColorChannels = 1; // 1 color channel
