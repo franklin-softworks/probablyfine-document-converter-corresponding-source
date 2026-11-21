@@ -1,0 +1,550 @@
+diff --git a/external/libeot/01-libeot-lzcomp-bounds-wasm.patch.1 b/external/libeot/01-libeot-lzcomp-bounds-wasm.patch.1
+new file mode 100644
+index 0000000..6944823
+--- /dev/null
++++ b/external/libeot/01-libeot-lzcomp-bounds-wasm.patch.1
+@@ -0,0 +1,64 @@
++Bound the LZCOMP decoder's copy source, copy length and length value.
++
++Decode() copies from ptr1[start..] where start = pos - distance - length + 1 is driven by the stream,
++and writes ptr1[pos++] for `length` bytes with the output-length test only once per item. The history
++buffer is [-preLoadSize, out_len): valid streams copy from the preloaded dictionary before it (every
++compressed font in the corpus has 239-400 such copies), so `start < 0` is NOT an error; only
++`start < -preLoadSize` is. DecodeLength() shifts until the stream says stop and overflows a signed long.
++(archive patch 01: BUG-01, BUG-02, BUG-04)
++
++Re-derived for FG-054 (owner instruction 2026-10-29), NOT the archive's file of the same intent.
++The four patches in libeot_patches_and_research.tar.xz (sha256 8afd91ed...) do not apply to libeot 0.01
++(three have malformed hunk headers; their contexts name code that is not in the source), and applied
++literally some would break valid fonts. This change keeps each patch's stated intent, written against the
++real source: libeot-0.01 (sha256 cf5091fa...) with LibreOffice's three patches applied first.
++Tests (native, ASan+UBSan+LeakSanitizer, a caller that mirrors vcl/source/gdi/embeddedfontshelper.cxx):
++the 10 decodable corpus fonts decode byte-identical to the unpatched build. Of 473 mutated copies of them
++(truncations, byte flips) the unpatched build gives 175 SEGVs, 43 heap overflows, 1 use-after-free and 13
++leaks; patched, 0 reports (437 clean errors, 36 decoded). A second set of 3,740 (other seed, splices added)
++gives 0 reports patched (3,372 clean errors, 368 decoded). Not fuzzed with libFuzzer.
++
++--- a/src/lzcomp/lzcomp.c
+++++ b/src/lzcomp/lzcomp.c
++@@ -10,6 +10,7 @@
++ #include <string.h>
++ #include <ctype.h>
++ #include <stdbool.h>
+++#include <limits.h>
++ 
++ #include "BITIO.H"
++ #include "AHUFF.H"
++@@ -240,10 +241,13 @@
++         }
++         done = (bits & mask) == 0;
++         bits &= ~mask;
+++        /* The loop runs for as long as the stream says "more": refuse a value that no longer fits. */
+++        if ( value > (LONG_MAX >> bit_Range) ) longjmp( t->mem->env, ERR_LZCOMP_Decode_bounds );
++         value <<= bit_Range;
++         value |= bits;
++     } while ( !done );
++     
+++    if ( value > LONG_MAX - len_min ) longjmp( t->mem->env, ERR_LZCOMP_Decode_bounds );
++     value += len_min;
++ 
++     return value; /******/
++@@ -766,6 +770,11 @@
++                 distance    = DecodeDistance2( t, numDistRanges );
++                 if ( distance >=max_2Byte_Dist  ) length++;
++                 start        = pos - distance - length + 1;
+++                /* ptr1 points preLoadSize bytes into the history buffer (the preloaded dictionary lies
+++                   before it, and valid streams copy from it), which is out_len + preLoadSize long. */
+++                if ( start < -preLoadSize || length > t->out_len - pos ) {
+++                    longjmp( t->mem->env, ERR_LZCOMP_Decode_bounds );
+++                }
++                 for ( j = 0; j < length; j++ ) {
++                     value = ptr1[ start + j ];
++                     ptr1[ pos++ ] = value;
++@@ -827,6 +836,7 @@
++                 if ( distance >=max_2Byte_Dist  ) length++;
++                 start        = dst - distance - length + 1;
++                 assert( distance + length - 1 <= t->maxCopyDistance );
+++                if ( length > t->out_len - pos ) longjmp( t->mem->env, ERR_LZCOMP_Decode_bounds );
++                 for ( j = 0; j < length; j++ ) {
++                     src = start + j;
++                     if ( src < 0 ) src = src + t->maxCopyDistance;
+diff --git a/external/libeot/02-libeot-bitio-oob-read-wasm.patch.1 b/external/libeot/02-libeot-bitio-oob-read-wasm.patch.1
+new file mode 100644
+index 0000000..731bce5
+--- /dev/null
++++ b/external/libeot/02-libeot-bitio-oob-read-wasm.patch.1
+@@ -0,0 +1,32 @@
++MTX_BITIO_input_bit: test the input index BEFORE reading the byte.
++
++The byte at mem_bytes[mem_index] was read first and mem_index checked after, so the read at
++mem_index == mem_size was one byte past the input. (archive patch 02: BUG-03)
++
++Re-derived for FG-054 (owner instruction 2026-10-29), NOT the archive's file of the same intent.
++The four patches in libeot_patches_and_research.tar.xz (sha256 8afd91ed...) do not apply to libeot 0.01
++(three have malformed hunk headers; their contexts name code that is not in the source), and applied
++literally some would break valid fonts. This change keeps each patch's stated intent, written against the
++real source: libeot-0.01 (sha256 cf5091fa...) with LibreOffice's three patches applied first.
++Tests (native, ASan+UBSan+LeakSanitizer, a caller that mirrors vcl/source/gdi/embeddedfontshelper.cxx):
++the 10 decodable corpus fonts decode byte-identical to the unpatched build. Of 473 mutated copies of them
++(truncations, byte flips) the unpatched build gives 175 SEGVs, 43 heap overflows, 1 use-after-free and 13
++leaks; patched, 0 reports (437 clean errors, 36 decoded). A second set of 3,740 (other seed, splices added)
++gives 0 reports patched (3,372 clean errors, 368 decoded). Not fuzzed with libFuzzer.
++
++--- a/src/lzcomp/bitio.c
+++++ b/src/lzcomp/bitio.c
++@@ -42,10 +42,11 @@
++ {
++     /*assert( t->ReadOrWrite == 'r' ); */
++     if ( t->input_bit_count-- == 0 ) {
++-        t->input_bit_buffer = t->mem_bytes[ t->mem_index++ ];
++-        if ( t->mem_index > t->mem_size ) {
+++        /* Check BEFORE reading: reading mem_bytes[mem_size] is one byte past the input. */
+++        if ( t->mem_index >= t->mem_size ) {
++             longjmp( t->mem->env, ERR_BITIO_end_of_file );
++         }
+++        t->input_bit_buffer = t->mem_bytes[ t->mem_index++ ];
++         ++(t->bytes_in);
++         t->input_bit_count = 7;
++     }
+diff --git a/external/libeot/03-libeot-stream-overflow-wasm.patch.1 b/external/libeot/03-libeot-stream-overflow-wasm.patch.1
+new file mode 100644
+index 0000000..570fade
+--- /dev/null
++++ b/external/libeot/03-libeot-stream-overflow-wasm.patch.1
+@@ -0,0 +1,29 @@
++reserve(): refuse a request larger than 1 GiB before calling realloc.
++(archive patch 03: BUG-05. The archive put its cap after the allocation.)
++
++Re-derived for FG-054 (owner instruction 2026-10-29), NOT the archive's file of the same intent.
++The four patches in libeot_patches_and_research.tar.xz (sha256 8afd91ed...) do not apply to libeot 0.01
++(three have malformed hunk headers; their contexts name code that is not in the source), and applied
++literally some would break valid fonts. This change keeps each patch's stated intent, written against the
++real source: libeot-0.01 (sha256 cf5091fa...) with LibreOffice's three patches applied first.
++Tests (native, ASan+UBSan+LeakSanitizer, a caller that mirrors vcl/source/gdi/embeddedfontshelper.cxx):
++the 10 decodable corpus fonts decode byte-identical to the unpatched build. Of 473 mutated copies of them
++(truncations, byte flips) the unpatched build gives 175 SEGVs, 43 heap overflows, 1 use-after-free and 13
++leaks; patched, 0 reports (437 clean errors, 36 decoded). A second set of 3,740 (other seed, splices added)
++gives 0 reports patched (3,372 clean errors, 368 decoded). Not fuzzed with libFuzzer.
++
++--- a/src/util/stream.c
+++++ b/src/util/stream.c
++@@ -217,6 +217,12 @@
++   {
++     return EOT_STREAM_OK;
++   }
+++  /* No font needs more than 1 GiB; a request that large comes from a corrupt size field. Refuse
+++     it before asking realloc (32-bit size_t on wasm32). */
+++  if (toReserve > 1024u * 1024u * 1024u)
+++  {
+++    return EOT_CANT_ALLOCATE_MEMORY_FOR_STREAM;
+++  }
++   uint8_t *newBuf = realloc(s->buf, toReserve);
++   if (!newBuf)
++   {
+diff --git a/external/libeot/04-libeot-error-return-and-leaks-wasm.patch.1 b/external/libeot/04-libeot-error-return-and-leaks-wasm.patch.1
+new file mode 100644
+index 0000000..093e8c8
+--- /dev/null
++++ b/external/libeot/04-libeot-error-return-and-leaks-wasm.patch.1
+@@ -0,0 +1,291 @@
++Make a malformed MTX stream an error return instead of a crash, and free what it allocated.
++
++The decoder reports a malformed stream with longjmp(mem->env, ...), but libeot never setjmp()s: every
++such error jumped through an uninitialised jmp_buf. unpackMtx() now sets it, the MTX allocator tracks
++its allocations (the unused mem_pointers fields; MTX_mem_FreeAllMemory was declared and never defined)
++so the error exit can free the decoder's state, and a failed allocation is an error instead of a NULL
++dereference. Also: EOT2ttf_buffer freed no metadata strings on a failed decode (callers free them only
++after success) and reported a failed decode as success when the header had only produced a warning;
++populateGlyfAndLoca leaked its output streams on a bad glyph. unpackMtx checked offsets with an
++overflowing unsigned sum. (archive patch 04: BUG-06)
++The allocator wrappers never ask for 0 bytes: realloc(p, 0) frees p and returns NULL, which they would take for a
++failure and then free p a second time (reachable from the run-length path of the LZCOMP decoder).
++
++Re-derived for FG-054 (owner instruction 2026-10-29), NOT the archive's file of the same intent.
++The four patches in libeot_patches_and_research.tar.xz (sha256 8afd91ed...) do not apply to libeot 0.01
++(three have malformed hunk headers; their contexts name code that is not in the source), and applied
++literally some would break valid fonts. This change keeps each patch's stated intent, written against the
++real source: libeot-0.01 (sha256 cf5091fa...) with LibreOffice's three patches applied first.
++Tests (native, ASan+UBSan+LeakSanitizer, a caller that mirrors vcl/source/gdi/embeddedfontshelper.cxx):
++the 10 decodable corpus fonts decode byte-identical to the unpatched build. Of 473 mutated copies of them
++(truncations, byte flips) the unpatched build gives 175 SEGVs, 43 heap overflows, 1 use-after-free and 13
++leaks; patched, 0 reports (437 clean errors, 36 decoded). A second set of 3,740 (other seed, splices added)
++gives 0 reports patched (3,372 clean errors, 368 decoded). Not fuzzed with libFuzzer.
++
++--- a/src/lzcomp/ERRCODES.H
+++++ b/src/lzcomp/ERRCODES.H
++@@ -1,4 +1,5 @@
++ #define NO_ERROR   0
+++#define ERR_MTX_mem_alloc          3300 /*MTXMEM:allocation failed*/
++ #define ERR_BITIO_end_of_file      3304 /*BITIO::input_bit:UNEXPECTED END OF FILE*/
++ #define ERR_LZCOMP_Encode_bounds    3353 /*LZCOMP:Encode out of bounds i*/
++ #define ERR_LZCOMP_Decode_bounds    3354 /*LZCOMP::Decode out of bounds pos*/
++--- a/src/lzcomp/mtxmem.c
+++++ b/src/lzcomp/mtxmem.c
++@@ -5,26 +5,115 @@
++ #include <string.h> /* for size_t */
++ #include <stdlib.h>
++ #include "MTXMEM.H"
+++#include "ERRCODES.H"
+++
+++/* Live allocations are tracked (mem_pointers) so that a decoder error, which leaves the decoder by
+++   longjmp from anywhere, can free everything it still holds: MTX_mem_FreeAllMemory. */
+++static long track_find(MTX_MemHandler *t, void *p)
+++{
+++    long i;
+++    for (i = t->mem_numPointers - 1; i >= 0; --i)
+++    {
+++        if (t->mem_pointers[i].pointermem == p)
+++        {
+++            return i;
+++        }
+++    }
+++    return -1;
+++}
+++
+++static int track_add(MTX_MemHandler *t, void *p, unsigned long size)
+++{
+++    if (t->mem_numPointers == t->mem_maxPointers)
+++    {
+++        long newMax = t->mem_maxPointers ? t->mem_maxPointers * 2 : 32;
+++        mem_struct *n = (mem_struct *)t->realloc(t->mem_pointers, sizeof(mem_struct) * (size_t)newMax);
+++        if (!n)
+++        {
+++            return 0;
+++        }
+++        t->mem_pointers = n;
+++        t->mem_maxPointers = newMax;
+++    }
+++    t->mem_pointers[t->mem_numPointers].pointermem = p;
+++    t->mem_pointers[t->mem_numPointers].pointersize = (long)size;
+++    t->mem_numPointers++;
+++    return 1;
+++}
++ 
++ void *MTX_mem_malloc(MTX_MemHandler *t, unsigned long size)
++ {
++-    return t->malloc(size);
+++    void *p = t->malloc(size ? size : 1);   /* never ask for 0 bytes: a NULL for 0 is not a failure */
+++    if (!p || !track_add(t, p, size))
+++    {
+++        if (p)
+++        {
+++            t->free(p);
+++        }
+++        longjmp(t->env, ERR_MTX_mem_alloc);
+++    }
+++    return p;
++ }
++ 
++ void *MTX_mem_realloc(MTX_MemHandler *t, void *p, unsigned long size)
++ {
++-    return t->realloc(p, size);
+++    long at = p ? track_find(t, p) : -1;
+++    void *q = t->realloc(p, size ? size : 1);   /* realloc(p, 0) frees p and returns NULL: taken for a failure it would be freed twice */
+++    if (!q)
+++    {
+++        longjmp(t->env, ERR_MTX_mem_alloc);   /* p is still tracked, and is freed by FreeAllMemory */
+++    }
+++    if (at >= 0)
+++    {
+++        t->mem_pointers[at].pointermem = q;
+++        t->mem_pointers[at].pointersize = (long)size;
+++    }
+++    else if (!track_add(t, q, size))
+++    {
+++        t->free(q);
+++        longjmp(t->env, ERR_MTX_mem_alloc);
+++    }
+++    return q;
++ }
++ 
++ void  MTX_mem_free(MTX_MemHandler *t, void *deadObject)
++ {
+++    long at = deadObject ? track_find(t, deadObject) : -1;
+++    if (at >= 0)
+++    {
+++        t->mem_pointers[at] = t->mem_pointers[--t->mem_numPointers];
+++    }
++     t->free(deadObject);
++ }
++ 
+++/* Frees every allocation still tracked, and the table. Call it on an abnormal (error) exit. */
+++void MTX_mem_FreeAllMemory(MTX_MemHandler *t)
+++{
+++    long i;
+++    for (i = 0; i < t->mem_numPointers; ++i)
+++    {
+++        t->free(t->mem_pointers[i].pointermem);
+++    }
+++    t->mem_numPointers = 0;
+++    t->free(t->mem_pointers);
+++    t->mem_pointers = NULL;
+++    t->mem_maxPointers = 0;
+++}
+++
+++/* Normal exit: frees the table and the handler, NOT what is still tracked (the caller owns it now). */
+++void MTX_mem_Destroy(MTX_MemHandler *t)
+++{
+++    t->free(t->mem_pointers);
+++    free(t);
+++}
++ 
++ MTX_MemHandler *MTX_mem_Create(MTX_MALLOCPTR mptr, MTX_REALLOCPTR rptr, MTX_FREEPTR fptr)
++ {
++     MTX_MemHandler *t = (MTX_MemHandler *)malloc(sizeof(MTX_MemHandler));
+++    if (!t)
+++    {
+++        return NULL;
+++    }
++     *t = (MTX_MemHandler){0};
++     t->malloc = mptr;
++     t->realloc = rptr;
++--- a/src/lzcomp/liblzcomp.c
+++++ b/src/lzcomp/liblzcomp.c
++@@ -20,6 +20,8 @@
++ {
++ 	return ((unsigned)buf[2]) | (((unsigned)buf[1]) << 8) | (((unsigned)buf[0]) << 16);
++ }
+++/* a failed stream read: leave through the common error exit (which frees what the decoder holds) */
+++#define CHK_FAIL(sRes) if ((sRes) != EOT_STREAM_OK) {returnedStatus = EOT_MTX_ERROR; goto FAIL;}
++ enum EOTError unpackMtx(struct Stream *buf, unsigned size, uint8_t **bufsOut, unsigned *bufSizesOut)
++ {
++ 	for (unsigned i = 0; i < 3; ++i)
++@@ -27,50 +29,64 @@
++ 		bufsOut[i] = NULL;
++ 	}
++ 	enum StreamResult sResult;
++-	enum EOTError returnedStatus = EOT_SUCCESS;
+++	volatile enum EOTError returnedStatus = EOT_SUCCESS;
++ 	MTX_MemHandler *mem = MTX_mem_Create(&malloc, &realloc, &free);
++ 	if (!mem)
++ 	{
++-		goto CLEANUP;
+++		return EOT_CANT_ALLOCATE_MEMORY;
++ 	}
++-	LZCOMP *lzcomp = MTX_LZCOMP_Create1(mem);
++-	if (!lzcomp)
+++	/* The decoder reports malformed input by longjmp(mem->env, ...) from wherever it finds it; this
+++	   is where those land. Nothing set up this jump buffer before, so such an error jumped through an
+++	   uninitialised one. */
+++	if (setjmp(mem->env) != 0)
++ 	{
++-		goto CLEANUP;
+++		returnedStatus = EOT_MTX_ERROR;
+++		goto FAIL;
++ 	}
+++	LZCOMP *lzcomp = MTX_LZCOMP_Create1(mem);
++ 	uint8_t versionMagic;
++ 	uint32_t offsets[3];
++ 	offsets[0] = 10;
++ 	uint32_t copyLimit;
++ 	sResult = BEReadU8(buf, &versionMagic);
++-	CHK_CN(sResult, EOT_MTX_ERROR);
+++	CHK_FAIL(sResult);
++ 	sResult = BEReadU24(buf, &copyLimit);
++-	CHK_CN(sResult, EOT_MTX_ERROR);
+++	CHK_FAIL(sResult);
++ 	for (unsigned i = 1 /* sic */; i < 3; ++i)
++ 	{
++ 		sResult = BEReadU24(buf, &offsets[i]);
++-		CHK_CN(sResult, EOT_MTX_ERROR);
+++		CHK_FAIL(sResult);
++ 	}
++ 	unsigned sizes[] = {offsets[1] - offsets[0], offsets[2] - offsets[1], buf->size - offsets[2]};
++ 	for (unsigned i = 0; i < 3; ++i)
++ 	{
++-		if (offsets[i] + sizes[i] > buf->size)
+++		long sizeOut;
+++		/* offsets and sizes come from the file: each block must lie inside the buffer */
+++		if (offsets[i] > buf->size || sizes[i] > buf->size - offsets[i])
++ 		{
++ 			returnedStatus = EOT_MTX_ERROR;
++-			goto CLEANUP;
+++			goto FAIL;
++ 		}
++-		long sizeOut;
++ 		bufsOut[i] = (uint8_t *)MTX_LZCOMP_UnPackMemory(lzcomp, buf->buf + offsets[i], sizes[i], &sizeOut, versionMagic);
++ 		bufSizesOut[i] = sizeOut;
++ 		if (!bufsOut[i])
++ 		{
++ 			returnedStatus = EOT_MTX_ERROR;
++-			goto CLEANUP;
+++			goto FAIL;
++ 		}
++ 	}
++-CLEANUP:
+++	/* Success: what is still tracked is the three outputs, which now belong to the caller. */
++ 	MTX_LZCOMP_Destroy(lzcomp);
+++	MTX_mem_Destroy(mem);
+++	return EOT_SUCCESS;
+++FAIL:
+++	/* Frees everything the decoder still holds, including blocks already decoded. */
+++	MTX_mem_FreeAllMemory(mem);
++ 	free(mem);
+++	for (unsigned i = 0; i < 3; ++i)
+++	{
+++		bufsOut[i] = NULL;
+++	}
++ 	return returnedStatus;
++ }
++ #ifdef LZCOMP_MAIN
++--- a/src/libeot.c
+++++ b/src/libeot.c
++@@ -52,6 +52,8 @@
++   }
++   else if (result != EOT_SUCCESS)
++   {
+++    /* EOTfillMetadata can fail after it has allocated name strings; callers free metadata only after success */
+++    EOTfreeMetadata(metadataOut);
++     return result;
++   }
++ 
++@@ -73,17 +75,22 @@
++   }
++   else if (result != EOT_SUCCESS)
++   {
+++    /* EOTfillMetadata can fail after it has allocated name strings; callers free metadata only after success */
+++    EOTfreeMetadata(metadataOut);
++     return result;
++   }
++ 
++   enum EOTError writeResult = writeFontBuffer(font + metadataOut->fontDataOffset, metadataOut->fontDataSize, metadataOut->flags & TTEMBED_TTCOMPRESSED, metadataOut->flags & TTEMBED_XORENCRYPTDATA, fontOut, fontSizeOut);
++-  if (result >= EOT_WARN)
+++  if (writeResult != EOT_SUCCESS)
++   {
++-    EOTprintError(result, stderr);
+++    /* A failed decode was reported as success whenever the header had only produced a warning, and
+++       the metadata strings were leaked: callers free the metadata only after a successful call. */
+++    EOTfreeMetadata(metadataOut);
+++    return writeResult;
++   }
++-  else if (writeResult != EOT_SUCCESS)
+++  if (result >= EOT_WARN)
++   {
++-    return writeResult;
+++    EOTprintError(result, stderr);
++   }
++   return EOT_SUCCESS;
++ }
++--- a/src/ctf/parseCTF.c
+++++ b/src/ctf/parseCTF.c
++@@ -699,6 +699,9 @@
++     enum EOTError result = decodeGlyph(streams, &sOut);
++     if (result != EOT_SUCCESS)
++     {
+++      /* neither buffer has been handed to glyf/loca yet */
+++      free(sOut.buf);
+++      free(sLocaOut.buf);
++       return result;
++     }
++     /* do padding */
+diff --git a/external/libeot/05-libeot-uninitialised-glyph-bounds-wasm.patch.1 b/external/libeot/05-libeot-uninitialised-glyph-bounds-wasm.patch.1
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/external/libeot/05-libeot-uninitialised-glyph-bounds-wasm.patch.1
+@@ -0,0 +1,43 @@
++Initialise the glyph bounding values that decodeGlyph() passes on unset.
++
++decodeGlyph() reads xMin, yMin, xMax and yMax only when the glyph carries its own bounding box
++(numContours == 0x7FFF), and otherwise hands them, never assigned, to decodeSimpleGlyph(). Using an
++indeterminate value as an argument is undefined behaviour, and clang at -O2 treats it as "undef" and
++rewrites the code around it: in the WASM build every MicroType-Express compressed font then failed to
++decode (EOT_CORRUPT_FILE or EOT_CANT_ALLOCATE_MEMORY, the latter because libeot reports any failed
++stream read as an allocation failure). gcc, and clang at -O1 or below, happen to produce working code,
++so every native build and the one uncompressed font in the fixtures decoded fine and the defect only
++showed in the shipped module. boundingBoxLocation, used only when calculateBoundingBox is set, is
++initialised for the same reason (the compiler cannot see that it is).
++
++Written for FG-054 (owner instruction 2026-10-29), against libeot-0.01 with LibreOffice's three
++patches and the four before this one applied. Test: libeot compiled with Emscripten 3.1.51 and the
++module's own C flags (-O2 -msimd128 -s SUPPORT_LONGJMP=wasm), run under Node: before, 9 of the 10
++decodable corpus fonts fail; after, all 10 decode, and the output is byte-identical to the native decode.
++Zero-initialising every local (-ftrivial-auto-var-init=zero) in parseCTF.c alone gives the same result,
++which is how the file was found (zero-initialising the locals of any other single file does not).
++
++
++--- a/src/ctf/parseCTF.c
+++++ b/src/ctf/parseCTF.c
++@@ -376,7 +376,7 @@
++   struct Stream *in = streams[0];
++   enum StreamResult sResult;
++   enum EOTError returnedStatus = EOT_SUCCESS;
++-  unsigned boundingBoxLocation;
+++  unsigned boundingBoxLocation = 0;   /* set and used only when calculateBoundingBox */
++   RD2(BEWriteS16, out, numContours, sResult);
++   if (calculateBoundingBox)
++   {
++@@ -624,7 +624,10 @@
++ enum EOTError decodeGlyph(struct Stream **streams, struct Stream *out)
++ {
++   struct Stream *in = streams[0];
++-  int16_t numContours, xMin, yMin, xMax, yMax;
+++  int16_t numContours;
+++  /* Only read when the glyph carries its own bounding box, but passed on either way: an indeterminate
+++     value used as an argument is undefined behaviour, and clang's -O2 acts on it (see the patch header). */
+++  int16_t xMin = 0, yMin = 0, xMax = 0, yMax = 0;
++   bool calculateBoundingBox = false;
++   enum StreamResult sResult;
++   RD2(BEReadS16, in, &numContours, sResult);
+diff --git a/external/libeot/06-libeot-checked-font-buffer-alloc-wasm.patch.1 b/external/libeot/06-libeot-checked-font-buffer-alloc-wasm.patch.1
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/external/libeot/06-libeot-checked-font-buffer-alloc-wasm.patch.1
+@@ -0,0 +1,25 @@
++Check the allocation of the working copy of the font data.
++
++writeFontBuffer() copied the font into a malloc'd buffer without testing the result, so a failed allocation (the
++size comes from the font's header, bounded by the input) was written through a NULL pointer. It now returns
++EOT_CANT_ALLOCATE_MEMORY; nothing else has been allocated at that point. A request for 0 bytes asks for 1, so a NULL
++answer to it is not mistaken for a failure.
++
++Written for FG-054 (owner instruction 2026-10-29; found by the pre-merge Fable review), against libeot-0.01 with
++LibreOffice's three patches and the five before this one applied.
++
++--- a/src/writeFontFile.c
+++++ b/src/writeFontFile.c
++@@ -18,7 +18,11 @@
++ enum EOTError writeFontBuffer(const uint8_t *font, unsigned fontSize, bool compressed, bool encrypted, uint8_t **finalOutBuffer, unsigned *finalFontSize)
++ {
++   enum EOTError result;
++-  uint8_t *buf = (uint8_t *)malloc(fontSize);
+++  uint8_t *buf = (uint8_t *)malloc(fontSize ? fontSize : 1);
+++  if (!buf)
+++  {
+++    return EOT_CANT_ALLOCATE_MEMORY;   /* nothing else is allocated yet */
+++  }
++   for (unsigned i = 0; i < fontSize; ++i)
++   {
++     if (encrypted)
+diff --git a/external/libeot/ExternalProject_libeot.mk b/external/libeot/ExternalProject_libeot.mk
+index b60ac86..5039d3e 100644
+--- a/external/libeot/ExternalProject_libeot.mk
++++ b/external/libeot/ExternalProject_libeot.mk
+@@ -22,6 +22,7 @@ $(call gb_ExternalProject_get_state_target,libeot,build) :
+ 			--with-pic \
+ 			--enable-static \
+ 			--disable-shared \
++			$(if $(filter EMSCRIPTEN,$(OS)),CFLAGS="-O2 $(gb_EMSCRIPTEN_CPPFLAGS)") \
+ 			$(if $(ENABLE_DEBUG),--enable-debug,--disable-debug) \
+ 			$(gb_CONFIGURE_PLATFORMS) \
+ 		&& $(MAKE) $(if $(verbose),V=1) libeot.la \
+diff --git a/external/libeot/UnpackedTarball_libeot.mk b/external/libeot/UnpackedTarball_libeot.mk
+index 40ac1cb..f7f143f 100644
+--- a/external/libeot/UnpackedTarball_libeot.mk
++++ b/external/libeot/UnpackedTarball_libeot.mk
+@@ -11,6 +11,13 @@ libeot_patches :=
+ libeot_patches += 0001-remove-unused-err.h.patch
+ libeot_patches += debug-no-werror.patch.0
+ libeot_patches += ubsan.patch.0
++# FG-054: bounds, error returns and leaks in the MTX/EOT decoder (see the header of each file)
++libeot_patches += 01-libeot-lzcomp-bounds-wasm.patch.1
++libeot_patches += 02-libeot-bitio-oob-read-wasm.patch.1
++libeot_patches += 03-libeot-stream-overflow-wasm.patch.1
++libeot_patches += 04-libeot-error-return-and-leaks-wasm.patch.1
++libeot_patches += 05-libeot-uninitialised-glyph-bounds-wasm.patch.1
++libeot_patches += 06-libeot-checked-font-buffer-alloc-wasm.patch.1
+ 
+ $(eval $(call gb_UnpackedTarball_UnpackedTarball,libeot))
+ 
