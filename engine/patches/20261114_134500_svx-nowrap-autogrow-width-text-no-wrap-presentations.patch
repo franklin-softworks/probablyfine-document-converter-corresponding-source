@@ -1,0 +1,93 @@
+--- a/svx/source/svdraw/svdotextdecomposition.cxx
++++ b/svx/source/svdraw/svdotextdecomposition.cxx
+@@ -54,6 +54,7 @@
+ #include <svx/unoapi.hxx>
+ #include <drawinglayer/geometry/viewinformation2d.hxx>
+ #include <editeng/outlobj.hxx>
++#include <editeng/editobj.hxx>
+ #include <basegfx/matrix/b2dhommatrixtools.hxx>
+ #include <sal/log.hxx>
+ #include <osl/diagnose.h>
+@@ -640,6 +641,13 @@
+     const bool bTopToBottom(rSdrBlockTextPrimitive.getOutlinerParaObject().IsTopToBottom());
+     const Size aAnchorTextSize(Size(nAnchorTextWidth, nAnchorTextHeight));
+ 
++#ifdef __EMSCRIPTEN__
++    // BUG-84: set when the paper of a no-wrap, auto-grow-width shape was left free to grow sideways; the alignment its lines
++    // have inside that wider paper, to be turned into the horizontal adjust of the frame (see below)
++    bool bNoWrapGrowBlock(false);
++    SvxAdjust eNoWrapGrowAdjust(SvxAdjust::Left);
++#endif
++
+     if(bIsCell)
+     {
+         // cell text is formatted neither like a text object nor like an object
+@@ -716,6 +724,51 @@
+                 // allow to grow horizontal for vertical texts
+                 aMaxAutoPaperSize.setWidth(1000000);
+             }
++#ifdef __EMSCRIPTEN__
++            // BUG-84: a shape that grows to fit its text (auto-grow width, which for a custom shape means auto-grow height with
++            // word wrap off: PowerPoint's wrap="none" with spAutoFit) must never wrap its lines. The paper was limited to the stored
++            // frame width, so a frame a little narrower than the text in the substituted font broke the line in two, while the
++            // same shape read back from ODP (whose frame was grown on save) did not. Let the paper grow sideways and keep the
++            // frame as it is. A frame with a left, centre or right horizontal adjust is placed by the adjust below. A block frame
++            // (the adjust is the paragraphs' own) is let grow only when every paragraph names its alignment and they agree
++            // (left, centre or right): that alignment then becomes the frame's adjust, so the line is centred on the frame, or
++            // ends at its right edge, as in PowerPoint. Anything else keeps the old limit.
++            if (!bVerticalWriting && !rSdrBlockTextPrimitive.getWordWrap() && IsAutoGrowWidth())
++            {
++                bool bLift(SDRTEXTHORZADJUST_BLOCK != eHAdj);
++                if (!bLift)
++                {
++                    const EditTextObject& rTextObj(rSdrBlockTextPrimitive.getOutlinerParaObject().GetTextObject());
++                    const sal_Int32 nParas(rTextObj.GetParagraphCount());
++                    bool bAgree(nParas > 0);
++                    SvxAdjust eCommon(SvxAdjust::Left);
++                    for (sal_Int32 nPara = 0; bAgree && nPara < nParas; ++nPara)
++                    {
++                        const SfxItemSet& rParaSet(rTextObj.GetParaAttribs(nPara));
++                        if (rParaSet.GetItemState(EE_PARA_JUST, false) != SfxItemState::SET)
++                        {
++                            bAgree = false;
++                            break;
++                        }
++                        const SvxAdjust eAdjust(rParaSet.Get(EE_PARA_JUST).GetAdjust());
++                        if (eAdjust != SvxAdjust::Left && eAdjust != SvxAdjust::Center && eAdjust != SvxAdjust::Right)
++                            bAgree = false;
++                        else if (nPara == 0)
++                            eCommon = eAdjust;
++                        else if (eAdjust != eCommon)
++                            bAgree = false;
++                    }
++                    if (bAgree)
++                    {
++                        bLift = true;
++                        bNoWrapGrowBlock = true;
++                        eNoWrapGrowAdjust = eCommon;
++                    }
++                }
++                if (bLift)
++                    aMaxAutoPaperSize.setWidth(1000000);
++            }
++#endif
+ 
+             rOutliner.SetMaxAutoPaperSize(aMaxAutoPaperSize);
+         }
+@@ -731,6 +784,16 @@
+     const Size aOutlinerTextSize(rOutliner.GetPaperSize());
+     const basegfx::B2DVector aOutlinerScale(aOutlinerTextSize.Width(), aOutlinerTextSize.Height());
+     basegfx::B2DVector aAdjustTranslate(0.0, 0.0);
++#ifdef __EMSCRIPTEN__
++    // BUG-84: the lines of a grown block frame sit in a paper as wide as the widest line, so place that paper by the alignment
++    // of the paragraphs, about the frame, when it is wider than the frame
++    if (bNoWrapGrowBlock && SDRTEXTHORZADJUST_BLOCK == eHAdj && aAnchorTextRange.getWidth() < aOutlinerScale.getX())
++    {
++        eHAdj = eNoWrapGrowAdjust == SvxAdjust::Center ? SDRTEXTHORZADJUST_CENTER
++              : eNoWrapGrowAdjust == SvxAdjust::Right  ? SDRTEXTHORZADJUST_RIGHT
++                                                       : SDRTEXTHORZADJUST_LEFT;
++    }
++#endif
+ 
+     // For draw objects containing text correct hor/ver alignment if text is bigger
+     // than the object itself. Without that correction, the text would always be
