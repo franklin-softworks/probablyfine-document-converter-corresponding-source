@@ -1,0 +1,103 @@
+Subject: [PATCH] Drop the Impress SVG-export presentation engine in WASM builds
+
+filter/source/svg/presentation_engine.js is converted by js2hxx.py into
+svgscript.hxx (111 C string fragments) and linked into .rodata by svgexport.cxx.
+It is the JavaScript animation/navigation runtime for interactive SVG slideshows
+exported from Impress.
+
+MEASURED in the shipped web/modules/documents/soffice.wasm: 415,703 bytes of
+payload spread over 56 data segments (located by markers unique to that file:
+window.SVGPathSeg, aSlideShow, SlideAnimations, NextEffectEventArray,
+@libreofficeend, PriorityQueue). Zeroing exactly those segment payloads and
+re-running brotli -q 11 drops the module from 20,483,909 to 20,433,251 bytes:
+
+    wire cost of the blob = 50,658 bytes
+
+That is per module, and the blob is present in every module (documents is a
+Writer-only build and carries it regardless), so the fix is worth roughly 5x
+that across the shipped set.
+
+WHY IT IS UNREACHABLE - the blob's only consumer is implGenerateScript(), called
+from exactly one place, svgexport.cxx implExportDocument():
+
+    if( mbPresentation && !mbExportShapeSelection )
+        implGenerateScript();
+
+mbPresentation is assigned in exactly one place, implExportImpressOrDraw():
+
+    mbPresentation = Reference< XPresentationSupplier >(mxSrcDoc, UNO_QUERY).is();
+
+and implExportImpressOrDraw() is only reached when !mbWriterFilter &&
+!mbCalcFilter. So emitting the script requires an Impress document being written
+THROUGH the SVG export filter. This product never exports SVG from any module -
+web/js/format_registry.js contains no SVG entry, and SVG is offered as neither
+an input nor an output format.
+
+WHAT THIS DOES NOT TOUCH - embedded-SVG *import*. Images inside DOCX/ODT/RTF
+render through a completely separate library: vcl/source/filter/graphicfilter.cxx
+(IMP_SVG -> readSVG) builds a VectorGraphicData, which instantiates
+com.sun.star.graphic.SvgTools, implemented in svgio (svgio/source/svguno/
+xsvgparser.cxx). svgio does not link svgfilter and svgfilter does not link
+svgio. svgfilter's own "ImportFilter" service is only "open a standalone .svg as
+a Draw/Impress document"; it requires an XDrawPagesSupplier and then delegates
+to GraphicFilter::ImportGraphic anyway.
+
+This is deliberately the narrow cut. It removes the JS blob only and leaves the
+svgfilter library, its .component and all five *_svg_Export.xcu registrations
+in place, so no service registration becomes unresolvable.
+
+NOT COMPILE-TESTED - no build was available. The failure mode if wrong is a
+compile error in svgexport.cxx, which is loud and cheap.
+
+VERIFY AFTER BUILDING:
+  grep -c 'window.SVGPathSeg' web/modules/documents/soffice.wasm   # expect 0
+and confirm soffice.wasm.br drops by ~50 KB.
+
+--- a/filter/source/svg/svgexport.cxx
++++ b/filter/source/svg/svgexport.cxx
+@@ -21,7 +21,9 @@
+ #include "svgwriter.hxx"
+ #include "svgfontexport.hxx"
+ #include "svgfilter.hxx"
++#ifndef __EMSCRIPTEN__
+ #include <svgscript.hxx>
++#endif
+ 
+ #include <com/sun/star/awt/Rectangle.hpp>
+ #include <com/sun/star/animations/XAnimationNodeSupplier.hpp>
+@@ -1747,6 +1749,27 @@
+ 
+ void SVGFilter::implGenerateScript()
+ {
++#ifdef __EMSCRIPTEN__
++    // WASM: do not embed the Impress SVG-export presentation engine.
++    //
++    // filter/source/svg/presentation_engine.js is converted by js2hxx.py into
++    // svgscript.hxx (111 string fragments) and linked into .rodata. Measured in
++    // the shipped documents module: 415,703 bytes of payload, costing 50,658
++    // bytes of wire after brotli -q 11.
++    //
++    // It is unreachable in this converter. The only caller of this function is
++    // gated on mbPresentation (implExportDocument), which is set solely in
++    // implExportImpressOrDraw() from an XPresentationSupplier query on the
++    // source document -- so it requires an Impress document being written
++    // THROUGH the SVG export filter. No module offers SVG as an output format
++    // (web/js/format_registry.js has no SVG entry), so no conversion this
++    // product performs can reach it.
++    //
++    // Embedded-SVG *import* is unaffected: DOCX/ODT images go through
++    // vcl/source/filter/graphicfilter.cxx -> readSVG -> VectorGraphicData ->
++    // com.sun.star.graphic.SvgTools, which is implemented in svgio and does not
++    // link svgfilter at all.
++#else
+     mpSVGExport->AddAttribute(u"type"_ustr, u"text/ecmascript"_ustr);
+ 
+     {
+@@ -1761,6 +1784,7 @@
+             }
+         }
+     }
++#endif
+ }
+ 
+ 
