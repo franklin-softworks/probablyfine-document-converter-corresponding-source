@@ -1,0 +1,33 @@
+--- a/sd/source/ui/app/sdmod2.cxx
++++ b/sd/source/ui/app/sdmod2.cxx
+@@ -166,6 +166,30 @@
+     if( !pDocShell )
+         pDocShell = dynamic_cast< ::sd::DrawDocShell *>( SfxObjectShell::Current() );
+ 
++    // Recover the document from the outliner's visualized page when the
++    // outliner has no text object to supply it.
++    //
++    // Every field branch below is guarded on `pPage && pDoc && !bMasterView`
++    // and recovers a null pDoc ONLY via pViewSh->GetDoc(). Headless conversion
++    // has no view shell, so pDoc stays null and every field falls through to a
++    // placeholder ("<number>", " ") no matter how well the page resolved.
++    // Measured at export before this fix: 6/6 GetCurrentPage() calls returned a
++    // page and all five slide numbers still rendered as the literal "<number>".
++    //
++    // GetCurrentPage() takes that page from pOutliner->getVisualizedPage(), and
++    // SdrPage::getSdrModelFromSdrPage() means a page always knows its model, so
++    // this is non-null under precisely the condition that makes pPage non-null.
++    // One recovery here covers page number, page title, file name and author.
++    //
++    // NOT via pDocShell: tried and measured dead on this path — 477 calls had
++    // shell=0 AND textobj=0 (nothing to fall back to) and 90 had both already
++    // set (nothing to fix), so that fallback never fired once.
++    if( !pDoc && pSdrOutliner )
++    {
++        if( const SdrPage* pVisPage = pSdrOutliner->getVisualizedPage() )
++            pDoc = dynamic_cast< SdDrawDocument* >( &pVisPage->getSdrModelFromSdrPage() );
++    }
++
+     const SvxDateField* pDateField = nullptr;
+     const SvxExtTimeField* pExtTimeField = nullptr;
+     const SvxExtFileField* pExtFileField = nullptr;

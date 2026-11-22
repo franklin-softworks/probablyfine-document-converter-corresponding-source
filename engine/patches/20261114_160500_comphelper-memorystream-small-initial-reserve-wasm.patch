@@ -1,0 +1,18 @@
+--- a/comphelper/source/streaming/memorystream.cxx
++++ b/comphelper/source/streaming/memorystream.cxx
+@@ -105,7 +105,15 @@
+ UNOMemoryStream::UNOMemoryStream()
+ : mnCursor(0)
+ {
++#ifdef __EMSCRIPTEN__
++    // BUG-88: every package stream (one per picture of a DOCX/ODT/XLSX/PPTX export, and more) is one of these, and 1 MiB was reserved up front for each one.
++    // The reserve is address space only (the vector does not zero it), but in the WASM engine it is linear memory that stays allocated until the package is
++    // committed: 1,500 distinct small pictures asked for ~3.3 GB of heap for 550 KB of picture data and tripped the memory ceiling. The vector grows
++    // geometrically on write, so a small first reserve costs a few reallocations of large streams and nothing for small ones.
++    maData.reserve(16 * 1024);
++#else
+     maData.reserve(1 * 1024 * 1024);
++#endif
+ }
+ 
+ // XServiceInfo

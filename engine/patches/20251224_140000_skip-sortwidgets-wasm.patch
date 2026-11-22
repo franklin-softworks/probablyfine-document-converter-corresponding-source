@@ -1,0 +1,17 @@
+diff --git a/vcl/source/gdi/pdfwriter_impl.cxx b/vcl/source/gdi/pdfwriter_impl.cxx
+index f132c585fde3..b17a41f3db2b 100644
+--- a/vcl/source/gdi/pdfwriter_impl.cxx
++++ b/vcl/source/gdi/pdfwriter_impl.cxx
+@@ -6223,7 +6223,12 @@ bool PDFWriterImpl::emit()
+ 
+     // resort structure tree and annotations if necessary
+     // needed for widget tab order
++#ifndef __EMSCRIPTEN__
++    // WASM/LOK optimization: Skip widget sorting for headless export.
++    // Widget sorting is only needed for interactive PDF forms with tab order.
++    // Presentations (Impress) have no form fields, so this is pure overhead.
+     sortWidgets();
++#endif
+ 
+ #if HAVE_FEATURE_NSS
+     if( m_aContext.SignPDF )

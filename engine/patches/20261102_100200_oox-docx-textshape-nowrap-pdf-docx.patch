@@ -1,0 +1,47 @@
+oox: let a text shape obey TextWordWrap when it is exported to DOCX (pdf-docx module only).
+
+DrawingML::WriteText lets only a custom shape obey TextWordWrap; normal text always wraps (wrap="square"). The PDF import turns
+word wrap off, on purpose, for a text box that holds a single line (pdfimport-singleline-nowrap-pdf-docx.patch), so in this
+module a text shape obeys the property too and the box is written with wrap="none". Word then grows such a box sideways.
+The DOCX branch that forces wrap="square" for a com.sun.star.drawing.TextShape (the PDF import's text boxes are TextShapes) skips a
+shape whose TextWordWrap property itself is off, otherwise it would overwrite the "none". It reads the property, not the merged flag:
+the tdf#134401 rule after it also turns wrapping off for any text shape with both auto-grow flags, which would make a box that the
+importer left wrapping (more than one line) one long line too.
+Routed to pdf-docx only; every other module keeps the rule. Not observed in Word.
+
+diff --git a/oox/source/export/drawingml.cxx b/oox/source/export/drawingml.cxx
+index 6deb9c3..ba75141 100644
+--- a/oox/source/export/drawingml.cxx
++++ b/oox/source/export/drawingml.cxx
+@@ -4189,10 +4189,17 @@ void DrawingML::WriteText(const Reference<XInterface>& rXIface, bool bBodyPr, bo
+     bool bHasWrap = false;
+     bool bWrap = false;
+     // Only custom shapes obey the TextWordWrap option, normal text always wraps.
+-    if (dynamic_cast<SvxCustomShape*>(rXIface.get()) && GetProperty(rXPropSet, u"TextWordWrap"_ustr))
++    // BUG-43 (pdf-docx module only, see the patch header): the PDF import turns word wrap off, on purpose, for a text box
++    // that holds a single line, so here a text shape obeys it too (wrap="none": Word grows the box sideways).
++    const bool bTextShapeWrap = xShape.is() && SdrObject::getSdrObjectFromXShape(xShape) != nullptr;
++    bool bTextShapeNoWrap = false;
++    if ((dynamic_cast<SvxCustomShape*>(rXIface.get()) || bTextShapeWrap) && GetProperty(rXPropSet, u"TextWordWrap"_ustr))
+     {
+         mAny >>= bWrap;
+         bHasWrap = true;
++        // Only the property itself counts below: the tdf#134401 rule that follows also turns wrapping off for a text shape that
++        // merely has both auto-grow flags, and that would make every box (multi-line ones too) one long line.
++        bTextShapeNoWrap = bTextShapeWrap && !bWrap;
+     }
+ 
+     // tdf#134401: If AUTOGROWWIDTH and AUTOGROWHEIGHT are set, then export it as TextWordWrap
+@@ -4220,8 +4227,10 @@ void DrawingML::WriteText(const Reference<XInterface>& rXIface, bool bBodyPr, bo
+             // TextShape's automatic word wrapping, then we need to set
+             // wrapping to square.
+             uno::Reference<lang::XServiceInfo> xServiceInfo(rXIface, uno::UNO_QUERY);
+-            if ((xServiceInfo.is() && xServiceInfo->supportsService(u"com.sun.star.drawing.TextShape"_ustr))
+-                || bIsFontworkShape)
++            // BUG-43 (pdf-docx module only): a text shape whose word wrap the PDF import turned off keeps wrap="none".
++            if (!(bTextShapeNoWrap && !bIsFontworkShape)
++                && ((xServiceInfo.is() && xServiceInfo->supportsService(u"com.sun.star.drawing.TextShape"_ustr))
++                    || bIsFontworkShape))
+                 pWrap = "square";
+         }
+ 
