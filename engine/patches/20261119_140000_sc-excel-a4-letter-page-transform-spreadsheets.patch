@@ -1,0 +1,334 @@
+diff --git a/filter/source/pdf/pdfexport.cxx b/filter/source/pdf/pdfexport.cxx
+index b89244fa0242..2f8bb6a5dfad 100644
+--- a/filter/source/pdf/pdfexport.cxx
++++ b/filter/source/pdf/pdfexport.cxx
+@@ -26,6 +26,8 @@
+ #include <utility>
+ #include <vcl/canvastools.hxx>
+ #include <vcl/mapmod.hxx>
++#include <basegfx/numeric/ftools.hxx>
++#include <tools/fract.hxx>
+ #include <vcl/gdimtf.hxx>
+ #include <vcl/graphic/GraphicMetadata.hxx>
+ #include <vcl/pdf/PDFEncryptionInitialization.hxx>
+@@ -151,13 +153,14 @@ bool PDFExport::ExportSelection( vcl::PDFWriter& rPDFWriter,
+                     const Sequence< PropertyValue > aRenderer( rRenderable->getRenderer( *aIter, rSelection, rRenderOptions ) );
+                     awt::Size                   aPageSize;
+ 
++                    // the page transform of an A4-declared Excel sheet printed in Letter mode (sc/inc/excelrowpitch.hxx): scale, offset x, offset y, content width and height (1/100 mm)
++                    Sequence<double> aPageTransform;
+                     for( const PropertyValue& rProp : aRenderer )
+                     {
+                         if ( rProp.Name == "PageSize" )
+-                        {
+                             rProp.Value >>= aPageSize;
+-                            break;
+-                        }
++                        else if ( rProp.Name == "ScWasmPageTransform" )
++                            rProp.Value >>= aPageTransform;
+                     }
+ 
+                     rPDFExtOutDevData.SetCurrentPageNumber( nCurrentPage );
+@@ -208,7 +211,7 @@ bool PDFExport::ExportSelection( vcl::PDFWriter& rPDFWriter,
+                             }
+                         }
+ 
+-                        ImplExportPage(rPDFWriter, rPDFExtOutDevData, aMtf);
++                        ImplExportPage(rPDFWriter, rPDFExtOutDevData, aMtf, aPageTransform.getLength() == 5 ? &aPageTransform : nullptr);
+                         bRet = true;
+                     }
+                     else
+@@ -1252,7 +1255,7 @@ void PDFExport::showErrors( const std::set< vcl::PDFWriter::ErrorCode >& rErrors
+ }
+ 
+ 
+-void PDFExport::ImplExportPage( vcl::PDFWriter& rWriter, vcl::PDFExtOutDevData& rPDFExtOutDevData, const GDIMetaFile& rMtf )
++void PDFExport::ImplExportPage( vcl::PDFWriter& rWriter, vcl::PDFExtOutDevData& rPDFExtOutDevData, const GDIMetaFile& rMtf, const css::uno::Sequence<double>* pPageTransform )
+ {
+     //Rectangle(Point, Size) creates a rectangle off by 1, use Rectangle(long, long, long, long) instead
+     basegfx::B2DPolygon aSize(tools::Polygon(tools::Rectangle(0, 0, rMtf.GetPrefSize().Width(), rMtf.GetPrefSize().Height())).getB2DPolygon());
+@@ -1261,6 +1264,13 @@ void PDFExport::ImplExportPage( vcl::PDFWriter& rWriter, vcl::PDFExtOutDevData&
+     tools::Rectangle       aPageRect( Point(), rMtf.GetPrefSize() );
+ 
+     rWriter.NewPage( aRangePDF.getWidth(), aRangePDF.getHeight() );
++    if (pPageTransform)
++    {
++        // the page content was laid out on a larger page (A4) than the page this PDF page has (Letter): the writer wraps the page's content in a scale and shift matrix and
++        // moves the rectangles of links and destinations with it (PDFWriter::SetPageTransform; the transformation ends with the page)
++        rWriter.SetPageTransform((*pPageTransform)[0], (*pPageTransform)[1], (*pPageTransform)[2]);
++        aPageRect = tools::Rectangle(0, 0, basegfx::fround((*pPageTransform)[3]), basegfx::fround((*pPageTransform)[4]));
++    }
+     rWriter.SetMapMode( rMtf.GetPrefMapMode() );
+ 
+     vcl::PDFWriter::PlayMetafileContext aCtx;
+diff --git a/filter/source/pdf/pdfexport.hxx b/filter/source/pdf/pdfexport.hxx
+index f4e3e20fbb17..8084f6c10e92 100644
+--- a/filter/source/pdf/pdfexport.hxx
++++ b/filter/source/pdf/pdfexport.hxx
+@@ -60,7 +60,7 @@ private:
+     OUString            msTiledWatermark;
+ 
+     void                ImplExportPage( vcl::PDFWriter& rWriter, vcl::PDFExtOutDevData& rPDFExtOutDevData,
+-                                        const GDIMetaFile& rMtf );
++                                        const GDIMetaFile& rMtf, const css::uno::Sequence<double>* pPageTransform = nullptr );
+ 
+     void                ImplWriteWatermark( vcl::PDFWriter& rWriter, const Size& rPageSize );
+     void                ImplWriteTiledWatermark( vcl::PDFWriter& rWriter, const Size& rPageSize );
+diff --git a/include/vcl/pdfwriter.hxx b/include/vcl/pdfwriter.hxx
+index 5cd034c9878a..df3b1abeeba8 100644
+--- a/include/vcl/pdfwriter.hxx
++++ b/include/vcl/pdfwriter.hxx
+@@ -830,6 +830,13 @@ public:
+ 
+     VCL_DLLPUBLIC void SetMapMode( const MapMode& rNewMapMode );
+ 
++    /* Call right after NewPage: everything drawn on this page from now on until the page ends is drawn through the transformation x' = fScale * x + fOffsetX, y' = fScale * y +
++       fOffsetY (the top-down page coordinates, in 1/100 mm of the page): the content of the page was laid out on a larger page than the page it is drawn on (an A4-declared
++       Excel sheet printed on Letter, filter/source/pdf/pdfexport.cxx). The content stream is wrapped in "q <matrix> cm ... Q", and the rectangles of links, destinations and
++       other annotations of the page go through the same transformation, so text, graphics, clips and links stay together. Tiling patterns are not transformed (a PDF pattern
++       matrix is relative to the page, not to the current matrix). */
++    VCL_DLLPUBLIC void SetPageTransform( double fScale, double fOffsetX, double fOffsetY );
++
+ 
+     /* actual drawing functions */
+     VCL_DLLPUBLIC void  DrawText( const Point& rPos, const OUString& rText );
+diff --git a/sc/inc/excelrowpitch.hxx b/sc/inc/excelrowpitch.hxx
+index 31c52967e928..7a7e3913c4b2 100644
+--- a/sc/inc/excelrowpitch.hxx
++++ b/sc/inc/excelrowpitch.hxx
+@@ -14,6 +14,7 @@
+ 
+ #include <rtl/ustring.hxx>
+ #include <sal/types.h>
++#include <tools/long.hxx>
+ #include <utility>
+ #include <vector>
+ 
+@@ -50,6 +51,19 @@ struct SheetInfo
+ 
+ SC_DLLPUBLIC void SetSheetInfo(const ScDocument& rDoc, SCTAB nTab, SheetInfo aInfo);
+ SC_DLLPUBLIC void ApplyPrintRowHeights(ScDocument& rDoc);
++
++// A4-declared Excel sheets printed in Letter mode (owner decision 2026-11-14: follow the Office reference). Excel paginates the sheet ON A4 and scales every A4 page onto
++// the Letter page. Calc lays the sheet out exactly as on A4 (100 %: the same rows and columns on each page, the same cell text layout) and the PDF export draws that A4
++// page scaled and shifted onto a Letter page: getRenderer reports the Letter page size and a "ScWasmPageTransform" property that filter/source/pdf/pdfexport.cxx applies
++// to the PDF writer's map mode. (An earlier version scaled through the page style's zoom: Calc's integer zoom of 91 to 95 % laid some wrapped cell text out one line
++// shorter and a line was lost.) A no-op unless LO_WASM_A4_LETTER_MAPPING is "1" (the bridge sets it for a PDF target with Letter paper) and the document came from an Excel filter.
++struct PageTransform
++{
++    double fScale = 1.0, fOffsetX = 0.0, fOffsetY = 0.0;           // 1/100 mm on the Letter page
++    tools::Long nContentWidth = 0, nContentHeight = 0;              // the A4 content area, 1/100 mm
++    tools::Long nPageWidth = 0, nPageHeight = 0;                    // the Letter page, 1/100 mm
++};
++SC_DLLPUBLIC bool GetA4LetterPageTransform(ScDocument& rDoc, tools::Long nWidth, tools::Long nHeight, PageTransform& rOut);
+ }
+ 
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/sc/source/core/data/excelrowpitch.cxx b/sc/source/core/data/excelrowpitch.cxx
+index 77aa84fc98bd..ecaca7bb4721 100644
+--- a/sc/source/core/data/excelrowpitch.cxx
++++ b/sc/source/core/data/excelrowpitch.cxx
+@@ -21,6 +21,11 @@
+ #include <scresid.hxx>
+ 
+ #include <editeng/fontitem.hxx>
++#include <editeng/lrspitem.hxx>
++#include <editeng/ulspitem.hxx>
++#include <editeng/sizeitem.hxx>
++#include <svx/pageitem.hxx>
++#include <svl/intitem.hxx>
+ #include <editeng/fhgtitem.hxx>
+ #include <sfx2/docfile.hxx>
+ #include <sfx2/docfilt.hxx>
+@@ -311,6 +316,34 @@ void ApplyPrintRowHeights(ScDocument& rDoc)
+         rInfos.erase(it);   // once per document: a second call (a second render of the same document) must not apply it again
+     }
+ }
++
++// ---------------------------------------------------------------------------------------------------------------------------------------------------------
++// A4 -> Letter (see the header). Excel lays an A4-declared sheet out on A4 and scales every A4 page onto the Letter page: along the long axis the A4 page is fitted into
++// Letter's printable length (15.4 pt of it are not printable on the oracle's printer), the short axis is centred, and the page sits 4.2 pt from the leading edge
++// (measured on the oracle, Microsoft Print to PDF at 600 dpi; scale 0.9224 on every page of every file). All lengths here are 1/100 mm.
++bool GetA4LetterPageTransform(ScDocument& rDoc, tools::Long nWidth, tools::Long nHeight, PageTransform& rOut)
++{
++    const char* pEnv = std::getenv("LO_WASM_A4_LETTER_MAPPING");
++    if (!pEnv || pEnv[0] != '1' || !isExcelDocument(rDoc))
++        return false;
++    constexpr tools::Long kA4Short = 20999, kA4Long = 29700, kLetterShort = 21590, kLetterLong = 27940;
++    constexpr double kUnprintableLong = 15.4 * 2540.0 / 72.0;     // 15.4 pt
++    constexpr double kLeadingOffset = 4.2 * 2540.0 / 72.0;        // 4.2 pt
++    const bool bLandscape = nWidth > nHeight;
++    const tools::Long nLong = bLandscape ? nWidth : nHeight, nShort = bLandscape ? nHeight : nWidth;
++    if (std::abs(nLong - kA4Long) > 30 || std::abs(nShort - kA4Short) > 30)
++        return false;   // not an A4 page: Letter, Legal and the rest are not touched
++    const double fScale = (kLetterLong - kUnprintableLong) / kA4Long;
++    const double fShortOffset = (kLetterShort - fScale * kA4Short) / 2.0;
++    rOut.fScale = fScale;
++    rOut.fOffsetX = bLandscape ? kLeadingOffset : fShortOffset;
++    rOut.fOffsetY = bLandscape ? fShortOffset : kLeadingOffset;
++    rOut.nContentWidth = nWidth;
++    rOut.nContentHeight = nHeight;
++    rOut.nPageWidth = bLandscape ? kLetterLong : kLetterShort;
++    rOut.nPageHeight = bLandscape ? kLetterShort : kLetterLong;
++    return true;
++}
+ }
+ 
+ /* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/sc/source/ui/unoobj/docuno.cxx b/sc/source/ui/unoobj/docuno.cxx
+index 073f05bd8b66..b884b2b4209c 100644
+--- a/sc/source/ui/unoobj/docuno.cxx
++++ b/sc/source/ui/unoobj/docuno.cxx
+@@ -2112,6 +2112,8 @@ uno::Sequence<beans::PropertyValue> SAL_CALL ScModelObj::getRenderer( sal_Int32
+     awt::Size aPageSize;
+     bool bWasCellRange = false;
+     ScRange aCellRange;
++    sc::excelpitch::PageTransform aA4LetterTransform;
++    bool bA4Letter = false;
+     if (lcl_renderSelectionToGraphic( bRenderToGraphic, aStatus))
+     {
+         bWasCellRange = true;
+@@ -2194,9 +2196,19 @@ uno::Sequence<beans::PropertyValue> SAL_CALL ScModelObj::getRenderer( sal_Int32
+ 
+         aPageSize.Width = convertTwipToMm100(aTwips.Width());
+         aPageSize.Height = convertTwipToMm100(aTwips.Height());
++
++        // an A4-declared Excel sheet in Letter mode: the page is laid out on A4 as before and the PDF export draws it scaled onto a Letter page (excelrowpitch.hxx)
++        if (sc::excelpitch::GetA4LetterPageTransform(pDocShell->GetDocument(), aPageSize.Width, aPageSize.Height, aA4LetterTransform))
++        {
++            bA4Letter = true;
++            aPageSize.Width = aA4LetterTransform.nPageWidth;
++            aPageSize.Height = aA4LetterTransform.nPageHeight;
++        }
+     }
+ 
+     tools::Long nPropCount = bWasCellRange ? 5 : 4;
++    if (bA4Letter)
++        ++nPropCount;
+     uno::Sequence<beans::PropertyValue> aSequence(nPropCount);
+     beans::PropertyValue* pArray = aSequence.getArray();
+     pArray[0].Name = SC_UNONAME_PAGESIZE;
+@@ -2224,6 +2236,14 @@ uno::Sequence<beans::PropertyValue> SAL_CALL ScModelObj::getRenderer( sal_Int32
+         pArray[4].Value <<= aCalcPagePos;
+     }
+ 
++    if (bA4Letter)
++    {
++        // scale, offset x, offset y, content width, content height (1/100 mm); read by filter/source/pdf/pdfexport.cxx
++        pArray[nPropCount - 1].Name = "ScWasmPageTransform";
++        pArray[nPropCount - 1].Value <<= uno::Sequence<double>{ aA4LetterTransform.fScale, aA4LetterTransform.fOffsetX, aA4LetterTransform.fOffsetY,
++                                                              static_cast<double>(aA4LetterTransform.nContentWidth), static_cast<double>(aA4LetterTransform.nContentHeight) };
++    }
++
+     if( ! pPrinterOptions )
+         pPrinterOptions.reset(new ScPrintUIOptions);
+     else
+diff --git a/vcl/inc/pdf/pdfwriter_impl.hxx b/vcl/inc/pdf/pdfwriter_impl.hxx
+index 7806a9aaa39d..1be3a1cdb1c5 100644
+--- a/vcl/inc/pdf/pdfwriter_impl.hxx
++++ b/vcl/inc/pdf/pdfwriter_impl.hxx
+@@ -109,6 +109,11 @@ struct PDFPage
+      * Typically 1, larger if page size is > 508 cm.
+      */
+     sal_Int32 m_nUserUnit;
++    // PDFWriter::SetPageTransform: the page's content is drawn through x' = scale * x + offset (top-down page coordinates in the writer's internal pixel units)
++    bool                        m_bPageTransform = false;
++    double                      m_fPageScale = 1.0;
++    double                      m_fPageOffsetXPx = 0.0;
++    double                      m_fPageOffsetYPx = 0.0;
+     PDFWriter::Orientation      m_eOrientation;
+     sal_Int32                   m_nPageObject;
+     std::vector<sal_Int32>      m_aStreamObjects;
+@@ -1138,6 +1143,7 @@ public:
+     void setFont( const Font& rFont );
+ 
+     void setMapMode( const MapMode& rMapMode );
++    void setPageTransform( double fScale, double fOffsetX, double fOffsetY );
+ 
+     const MapMode& getMapMode() { return m_aGraphicsStack.front().m_aMapMode; }
+ 
+diff --git a/vcl/source/gdi/pdfwriter.cxx b/vcl/source/gdi/pdfwriter.cxx
+index 20e3df5b2c36..90dbb9b494e7 100644
+--- a/vcl/source/gdi/pdfwriter.cxx
++++ b/vcl/source/gdi/pdfwriter.cxx
+@@ -239,6 +239,11 @@ void PDFWriter::SetMapMode( const MapMode& rMapMode )
+     xImplementation->setMapMode( rMapMode );
+ }
+ 
++void PDFWriter::SetPageTransform( double fScale, double fOffsetX, double fOffsetY )
++{
++    xImplementation->setPageTransform( fScale, fOffsetX, fOffsetY );
++}
++
+ void PDFWriter::SetLineColor( const Color& rColor )
+ {
+     xImplementation->setLineColor( rColor );
+diff --git a/vcl/source/gdi/pdfwriter_impl.cxx b/vcl/source/gdi/pdfwriter_impl.cxx
+index 1fd8f0ab4311..c03e37a37c66 100644
+--- a/vcl/source/gdi/pdfwriter_impl.cxx
++++ b/vcl/source/gdi/pdfwriter_impl.cxx
+@@ -73,6 +73,7 @@
+ #include <vcl/lineinfo.hxx>
+ #include <vcl/metric.hxx>
+ #include <vcl/mnemonic.hxx>
++#include <basegfx/numeric/ftools.hxx>
+ #include <vcl/pdfread.hxx>
+ #include <vcl/settings.hxx>
+ #include <strhelper.hxx>
+@@ -921,6 +922,14 @@ void PDFPage::convertRect( tools::Rectangle& rRect ) const
+     rRect.SetRight( aLL.X() + aSize.Width() );
+     rRect.SetTop( pointToPixel(getHeight()) - aLL.Y() );
+     rRect.SetBottom( rRect.Top() + aSize.Height() );
++    if( m_bPageTransform )
++    {
++        // annotation rectangles (links, destinations, notes) follow the content through the page transformation
++        rRect.SetLeft( basegfx::fround( m_fPageScale * rRect.Left() + m_fPageOffsetXPx ) );
++        rRect.SetRight( basegfx::fround( m_fPageScale * rRect.Right() + m_fPageOffsetXPx ) );
++        rRect.SetTop( basegfx::fround( m_fPageScale * rRect.Top() + m_fPageOffsetYPx ) );
++        rRect.SetBottom( basegfx::fround( m_fPageScale * rRect.Bottom() + m_fPageOffsetYPx ) );
++    }
+ }
+ 
+ void PDFPage::appendPolygon( const tools::Polygon& rPoly, OStringBuffer& rBuffer, bool bClose ) const
+@@ -1565,6 +1574,9 @@ void PDFWriterImpl::endPage()
+     // this should pop the PDF graphics stack if necessary
+     updateGraphicsState();
+ 
++    if( m_aPages.back().m_bPageTransform )
++        writeBuffer( "Q\n" );   // closes the page transformation (setPageTransform)
++
+     m_aPages.back().endStream();
+ 
+     // reset the default font
+@@ -10623,6 +10635,31 @@ void PDFWriterImpl::pop()
+     m_aGraphicsStack.front().m_nUpdateFlags = GraphicsStateUpdateFlags::All;
+ }
+ 
++void PDFWriterImpl::setPageTransform( double fScale, double fOffsetX, double fOffsetY )
++{
++    if( m_aPages.empty() || m_aPages.back().m_bPageTransform )
++        return;   // once per page, right after newPage
++    if( fScale == 1.0 && fOffsetX == 0.0 && fOffsetY == 0.0 )
++        return;
++    PDFPage& rPage = m_aPages.back();
++    const double fPt = 72.0 / 2540.0;                               // 1/100 mm -> points
++    const double fOffsetXPt = fOffsetX * fPt, fOffsetYPt = fOffsetY * fPt;
++    rPage.m_bPageTransform = true;
++    rPage.m_fPageScale = fScale;
++    rPage.m_fPageOffsetXPx = fOffsetXPt * fDivisor;
++    // the rectangles convertRect produces are in PDF user space (y up, from the bottom of the page): the same map as the matrix below, y' = s*y + H*(1-s) - oy
++    rPage.m_fPageOffsetYPx = ( rPage.m_nPageHeight * ( 1.0 - fScale ) - fOffsetYPt ) * fDivisor;
++    // user space is y-up: a point at top-down y of the laid-out page goes to  oy + s*y  from the top of THIS page
++    OStringBuffer aBuf( 128 );
++    aBuf.append( "q " );
++    appendDouble( fScale, aBuf, 8 );  aBuf.append( " 0 0 " );
++    appendDouble( fScale, aBuf, 8 );  aBuf.append( ' ' );
++    appendDouble( fOffsetXPt, aBuf, 4 );  aBuf.append( ' ' );
++    appendDouble( rPage.m_nPageHeight * ( 1.0 - fScale ) - fOffsetYPt, aBuf, 4 );
++    aBuf.append( " cm\n" );
++    writeBuffer( aBuf );
++}
++
+ void PDFWriterImpl::setMapMode( const MapMode& rMapMode )
+ {
+     m_aGraphicsStack.front().m_aMapMode = rMapMode;
