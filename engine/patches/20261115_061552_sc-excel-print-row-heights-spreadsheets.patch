@@ -1,0 +1,498 @@
+diff --git a/sc/Library_sc.mk b/sc/Library_sc.mk
+index 16306dd5d805..1f1c98b92c90 100644
+--- a/sc/Library_sc.mk
++++ b/sc/Library_sc.mk
+@@ -139,6 +139,7 @@ $(eval $(call gb_Library_add_exception_objects,sc,\
+     sc/source/core/data/document10 \
+     sc/source/core/data/documentimport \
+     sc/source/core/data/documentstreamaccess \
++    sc/source/core/data/excelrowpitch \
+     sc/source/core/data/dpdimsave \
+     sc/source/core/data/dpfilteredcache \
+     sc/source/core/data/dpglobal \
+diff --git a/sc/inc/excelrowpitch.hxx b/sc/inc/excelrowpitch.hxx
+new file mode 100644
+index 000000000000..31c52967e928
+--- /dev/null
++++ b/sc/inc/excelrowpitch.hxx
+@@ -0,0 +1,55 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++#pragma once
++
++#include "scdllapi.h"
++#include "types.hxx"
++
++#include <rtl/ustring.hxx>
++#include <sal/types.h>
++#include <utility>
++#include <vector>
++
++class ScDocument;
++
++// Row heights of an Excel workbook as Excel PRINTS them (a PDF conversion, BUG-81 sheet_rows). The Excel import records what it read per sheet
++// (SetSheetInfo); the print/PDF render path calls ApplyPrintRowHeights once before it lays pages out. Nothing happens unless the environment
++// variable LO_WASM_EXCEL_PRINT_ROWS is "1" (the bridge sets it for a PDF target only) and the document came from an Excel filter.
++namespace sc::excelpitch
++{
++enum class Kind : sal_uInt8
++{
++    Biff5,
++    Biff8,
++    Ooxml
++};
++
++struct SheetInfo
++{
++    Kind eKind = Kind::Ooxml;
++    OUString aNormalFont;                                    // BIFF: the font of the Normal style (XF 0); empty = read Calc's Default style
++    sal_Int32 nNormalHeightTwips = 0;
++    sal_Int32 nDefRowTwips = 0;                              // BIFF: DEFAULTROWHEIGHT
++    bool bDefRowFlag = false;                                // BIFF: its "height differs from the default font" flag
++    std::vector<std::pair<SCROW, SCROW>> aCustomRows;        // BIFF: rows whose own height is custom (sorted, inclusive ranges)
++    struct Run
++    {
++        SCROW nFirst;
++        SCROW nLast;
++        sal_uInt16 nTwips;
++    };
++    std::vector<Run> aStored;                                // BIFF: the heights as read, before any recomputation
++};
++
++SC_DLLPUBLIC void SetSheetInfo(const ScDocument& rDoc, SCTAB nTab, SheetInfo aInfo);
++SC_DLLPUBLIC void ApplyPrintRowHeights(ScDocument& rDoc);
++}
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/sc/source/core/data/excelrowpitch.cxx b/sc/source/core/data/excelrowpitch.cxx
+new file mode 100644
+index 000000000000..77aa84fc98bd
+--- /dev/null
++++ b/sc/source/core/data/excelrowpitch.cxx
+@@ -0,0 +1,316 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This file is part of the LibreOffice project.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++#include <excelrowpitch.hxx>
++
++#include <document.hxx>
++#include <docsh.hxx>
++#include <dociter.hxx>
++#include <patattr.hxx>
++#include <scitems.hxx>
++#include <attrib.hxx>
++#include <stlpool.hxx>
++#include <stlsheet.hxx>
++#include <globstr.hrc>
++#include <scresid.hxx>
++
++#include <editeng/fontitem.hxx>
++#include <editeng/fhgtitem.hxx>
++#include <sfx2/docfile.hxx>
++#include <sfx2/docfilt.hxx>
++#include <sal/log.hxx>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdlib>
++#include <map>
++
++// BUG-81 (sheet_rows): the references are Excel's PDF export through "Microsoft Print to PDF" (600 dpi), whose row pitch is not the row height the screen shows
++// (Arial 10, RowHeight 12.75 pt, prints 12.36 pt) and is a whole number of 1/600 inch. Measured on the oracle (set of 580 synthetic files x 2 formats, custom heights,
++// wrapped rows, mixed fonts, 284 corpus cases):
++//   path 1  a row at the sheet's default height (no font taller than the Normal style's): the printed pitch of the Normal font (table);
++//   path 2  any other row (a taller font, wrapped lines, a custom height): floor(px x 6.059 + 0.15) units, px = the screen height in 96-dpi pixels.
++// Excel recomputes non-custom rows from the fonts (a stored height is ignored), except that a BIFF file's own default row height is kept when it equals the stored
++// height and is below the Normal's or marked.
++namespace sc::excelpitch
++{
++namespace
++{
++struct FontRows
++{
++    const char* pName;
++    sal_uInt8 aPx[29];       // screen row height in pixels for 6, 6.5 ... 20 pt
++    sal_uInt16 aUnits[29];   // printed pitch of a default row in 1/600 inch
++};
++
++    // font -> Excel's screen row height in 96-dpi pixels and the printed default-row pitch in 1/600 inch, for 6 to 20 pt in 0.5 pt steps (the oracle's measurements)
++    const FontRows aFontRows[] = {
++        { "arial", { 11, 12, 12, 13, 15, 15, 16, 17, 17, 18, 19, 19, 20, 22, 22, 23, 24, 24, 25, 27, 27, 28, 29, 29, 31, 31, 31, 33, 34 },
++          { 67, 71, 76, 81, 85, 90, 93, 99, 103, 110, 114, 118, 123, 127, 132, 138, 143, 148, 151, 156, 161, 168, 171, 176, 181, 185, 189, 194, 200 } },
++        { "calibri", { 11, 12, 12, 13, 15, 15, 16, 17, 17, 19, 20, 20, 21, 23, 23, 24, 25, 25, 26, 28, 28, 29, 30, 30, 31, 33, 33, 34, 35 },
++          { 69, 74, 79, 85, 90, 95, 99, 104, 109, 116, 121, 125, 130, 135, 140, 146, 150, 155, 161, 166, 171, 176, 181, 186, 191, 196, 200, 207, 212 } },
++        { "cambria", { 11, 12, 12, 13, 14, 14, 16, 17, 17, 18, 19, 19, 21, 22, 22, 23, 24, 24, 25, 27, 27, 28, 29, 29, 30, 32, 32, 33, 34 },
++          { 67, 71, 76, 82, 87, 91, 96, 101, 105, 112, 115, 120, 125, 130, 135, 140, 145, 150, 155, 160, 164, 170, 175, 179, 184, 188, 193, 199, 204 } },
++        { "comic sans ms", { 11, 12, 12, 13, 17, 17, 19, 20, 20, 21, 22, 22, 26, 27, 27, 26, 28, 28, 31, 32, 32, 33, 33, 33, 36, 37, 37, 39, 42 },
++          { 85, 90, 95, 101, 111, 116, 121, 128, 133, 140, 147, 154, 159, 162, 171, 178, 183, 190, 195, 201, 206, 214, 221, 227, 234, 239, 244, 251, 256 } },
++        { "courier new", { 11, 12, 12, 13, 15, 15, 16, 18, 18, 19, 20, 20, 21, 23, 23, 24, 25, 25, 26, 28, 28, 29, 30, 30, 32, 33, 33, 34, 35 },
++          { 61, 67, 70, 76, 79, 84, 88, 93, 96, 103, 107, 111, 115, 118, 124, 128, 133, 138, 143, 146, 151, 156, 160, 164, 167, 174, 177, 184, 187 } },
++        { "segoe ui", { 11, 12, 12, 13, 14, 14, 16, 19, 19, 21, 22, 22, 23, 25, 25, 28, 27, 27, 32, 34, 34, 33, 34, 34, 35, 39, 39, 40, 41 },
++          { 79, 84, 89, 99, 102, 107, 114, 119, 124, 130, 138, 143, 148, 155, 162, 166, 171, 178, 183, 188, 192, 201, 208, 211, 218, 223, 228, 236, 241 } },
++        { "tahoma", { 11, 12, 12, 13, 14, 14, 15, 17, 17, 18, 19, 19, 20, 22, 22, 23, 24, 24, 25, 26, 26, 28, 29, 29, 30, 31, 31, 32, 34 },
++          { 68, 73, 78, 84, 89, 94, 98, 103, 108, 114, 119, 124, 129, 133, 138, 144, 149, 154, 159, 164, 168, 175, 179, 184, 189, 194, 199, 205, 209 } },
++        { "times new roman", { 11, 12, 12, 13, 15, 15, 16, 17, 17, 18, 20, 20, 21, 22, 22, 23, 25, 25, 26, 27, 27, 28, 30, 30, 31, 32, 32, 33, 35 },
++          { 67, 71, 77, 82, 87, 92, 96, 101, 106, 112, 116, 121, 126, 130, 136, 141, 145, 150, 155, 159, 165, 170, 174, 179, 184, 187, 192, 198, 203 } },
++        { "trebuchet ms", { 11, 12, 12, 13, 18, 18, 20, 20, 20, 19, 22, 22, 24, 24, 24, 24, 25, 25, 27, 28, 28, 29, 30, 30, 31, 33, 33, 34, 37 },
++          { 71, 75, 78, 87, 92, 97, 103, 106, 113, 118, 124, 127, 133, 138, 142, 148, 154, 160, 165, 169, 174, 181, 185, 190, 195, 200, 206, 211, 216 } },
++        { "verdana", { 11, 12, 12, 13, 14, 14, 15, 17, 17, 18, 19, 19, 20, 21, 21, 23, 24, 24, 27, 26, 26, 27, 29, 29, 30, 33, 33, 34, 33 },
++          { 68, 73, 80, 84, 88, 93, 100, 103, 108, 114, 122, 124, 129, 134, 141, 147, 150, 154, 159, 166, 169, 175, 180, 186, 189, 196, 199, 207, 210 } },
++    };
++
++struct Alias
++{
++    const char* pName;
++    int nFont;
++};
++
++// index into aFontRows: 0 arial 1 calibri 2 cambria 3 comic sans ms 4 courier new 5 segoe ui 6 tahoma 7 times new roman 8 trebuchet ms 9 verdana
++const Alias aAliases[] = {
++    { "arial", 0 },           { "helvetica", 0 },     { "helv", 0 },           { "ms sans serif", 0 },  { "liberation sans", 0 },  { "arimo", 0 },
++    { "geneva", 0 },          // the classic Mac UI font: Excel on Windows draws it as Arial (oracle: Geneva 9 prints the Arial 9 pitch)
++    { "calibri", 1 },         { "carlito", 1 },
++    { "cambria", 2 },         { "caladea", 2 },
++    { "comic sans ms", 3 },
++    { "courier new", 4 },     { "courier", 4 },       { "monaco", 4 },       { "liberation mono", 4 }, { "cousine", 4 },
++    { "segoe ui", 5 },
++    { "tahoma", 6 },
++    { "times new roman", 7 }, { "times", 7 },         { "tms rmn", 7 },        { "new york", 7 },        { "liberation serif", 7 }, { "tinos", 7 },
++    { "trebuchet ms", 8 },
++    { "verdana", 9 },
++};
++
++struct Metrics
++{
++    int nPx;
++    int nUnits;
++};
++
++bool lookupFont(const OUString& rName, double fPt, Metrics& rOut)
++{
++    int nFont = -1;
++    for (const Alias& rAlias : aAliases)
++        if (rName.equalsIgnoreAsciiCaseAscii(rAlias.pName))
++        {
++            nFont = rAlias.nFont;
++            break;
++        }
++    if (nFont < 0 || fPt < 5.75 || fPt > 20.25)
++        return false;
++    const int nIdx = std::clamp(static_cast<int>(std::lround((fPt - 6.0) * 2.0)), 0, 28);
++    rOut.nPx = aFontRows[nFont].aPx[nIdx];
++    rOut.nUnits = aFontRows[nFont].aUnits[nIdx];
++    return true;
++}
++
++// printed units of a row whose screen height is nPx pixels (custom rows, taller fonts, wrapped lines)
++int path2Units(int nPx) { return static_cast<int>(std::floor(nPx * 6.059 + 0.15)); }
++
++// the printed pitch Calc's PDF export gives a row of h twips (measured: a pitch 0.2% short of the twips asked for)
++constexpr double kTwipsPerUnit = 72.0 * 20.0 / 600.0;   // 2.4
++constexpr double kPrintScaleCompensation = 1.001;
++
++sal_uInt16 unitsToTwips(int nUnits) { return static_cast<sal_uInt16>(std::lround(nUnits * kTwipsPerUnit * kPrintScaleCompensation)); }
++
++std::map<std::pair<const ScDocument*, SCTAB>, SheetInfo>& infos()
++{
++    static std::map<std::pair<const ScDocument*, SCTAB>, SheetInfo> aInfos;
++    return aInfos;
++}
++
++bool isExcelDocument(ScDocument& rDoc)
++{
++    ScDocShell* pShell = rDoc.GetDocumentShell();
++    SfxMedium* pMedium = pShell ? pShell->GetMedium() : nullptr;
++    std::shared_ptr<const SfxFilter> xFilter = pMedium ? pMedium->GetFilter() : nullptr;
++    return xFilter && xFilter->GetFilterName().indexOf("Excel") >= 0;
++}
++
++bool inRanges(const std::vector<std::pair<SCROW, SCROW>>& rRanges, SCROW nRow)
++{
++    auto it = std::upper_bound(rRanges.begin(), rRanges.end(), nRow, [](SCROW n, const std::pair<SCROW, SCROW>& r) { return n < r.first; });
++    return it != rRanges.begin() && nRow <= std::prev(it)->second;
++}
++
++sal_uInt16 storedTwips(ScDocument& rDoc, SCTAB nTab, const SheetInfo& rInfo, SCROW nRow)
++{
++    if (rInfo.eKind == Kind::Ooxml || rInfo.aStored.empty())
++        return rDoc.GetRowHeight(nRow, nTab, false);
++    auto it = std::upper_bound(rInfo.aStored.begin(), rInfo.aStored.end(), nRow, [](SCROW n, const SheetInfo::Run& r) { return n < r.nFirst; });
++    if (it != rInfo.aStored.begin() && nRow <= std::prev(it)->nLast)
++        return std::prev(it)->nTwips;
++    return static_cast<sal_uInt16>(rInfo.nDefRowTwips);
++}
++
++struct Context
++{
++    Kind eKind;
++    int nNormalPx;
++    int nNormalUnits;
++    int nDefPx;
++    bool bDefFlag;
++};
++
++// the printed units of an AUTO (non-custom) row: nStoredPx = the height the file gave it, nFontPx = the tallest font of its cells (0 = no cell), bWrap = a cell wraps
++int autoRowUnits(const Context& rCtx, int nStoredPx, int nFontPx, bool bWrap)
++{
++    bool bKept = false;
++    int nFloor = rCtx.nNormalPx;
++    if (rCtx.eKind != Kind::Ooxml && nStoredPx == rCtx.nDefPx && rCtx.nDefPx != rCtx.nNormalPx && (rCtx.nDefPx < rCtx.nNormalPx || rCtx.bDefFlag))
++    {
++        bKept = true;   // a BIFF file's own default row height: honoured when it is below the Normal's or marked
++        nFloor = rCtx.nDefPx;
++    }
++    const int nTall = std::max(nFloor, nFontPx);
++    int nLines = 1;
++    if (bWrap)
++        nLines = std::max(1, static_cast<int>(std::lround(static_cast<double>(nStoredPx) / nTall)));
++    if (!bKept && nTall == rCtx.nNormalPx && nLines == 1)
++        return rCtx.nNormalUnits;
++    return path2Units(nLines * nTall);
++}
++
++void applySheet(ScDocument& rDoc, SCTAB nTab, const SheetInfo& rInfo)
++{
++    // the Normal style's font: from the file for BIFF (Calc's Default style does not take it), from the Default style for OOXML
++    Metrics aNormal;
++    if (!rInfo.aNormalFont.isEmpty() && rInfo.nNormalHeightTwips > 0)
++    {
++        if (!lookupFont(rInfo.aNormalFont, rInfo.nNormalHeightTwips / 20.0, aNormal))
++            return;
++    }
++    else
++    {
++        ScStyleSheetPool* pPool = rDoc.GetStyleSheetPool();
++        SfxStyleSheetBase* pStyle = pPool ? pPool->Find(ScResId(STR_STYLENAME_STANDARD), SfxStyleFamily::Para) : nullptr;
++        if (!pStyle)
++            return;
++        const SfxItemSet& rStyleSet = pStyle->GetItemSet();
++        if (!lookupFont(rStyleSet.Get(ATTR_FONT).GetFamilyName(), rStyleSet.Get(ATTR_FONT_HEIGHT).GetHeight() / 20.0, aNormal))
++            return;   // a Normal font outside the measured table: this sheet keeps the heights it has
++    }
++    Context aCtx{ rInfo.eKind, aNormal.nPx, aNormal.nUnits, static_cast<int>(std::lround(rInfo.nDefRowTwips / 15.0)), rInfo.bDefRowFlag };
++
++    SCCOL nEndCol = 0;
++    SCROW nEndRow = 0;
++    const bool bData = rDoc.GetCellArea(nTab, nEndCol, nEndRow);
++    std::vector<sal_uInt8> aFontPx;     // tallest cell font per row (0 = none), 255 = a font outside the table
++    std::vector<bool> aWrap;
++    if (bData)
++    {
++        aFontPx.assign(nEndRow + 1, 0);
++        aWrap.assign(nEndRow + 1, false);
++        ScCellIterator aIter(rDoc, ScRange(0, 0, nTab, nEndCol, nEndRow, nTab));
++        for (bool b = aIter.first(); b; b = aIter.next())
++        {
++            const SCROW nRow = aIter.GetPos().Row();
++            const ScPatternAttr* pPattern = rDoc.GetPattern(aIter.GetPos());
++            if (!pPattern || nRow < 0 || nRow > nEndRow)
++                continue;
++            Metrics aM;
++            if (!lookupFont(pPattern->GetItem(ATTR_FONT).GetFamilyName(), pPattern->GetItem(ATTR_FONT_HEIGHT).GetHeight() / 20.0, aM))
++                aFontPx[nRow] = 255;
++            else if (aFontPx[nRow] != 255)
++                aFontPx[nRow] = static_cast<sal_uInt8>(std::max<int>(aFontPx[nRow], aM.nPx));
++            if (pPattern->GetItem(ATTR_LINEBREAK).GetValue())
++                aWrap[nRow] = true;
++        }
++    }
++
++    const SCROW nMaxRow = rDoc.MaxRow();
++    const SCROW nLastWork = bData ? nEndRow : -1;   // rows past the data all take the sheet's default: one call below
++    SCROW nRunStart = 0;
++    sal_uInt16 nRunTwips = 0;
++    bool bRun = false;
++    auto flush = [&](SCROW nLast) {
++        if (bRun && nRunTwips)
++            rDoc.SetRowHeightOnly(nRunStart, nLast, nTab, nRunTwips);
++        bRun = false;
++    };
++    for (SCROW nRow = 0; nRow <= nLastWork; ++nRow)
++    {
++        sal_uInt16 nTwips = 0;   // 0 = leave the row as it is
++        if (!rDoc.RowHidden(nRow, nTab))
++        {
++            const sal_uInt16 nStored = storedTwips(rDoc, nTab, rInfo, nRow);
++            const bool bCustom = rInfo.eKind == Kind::Ooxml ? (rDoc.GetRowFlags(nRow, nTab) & CRFlags::ManualSize) != CRFlags::NONE : inRanges(rInfo.aCustomRows, nRow);
++            const int nStoredPx = static_cast<int>(std::lround(nStored / 15.0));
++            if (bCustom)
++                nTwips = unitsToTwips(path2Units(nStoredPx));
++            else if (aFontPx[nRow] != 255)
++                nTwips = unitsToTwips(autoRowUnits(aCtx, nStoredPx, aFontPx[nRow], aWrap[nRow]));
++        }
++        if (bRun && nTwips == nRunTwips && nRow > 0)
++            continue;
++        flush(nRow - 1);
++        if (nTwips)
++        {
++            nRunStart = nRow;
++            nRunTwips = nTwips;
++            bRun = true;
++        }
++    }
++    flush(nLastWork);
++    if (nLastWork < nMaxRow)
++    {
++        const SCROW nFirst = nLastWork + 1;
++        const bool bCustom = rInfo.eKind == Kind::Ooxml ? (rDoc.GetRowFlags(nFirst, nTab) & CRFlags::ManualSize) != CRFlags::NONE : inRanges(rInfo.aCustomRows, nFirst);
++        const int nStoredPx = static_cast<int>(std::lround(storedTwips(rDoc, nTab, rInfo, nFirst) / 15.0));
++        rDoc.SetRowHeightOnly(nFirst, nMaxRow, nTab, unitsToTwips(bCustom ? path2Units(nStoredPx) : autoRowUnits(aCtx, nStoredPx, 0, false)));
++    }
++}
++}
++
++void SetSheetInfo(const ScDocument& rDoc, SCTAB nTab, SheetInfo aInfo)
++{
++    // Only a conversion that will print through this rule records anything (the bridge sets the variable before the load): a reused engine must not
++    // accumulate the stored heights of every non-PDF conversion, and the map is keyed by a document ADDRESS that a later document can reuse.
++    const char* pEnv = std::getenv("LO_WASM_EXCEL_PRINT_ROWS");
++    if (!pEnv || pEnv[0] != '1')
++        return;
++    static const ScDocument* pLastDoc = nullptr;
++    if (&rDoc != pLastDoc || nTab == 0)
++    {
++        infos().clear();   // a new document, or a new import at an address an earlier document had: nothing of an earlier one survives
++        pLastDoc = &rDoc;
++    }
++    infos()[{ &rDoc, nTab }] = std::move(aInfo);
++}
++
++void ApplyPrintRowHeights(ScDocument& rDoc)
++{
++    const char* pEnv = std::getenv("LO_WASM_EXCEL_PRINT_ROWS");
++    auto& rInfos = infos();
++    if (!pEnv || pEnv[0] != '1' || !isExcelDocument(rDoc))
++    {
++        for (auto it = rInfos.begin(); it != rInfos.end();)
++            it = (it->first.first == &rDoc) ? rInfos.erase(it) : std::next(it);
++        return;
++    }
++    const SCTAB nTabs = rDoc.GetTableCount();
++    for (SCTAB nTab = 0; nTab < nTabs; ++nTab)
++    {
++        auto it = rInfos.find({ &rDoc, nTab });
++        if (it == rInfos.end())
++            continue;
++        applySheet(rDoc, nTab, it->second);
++        rInfos.erase(it);   // once per document: a second call (a second render of the same document) must not apply it again
++    }
++}
++}
++
++/* vim:set shiftwidth=4 softtabstop=4 expandtab: */
+diff --git a/sc/source/filter/excel/colrowst.cxx b/sc/source/filter/excel/colrowst.cxx
+index 29e3e46452c6..c883c35e3083 100644
+--- a/sc/source/filter/excel/colrowst.cxx
++++ b/sc/source/filter/excel/colrowst.cxx
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include <colrowst.hxx>
++#include <excelrowpitch.hxx>
+ 
+ #include <document.hxx>
+ #include <ftools.hxx>
+@@ -218,6 +219,17 @@ void XclImpColRowSettings::Convert( SCTAB nScTab )
+     if (!maRowHeights.valid_tree())
+         return;
+ 
++    // BUG-81: what the file said about its row heights, for the print-time Excel row model (sc/source/core/data/excelrowpitch.cxx)
++    sc::excelpitch::SheetInfo aPitchInfo;
++    aPitchInfo.eKind = GetBiff() >= EXC_BIFF8 ? sc::excelpitch::Kind::Biff8 : sc::excelpitch::Kind::Biff5;
++    aPitchInfo.nDefRowTwips = mnDefHeight;
++    if (const XclImpFont* pNormalFont = GetXFBuffer().GetFont(0))   // the Normal style's font: Calc's Default style does not take it
++    {
++        aPitchInfo.aNormalFont = pNormalFont->GetFontData().maName;
++        aPitchInfo.nNormalHeightTwips = pNormalFont->GetFontData().mnHeight;
++    }
++    aPitchInfo.bDefRowFlag = ::get_flag( mnDefRowFlags, EXC_DEFROW_UNSYNCED );
++
+     SCROW nPrevRow = -1;
+     ExcColRowFlags nPrevFlags = ExcColRowFlags::NONE;
+     for (const auto [nRow, nFlags] : maRowFlags)
+@@ -253,7 +265,13 @@ void XclImpColRowSettings::Convert( SCTAB nScTab )
+                 }
+ 
+                 if (nPrevFlags & ExcColRowFlags::Man)
++                {
+                     rDoc.SetManualHeight(nPrevRow, nRow-1, nScTab, true);
++                    if (!aPitchInfo.aCustomRows.empty() && aPitchInfo.aCustomRows.back().second + 1 == nPrevRow)
++                        aPitchInfo.aCustomRows.back().second = nRow - 1;
++                    else
++                        aPitchInfo.aCustomRows.emplace_back(nPrevRow, nRow - 1);
++                }
+             }
+             else
+             {
+@@ -266,6 +284,16 @@ void XclImpColRowSettings::Convert( SCTAB nScTab )
+         nPrevFlags = nFlags;
+     }
+ 
++    // the heights as read (before the BIFF5 optimal-height pass or anything else changes them), as runs
++    for (SCROW nRow = 0; nRow <= rDoc.MaxRow();)
++    {
++        SCROW nStart = nRow, nEnd = nRow;
++        const sal_uInt16 nTwips = rDoc.GetRowHeight(nRow, nScTab, &nStart, &nEnd, false);
++        aPitchInfo.aStored.push_back({ nRow, nEnd, nTwips });
++        nRow = nEnd + 1;
++    }
++    sc::excelpitch::SetSheetInfo(rDoc, nScTab, std::move(aPitchInfo));
++
+     mbDirty = false;
+ }
+ 
+diff --git a/sc/source/filter/oox/worksheethelper.cxx b/sc/source/filter/oox/worksheethelper.cxx
+index 276c6780e3e9..c58db7ef86ff 100644
+--- a/sc/source/filter/oox/worksheethelper.cxx
++++ b/sc/source/filter/oox/worksheethelper.cxx
+@@ -21,6 +21,7 @@
+ #include <memory>
+ #include <utility>
+ #include <worksheethelper.hxx>
++#include <excelrowpitch.hxx>
+ 
+ #include <algorithm>
+ #include <com/sun/star/awt/Point.hpp>
+@@ -982,6 +983,7 @@ void WorksheetGlobals::finalizeWorksheetImport()
+     ScTable* pTable = rDoc.FetchTable(nTab);
+     if (pTable)
+         pTable->SetOptimalMinRowHeight(maDefRowModel.mfHeight * 20); // in TWIPS
++    sc::excelpitch::SetSheetInfo(rDoc, nTab, sc::excelpitch::SheetInfo());   // BUG-81: an OOXML sheet: its heights are read from the document at print time
+ 
+     ScDBData* pDBData = rDoc.GetAnonymousDBData(nTab);
+     if (pDBData && pDBData->HasAutoFilter())
+diff --git a/sc/source/ui/unoobj/docuno.cxx b/sc/source/ui/unoobj/docuno.cxx
+index 6763b6ecb414..073f05bd8b66 100644
+--- a/sc/source/ui/unoobj/docuno.cxx
++++ b/sc/source/ui/unoobj/docuno.cxx
+@@ -99,6 +99,7 @@
+ #include <docoptio.hxx>
+ #include <docsh.hxx>
+ #include <docuno.hxx>
++#include <excelrowpitch.hxx>
+ #include <drwlayer.hxx>
+ #include <forbiuno.hxx>
+ #include <formulagroup.hxx>
+@@ -1866,6 +1867,9 @@ sal_Int32 SAL_CALL ScModelObj::getRendererCount(const uno::Any& aSelection,
+                 static_cast< sheet::XSpreadsheetDocument* >(this) );
+     }
+ 
++    // BUG-81: an Excel workbook printed to PDF gets the row heights Excel prints (once, before the pages are laid out; a no-op unless the bridge asked for it)
++    sc::excelpitch::ApplyPrintRowHeights(*GetDocument());
++
+     ScMarkData aMark(GetDocument()->GetSheetLimits());
+     ScPrintSelectionStatus aStatus;
+     OUString aPagesStr;

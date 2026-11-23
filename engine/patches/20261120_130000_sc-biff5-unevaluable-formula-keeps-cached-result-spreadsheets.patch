@@ -1,0 +1,157 @@
+diff --git a/sc/source/filter/excel/excform.cxx b/sc/source/filter/excel/excform.cxx
+index e9e59b5fe6da..3f45fdd8f9c8 100644
+--- a/sc/source/filter/excel/excform.cxx
++++ b/sc/source/filter/excel/excform.cxx
+@@ -103,6 +103,12 @@ void ImportExcel::Formula(
+         // Conversion failed.
+         return;
+ 
++    // BUG-90: where the last FORMULA record is, so that a STRING record after it can be applied
++    maLastFormulaPos = aScPos;
++    mfLastFormulaValue = fCurVal;
++    mbLastFormulaPosValid = true;
++    mbExtStringPending = false;
++
+     // Formula will be read next, length in nFormLen
+     std::unique_ptr<ScTokenArray> pResult;
+ 
+@@ -147,6 +153,27 @@ void ImportExcel::Formula(
+ 
+     ScFormulaCell* pCell = nullptr;
+ 
++    if (pResult && pResult->HasOpCode(ocBad))
++    {
++        // BUG-90: a formula that cannot be evaluated (a reference into another workbook whose file is not there is ocBad): Calc would recalculate it to #NAME?, where
++        // Excel shows the value the file stored. Keep that value as a constant: a number here, a string when its STRING record arrives.
++        if (std::isfinite(fCurVal))
++            rDoc.setNumericCell(aScPos, fCurVal);
++        else
++            mbExtStringPending = true;
++        GetXFRangeBuffer().SetXF(aScPos, nXF);
++        return;
++    }
++
++    if (!pResult && IsInUnresolvedArray(aScPos))
++    {
++        // a member of an array formula that was not made into a matrix (below): its cached number, its string comes with its STRING record
++        if (std::isfinite(fCurVal))
++            rDoc.setNumericCell(aScPos, fCurVal);
++        GetXFRangeBuffer().SetXF(aScPos, nXF);
++        return;
++    }
++
+     if (pResult)
+     {
+         pCell = new ScFormulaCell(rDoc.getDoc(), aScPos, std::move(pResult));
+@@ -176,6 +203,27 @@ void ImportExcel::Formula(
+     GetXFRangeBuffer().SetXF(aScPos, nXF);
+ }
+ 
++bool ImportExcel::IsInUnresolvedArray( const ScAddress& rPos ) const
++{
++    for (const ScRange& rRange : maUnresolvedArrays)
++        if (rRange.Contains(rPos))
++            return true;
++    return false;
++}
++
++// STRING (BIFF3 to BIFF5): the cached string result of the FORMULA record before it. Only a formula that could not be evaluated (BUG-90) keeps it: every other formula
++// recalculates, as before.
++void ImportExcel::FormulaString25()
++{
++    if (!mbLastFormulaPosValid)
++        return;
++    if (!mbExtStringPending && !IsInUnresolvedArray(maLastFormulaPos))
++        return;
++    const OUString aString = aIn.ReadByteString( true );
++    GetDocImport().setStringCell(maLastFormulaPos, aString);
++    mbExtStringPending = false;
++}
++
+ ExcelToSc::ExcelToSc( XclImpRoot& rRoot ) :
+     ExcelConverterBase(rRoot.GetDocImport().getDoc().GetSharedStringPool()),
+     XclImpRoot( rRoot ),
+diff --git a/sc/source/filter/excel/impop.cxx b/sc/source/filter/excel/impop.cxx
+index 93aa4b39719c..5c6181cf6fe0 100644
+--- a/sc/source/filter/excel/impop.cxx
++++ b/sc/source/filter/excel/impop.cxx
+@@ -507,6 +507,18 @@ void ImportExcel::Columndefault()
+     }
+ }
+ 
++// BUG-90: an array formula that cannot be evaluated (ocBad: an external reference whose file is not there) is not made into a matrix, which would show #NAME? in every cell; the
++// cells keep the results the file cached (the FORMULA numbers at their records, the STRING records as they come). BIFF5 reads its ARRAY records BEFORE the cells (the prefetch
++// pass), so nothing is set here: the range is only remembered.
++void ImportExcel::DropUnresolvedArray( std::unique_ptr<ScTokenArray>& pResult, const ScRange& rRange )
++{
++    if (pResult && pResult->HasOpCode(ocBad))
++    {
++        maUnresolvedArrays.push_back(rRange);
++        pResult.reset();
++    }
++}
++
+ void ImportExcel::Array25()
+ {
+     sal_uInt16 nFormLen;
+@@ -539,6 +551,8 @@ void ImportExcel::Array25()
+         SAL_WARN_IF(!pResult, "sc", "*ImportExcel::Array25(): ScTokenArray is NULL!");
+     }
+ 
++    DropUnresolvedArray( pResult, ScRange(nFirstCol, nFirstRow, GetCurrScTab(), nLastCol, nLastRow, GetCurrScTab()) );
++
+     if (pResult)
+     {
+         ScDocumentImport& rDoc = GetDocImport();
+@@ -1084,6 +1098,8 @@ void ImportExcel::Array34()
+         SAL_WARN_IF(!pResult, "sc", "+ImportExcel::Array34(): ScTokenArray is NULL!");
+     }
+ 
++    DropUnresolvedArray( pResult, ScRange(nFirstCol, nFirstRow, GetCurrScTab(), nLastCol, nLastRow, GetCurrScTab()) );
++
+     if (pResult)
+     {
+         ScDocumentImport& rDoc = GetDocImport();
+diff --git a/sc/source/filter/excel/read.cxx b/sc/source/filter/excel/read.cxx
+index 708aa7a34df1..647dc17da129 100644
+--- a/sc/source/filter/excel/read.cxx
++++ b/sc/source/filter/excel/read.cxx
+@@ -681,6 +681,7 @@ ErrCode ImportExcel::Read()
+                     case EXC_ID3_FORMULA:
+                     case EXC_ID4_FORMULA:       Formula25(); break;
+                     case EXC_ID_SHRFMLA: Shrfmla(); break;
++                    case 0x0207: FormulaString25(); break;   // STRING: the cached string result of the FORMULA before it
+                     case 0x0A:  Eof(); eCurrent = Z_Biff5E;                 break;
+                     case 0x14:
+                     case 0x15:  rPageSett.ReadHeaderFooter( maStrm );   break;
+diff --git a/sc/source/filter/inc/imp_op.hxx b/sc/source/filter/inc/imp_op.hxx
+index 398ae11827b0..4e6820618957 100644
+--- a/sc/source/filter/inc/imp_op.hxx
++++ b/sc/source/filter/inc/imp_op.hxx
+@@ -20,6 +20,7 @@
+ #pragma once
+ 
+ #include <sal/types.h>
++#include <address.hxx>
+ #include "xiroot.hxx"
+ #include "xistream.hxx"
+ #include "ftools.hxx"
+@@ -104,6 +105,18 @@ protected:
+     LastFormulaMapType maLastFormulaCells; // Keep track of last formula cells in each column.
+     LastFormula* mpLastFormula;
+ 
++    // BUG-90: a formula the importer cannot turn into something computable (an external-workbook reference whose file is not there: ocBad) keeps what the FILE stored
++    // for it, instead of recalculating to #NAME?: a number is set as a constant at its FORMULA record; a string arrives in the STRING record (0x0207) that follows the FORMULA
++    // (and, for an array, its ARRAY record), so the position of the last FORMULA record is kept and the STRING record is applied to it.
++    ScAddress               maLastFormulaPos;
++    bool                    mbLastFormulaPosValid = false;
++    double                  mfLastFormulaValue = 0.0;
++    bool                    mbExtStringPending = false;   /// the last FORMULA was unevaluable (ocBad) with a non-numeric cached result
++    std::vector<ScRange>    maUnresolvedArrays;           /// array ranges whose formula was unevaluable: no matrix is made, the cells get their cached results
++    bool                    IsInUnresolvedArray( const ScAddress& rPos ) const;
++    void                    DropUnresolvedArray( std::unique_ptr<ScTokenArray>& pResult, const ScRange& rRange );
++    void                    FormulaString25();            /// STRING record (BIFF3-5), after a FORMULA record  (0x0207)
++
+     sal_Int16               mnLastRefIdx;
+     sal_uInt16              mnIxfeIndex;        /// Current XF identifier from IXFE record.
+     sal_uInt16 mnLastRecId;
