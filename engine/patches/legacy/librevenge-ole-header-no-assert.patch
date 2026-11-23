@@ -1,0 +1,36 @@
+librevenge: an OLE header whose block shift is out of range must be refused, not asserted on (FF-6 option C).
+
+RVNGOLEStream.cpp: Header::load() clamps the 16-bit shifts from the file to 31, and compute_block_size() then did assert(shift < 31): a header with a
+shift of 31 or more (any hostile OLE2 file) aborted the process in a build without NDEBUG, and shifted by 31 in one with it. valid() already rejects
+such a header (shift_bbat >= 31), but only after compute_block_size(). Now compute_block_size() leaves both sizes at 0 for an out-of-range shift and
+valid() refuses first, before any division by them. Found by seeded mutation of real legacy files on the standalone legacy module (3 of 3 aborts).
+Upstream candidate for the owner: upstream-issues/librevenge-ole-header-shift-assert.md.
+
+--- a/src/lib/RVNGOLEStream.cpp	2026-11-08 23:58:16.582540706 +0000
++++ b/src/lib/RVNGOLEStream.cpp	2026-11-08 23:58:16.584699074 +0000
+@@ -128,8 +128,14 @@
+ 	Header();
+ 	void compute_block_size()
+ 	{
+-		assert(m_shift_bbat < 31);
+-		assert(m_shift_sbat < 31);
++		// A header from a file can carry any shift (load() clamps it to 31): a shift of 31 or more is not a valid OLE
++		// header and valid() rejects it, so do not abort on it (assert) and do not shift by it.
++		if (m_shift_bbat >= 31 || m_shift_sbat >= 31)
++		{
++			m_size_bbat = 0;
++			m_size_sbat = 0;
++			return;
++		}
+ 		m_size_bbat = 1 << m_shift_bbat;
+ 		m_size_sbat = 1 << m_shift_sbat;
+ 	}
+@@ -753,6 +759,8 @@
+ 
+ bool librevenge::Header::valid(const unsigned long fileSize) const
+ {
++	// compute_block_size() leaves the sizes at 0 for a shift out of range: refuse before any division by them
++	if (m_shift_bbat >= 31 || m_shift_sbat >= 31 || m_size_bbat == 0 || m_size_sbat == 0) return false;
+ 	if (m_threshold != 4096) return false;
+ 	// there must be at least the header, one bat sector and one dirent sector in the file
+ 	if ((fileSize / m_size_bbat) < 3) return false;

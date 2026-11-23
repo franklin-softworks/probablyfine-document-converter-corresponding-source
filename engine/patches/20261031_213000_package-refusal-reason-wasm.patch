@@ -1,0 +1,52 @@
+FG-021: leave the reason a package refusal in the environment so the bridge can report it (wasm).
+
+LibreOffice's package layer reports any failure of the encrypted read as a wrong password
+(ZipFile::getDataStream catches uno::Exception and throws WrongPasswordException), so a file
+refused by the PBKDF2 iteration-count cap (odf-pbkdf2-iteration-cap.patch) reached the user as
+"wrong password" and a fresh password prompt. When the cap refuses, record
+LO_WASM_PACKAGE_REFUSAL=pbkdf2-iteration-count=<n> or derived-key-size=<n> in the process environment. The bridge clears
+it before each load and reports ENCRYPTION_REFUSED when it is set after a failed load
+(engine/bridge/wasm_bridge.cpp). Wasm only: upstream gets the cap patch alone.
+
+diff --git a/package/source/zipapi/ZipFile.cxx b/package/source/zipapi/ZipFile.cxx
+--- a/package/source/zipapi/ZipFile.cxx
++++ b/package/source/zipapi/ZipFile.cxx
+@@ -37,6 +37,10 @@
+ #include <comphelper/threadpool.hxx>
+ #include <rtl/digest.h>
+ #include <rtl/crc.h>
++#ifdef __EMSCRIPTEN__
++#include <cstdlib>
++#include <string>
++#endif
+ #include <sal/log.hxx>
+ #include <o3tl/safeint.hxx>
+ #include <o3tl/string_view.hxx>
+@@ -171,6 +175,13 @@
+     {
+         // the length comes straight from the manifest of the document: PBKDF2
+         // derives that many bytes, so a large value is a long uninterruptible call
++#ifdef __EMSCRIPTEN__
++        // The package layer reports every failure of the encrypted read as a wrong password, so the host
++        // cannot tell this refusal from a mistyped one. Leave the reason where the bridge can read it
++        // (wasm_bridge.cpp, reportLoadFailure); the bridge clears it before each load.
++        setenv("LO_WASM_PACKAGE_REFUSAL",
++               ("derived-key-size=" + std::to_string(xEncryptionData->m_nDerivedKeySize)).c_str(), 1);
++#endif
+         throw ZipIOException(u"Invalid derived key length!"_ustr );
+     }
+ 
+@@ -222,6 +233,13 @@
+         // passed on as unsigned: a negative value would mean billions of
+         // rounds in one uninterruptible call
+         SAL_WARN("package", "PBKDF2 iteration count is missing or out of range");
++#ifdef __EMSCRIPTEN__
++        setenv("LO_WASM_PACKAGE_REFUSAL",
++               xEncryptionData->m_oPBKDFIterationCount
++                   ? ("pbkdf2-iteration-count=" + std::to_string(*xEncryptionData->m_oPBKDFIterationCount)).c_str()
++                   : "pbkdf2-iteration-count=missing",
++               1);
++#endif
+         throw ZipIOException(u"PBKDF2 iteration count is out of range"_ustr);
+     }
+     else if ( rtl_Digest_E_None != rtl_digest_PBKDF2( reinterpret_cast< sal_uInt8* >( aDerivedKey.getArray() ),
