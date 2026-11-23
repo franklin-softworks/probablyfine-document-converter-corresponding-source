@@ -1,0 +1,84 @@
+diff --git a/sc/inc/excelrowpitch.hxx b/sc/inc/excelrowpitch.hxx
+index d4f05b9e2e3b..57f462181b77 100644
+--- a/sc/inc/excelrowpitch.hxx
++++ b/sc/inc/excelrowpitch.hxx
+@@ -57,6 +57,12 @@ SC_DLLPUBLIC void ApplyPrintRowHeights(ScDocument& rDoc);
+ // environment variable LO_WASM_EXCEL_PRINT_ROWS is not "1" or the font or size is not covered (the caller then keeps the width it measured on the substitute font).
+ SC_DLLPUBLIC double GetExcelColumnDigitTwips(const OUString& rFontName, double fHeightPt);
+ 
++// The width, in twips, that Excel PRINTS for a column with no <col> element (the sheet's default width) for baseColWidth fBaseCols characters (8 unless the sheet says otherwise).
++// Excel takes the digit width as a whole number of 96-dpi pixels m (hinted: a table by font and size), the default column is ceil((base x m + 7) / 8) x 8 pixels, and it prints at
++// px x k / m units of 1/600 inch (k = the units per character of GetExcelColumnDigitTwips). Measured on the Office reference: 150 workbooks, 10 fonts x 5 sizes x 3 variants. Returns 0
++// (the caller keeps its own width) when the switch is off or the font or size is not covered.
++SC_DLLPUBLIC double GetExcelDefaultColumnTwips(const OUString& rFontName, double fHeightPt, double fBaseCols);
++
+ // A4-declared Excel sheets printed in Letter mode (owner decision 2026-11-14: follow the Office reference). Excel paginates the sheet ON A4 and scales every A4 page onto
+ // the Letter page. Calc lays the sheet out exactly as on A4 (100 %: the same rows and columns on each page, the same cell text layout) and the PDF export draws that A4
+ // page scaled and shifted onto a Letter page: getRenderer reports the Letter page size and a "ScWasmPageTransform" property that filter/source/pdf/pdfexport.cxx applies
+diff --git a/sc/source/core/data/excelrowpitch.cxx b/sc/source/core/data/excelrowpitch.cxx
+index 9714ea32a24c..04eea357caef 100644
+--- a/sc/source/core/data/excelrowpitch.cxx
++++ b/sc/source/core/data/excelrowpitch.cxx
+@@ -286,6 +286,45 @@ void applySheet(ScDocument& rDoc, SCTAB nTab, const SheetInfo& rInfo)
+ }
+ }
+ 
++namespace
++{
++// the whole-pixel digit width at 96 dpi per alias index (the order of aAliases: arial calibri cambria comic courier-new segoe tahoma times trebuchet verdana) for 8 to 12 pt; outside that
++// the digit advance rounded
++const sal_uInt8 aDigitPixels[10][5] = {
++    { 6, 7, 7, 8, 9 }, { 6, 6, 7, 7, 8 }, { 6, 7, 7, 8, 9 }, { 7, 7, 8, 9, 10 }, { 7, 7, 8, 9, 10 },
++    { 6, 6, 7, 8, 9 }, { 6, 7, 7, 8, 9 }, { 6, 6, 6, 7, 8 }, { 6, 6, 7, 8, 8 }, { 7, 8, 8, 10, 10 },
++};
++
++int fontIndex(const OUString& rName)
++{
++    for (const Alias& rAlias : aAliases)
++        if (rName.equalsIgnoreAsciiCaseAscii(rAlias.pName))
++            return rAlias.nFont;
++    return rName.equalsIgnoreAsciiCaseAscii("century") ? 0 : -1;
++}
++}
++
++double GetExcelDefaultColumnTwips(const OUString& rFontName, double fHeightPt, double fBaseCols)
++{
++    const double fDigitTwips = GetExcelColumnDigitTwips(rFontName, fHeightPt);
++    if (fDigitTwips <= 0.0 || fBaseCols < 1.0)
++        return 0.0;
++    const int nFont = fontIndex(rFontName);
++    if (nFont < 0)
++        return 0.0;
++    long nPixelsPerDigit;
++    const double fRounded = std::round(fHeightPt);
++    if (std::abs(fHeightPt - fRounded) < 1e-6 && fRounded >= 8.0 && fRounded <= 12.0)
++        nPixelsPerDigit = aDigitPixels[nFont][static_cast<int>(fRounded) - 8];
++    else
++        nPixelsPerDigit = std::lround(aDigitAdvanceEm[nFont] * fHeightPt * 96.0 / 72.0);
++    if (nPixelsPerDigit < 1)
++        return 0.0;
++    const double fUnitsPerChar = fDigitTwips / kTwipsPerUnit;                              // k
++    const double fPixels = std::ceil((fBaseCols * nPixelsPerDigit + 7.0) / 8.0) * 8.0;     // a multiple of 8
++    return std::round(fPixels * fUnitsPerChar / nPixelsPerDigit) * kTwipsPerUnit;
++}
++
+ double GetExcelColumnDigitTwips(const OUString& rFontName, double fHeightPt)
+ {
+     const char* pEnv = std::getenv("LO_WASM_EXCEL_PRINT_ROWS");
+diff --git a/sc/source/filter/oox/worksheethelper.cxx b/sc/source/filter/oox/worksheethelper.cxx
+index c58db7ef86ff..5c822786681a 100644
+--- a/sc/source/filter/oox/worksheethelper.cxx
++++ b/sc/source/filter/oox/worksheethelper.cxx
+@@ -765,6 +765,12 @@ void WorksheetGlobals::setBaseColumnWidth( sal_Int32 nWidth )
+     {
+         // #i3006# add 5 pixels padding to the width
+         maDefColModel.mfWidth = nWidth + getUnitConverter().scaleValue( 5, Unit::ScreenX, Unit::Digit );
++        // BUG-92: for a PDF conversion the width Excel prints for a default column (see GetExcelDefaultColumnTwips), in digits of the (Excel-width) digit of this workbook
++        const oox::xls::FontModel& rDefFont = getStyles().getDefaultFontModel();
++        const double fDigitTwips = sc::excelpitch::GetExcelColumnDigitTwips( rDefFont.maName, rDefFont.mfHeight );
++        const double fDefaultTwips = sc::excelpitch::GetExcelDefaultColumnTwips( rDefFont.maName, rDefFont.mfHeight, nWidth );
++        if( fDigitTwips > 0.0 && fDefaultTwips > 0.0 )
++            maDefColModel.mfWidth = fDefaultTwips / fDigitTwips;
+     }
+ }
+ 
