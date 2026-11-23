@@ -1,0 +1,89 @@
+diff --git a/sdext/source/pdfimport/inc/pdfiprocessor.hxx b/sdext/source/pdfimport/inc/pdfiprocessor.hxx
+index f0c36c802496..dafab6e7fa58 100644
+--- a/sdext/source/pdfimport/inc/pdfiprocessor.hxx
++++ b/sdext/source/pdfimport/inc/pdfiprocessor.hxx
+@@ -100,7 +100,7 @@ namespace pdfi
+         void processGlyphLine();
+ #ifdef __EMSCRIPTEN__
+         // BUG-83: close the pending glyph line (so it takes its z-order NOW) when the opaque graphic about to be drawn covers it
+-        void flushGlyphLineIfCoveredBy(const basegfx::B2DPolyPolygon& rArea);
++        void flushGlyphLineIfCoveredBy(const basegfx::B2DPolyPolygon& rArea, bool bPicture = false);
+         // the page's work budget for those tests (and whether a graphic's own geometry is within the cap)
+         bool chargeCoverWork(sal_Int64 nUnits);
+         // FEAT-27: a line a later opaque graphic covers is COUNTED per page (always) and, when the opt-in flag file /tmp/lo_pdf_drop_hidden exists, not emitted at all (the opt-in
+@@ -228,6 +228,8 @@ namespace pdfi
+         sal_Int32                          m_nLastHiddenPage = 0;
+         sal_Int32                          m_nUndecidedTotal = 0;
+         sal_Int32                          m_nLastUndecided = 0;
++        sal_Int32                          m_nPictureCoveredTotal = 0;  // pages whose text a page-sized PICTURE covers (an OCR'd scan): never counted as hidden text, but reported
++        sal_Int32                          m_nLastPictureCovered = 0;
+         sal_Int32                          m_nHiddenDropped = 0;
+         bool                               m_bReportHidden = false;     // the flag file /tmp/lo_pdf_hidden_report (or the drop flag) exists: only then is anything counted
+         bool                               m_bHiddenDirty = false;
+diff --git a/sdext/source/pdfimport/tree/pdfiprocessor.cxx b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+index 66005e35bca3..a7a36d3947e4 100644
+--- a/sdext/source/pdfimport/tree/pdfiprocessor.cxx
++++ b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+@@ -339,7 +339,7 @@ bool PDFIProcessor::chargeCoverWork(sal_Int64 nUnits)
+ // numbered, before the covering graphic. Only when the graphic covers at least half of the pending glyphs' centres, so an underline, a rule or a table border
+ // (which touch a line without covering it) never split one. BOUNDED: the centres are kept incrementally, at most MAX_COVER_SAMPLES of them (evenly spaced) are tested
+ // per graphic, a graphic of more than MAX_COVER_VERTICES vertices is not tested, and the page has a work budget (chargeCoverWork).
+-void PDFIProcessor::flushGlyphLineIfCoveredBy(const basegfx::B2DPolyPolygon& rArea)
++void PDFIProcessor::flushGlyphLineIfCoveredBy(const basegfx::B2DPolyPolygon& rArea, bool bPicture)
+ {
+     if (m_aGlyphCentres.empty() || !rArea.count())
+         return;
+@@ -362,8 +362,20 @@ void PDFIProcessor::flushGlyphLineIfCoveredBy(const basegfx::B2DPolyPolygon& rAr
+     if (nCovered * 2 >= nSamples)
+     {
+         // FEAT-27: a covered line. Dropped only on the opt-in (the worker creates /tmp/lo_pdf_drop_hidden for a PDF input when the setting is on; the JS ENV is read once at start-up, so a per-conversion switch is a file); otherwise kept, as before
+-        const bool bDrop = m_bDropHidden;
+-        if (m_bReportHidden)
++        // Only a PICTURE the size of the page (>= 80 % of the page, by the AREA of the shape) is a scan's page image: an OCR'd scan has its text layer under, or over, ONE picture
++        // of the page for every line of every page, and a scan is never warned about or stripped. An opaque FILL or SHADING of the same size (a white page rectangle drawn over
++        // text) is the case this feature exists for, so it is counted like any other cover. The scan pages are not silent: they are counted in the report (pictureCoveredTotal).
++        bool bPageSized = false;
++        if (bPicture && m_pCurPage && m_pCurPage->w > 0.0 && m_pCurPage->h > 0.0)
++            bPageSized = std::fabs(basegfx::utils::getArea(rArea)) >= 0.8 * m_pCurPage->w * m_pCurPage->h;
++        if (bPageSized && m_bReportHidden && m_nLastPictureCovered != m_nPageNo)
++        {
++            m_nLastPictureCovered = m_nPageNo;
++            ++m_nPictureCoveredTotal;
++            m_bHiddenDirty = true;
++        }
++        const bool bDrop = m_bDropHidden && !bPageSized;
++        if (m_bReportHidden && !bPageSized)
+             noteHiddenLine(bDrop);
+         if (bDrop)
+         {
+@@ -420,7 +432,7 @@ void PDFIProcessor::writeHiddenTextReport() const
+     aOut << "],\"undecidedTotal\":" << m_nUndecidedTotal << ",\"undecided\":[";
+     for (size_t i = 0; i < m_aUndecidedPages.size(); ++i)
+         aOut << (i ? "," : "") << m_aUndecidedPages[i];
+-    aOut << "]}";
++    aOut << "],\"pictureCoveredTotal\":" << m_nPictureCoveredTotal << "}";
+ }
+ #endif
+ 
+@@ -577,9 +589,9 @@ void PDFIProcessor::setupImage(ImageId nImage)
+         if (aCover.getB2DRange().overlaps(m_aGlyphCentreRange))
+         {
+             if (!rGC.Clip.count())
+-                flushGlyphLineIfCoveredBy(aCover);
++                flushGlyphLineIfCoveredBy(aCover, true);
+             else if (lcl_vertexCount(rGC.Clip) <= MAX_COVER_VERTICES && chargeCoverWork(lcl_vertexCount(rGC.Clip) + 1))
+-                flushGlyphLineIfCoveredBy(basegfx::utils::clipPolyPolygonOnPolyPolygon(aCover, rGC.Clip, true, false));
++                flushGlyphLineIfCoveredBy(basegfx::utils::clipPolyPolygonOnPolyPolygon(aCover, rGC.Clip, true, false), true);
+         }
+     }
+ #endif
+@@ -1135,7 +1147,8 @@ void PDFIProcessor::endPage()
+     processGlyphLine(); // draw last line
+ #ifdef __EMSCRIPTEN__
+     // FEAT-27: the report is written ONCE, when the last page ends
+-    if (m_bHiddenDirty && m_pCurPage && m_pCurPage->PageNumber == m_nPages)
++    // asked to count => ALWAYS a report, lines 0 for a clean document (a missing report then means the engine never got here, which the worker says out loud)
++    if ((m_bHiddenDirty || m_bReportHidden) && m_pCurPage && m_pCurPage->PageNumber == m_nPages)
+     {
+         writeHiddenTextReport();
+         m_bHiddenDirty = false;
