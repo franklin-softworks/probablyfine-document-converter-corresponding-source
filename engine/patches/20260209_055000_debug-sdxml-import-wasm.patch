@@ -1,0 +1,165 @@
+diff --git a/sd/source/filter/xml/sdxmlwrp.cxx b/sd/source/filter/xml/sdxmlwrp.cxx
+index caf15884c10f..5ff053ee24d7 100644
+--- a/sd/source/filter/xml/sdxmlwrp.cxx
++++ b/sd/source/filter/xml/sdxmlwrp.cxx
+@@ -20,6 +20,9 @@
+ #include <officecfg/Office/Common.hxx>
+ #include <vcl/errinf.hxx>
+ #include <sal/log.hxx>
++#ifdef __EMSCRIPTEN__
++#include <iostream>
++#endif
+ #include <com/sun/star/container/XChild.hpp>
+ #include <com/sun/star/beans/XPropertySetInfo.hpp>
+ #include <com/sun/star/embed/ElementModes.hpp>
+@@ -200,6 +203,10 @@ ErrCodeMsg ReadThroughComponent(
+         rxContext->getServiceManager()->createInstanceWithArgumentsAndContext(aFilterName, rFilterArguments, rxContext),
+         UNO_QUERY );
+     SAL_WARN_IF(!xFilter.is(), "sd.filter", "Can't instantiate filter component: " << aFilterName);
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[SD_XML] ReadThroughComponent: filter " << OUStringToOString(aFilterName, RTL_TEXTENCODING_UTF8).getStr()
++              << " created=" << xFilter.is() << std::endl;
++#endif
+     if( !xFilter.is() )
+         return SD_XML_READERROR;
+     Reference< xml::sax::XFastParser > xFastParser(xFilter, UNO_QUERY);
+@@ -220,6 +227,10 @@ ErrCodeMsg ReadThroughComponent(
+ 
+     // finally, parser the stream
+     SAL_INFO( "sd.filter", "parsing stream" );
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[SD_XML] About to parse " << OUStringToOString(rStreamName, RTL_TEXTENCODING_UTF8).getStr()
++              << " xFastParser=" << xFastParser.is() << std::endl;
++#endif
+     try
+     {
+         if (xFastParser)
+@@ -231,9 +242,15 @@ ErrCodeMsg ReadThroughComponent(
+             xParser->setDocumentHandler( xDocumentHandler );
+             xParser->parseStream( aParserInput );
+         }
++#ifdef __EMSCRIPTEN__
++        std::cerr << "[SD_XML] Parse of " << OUStringToOString(rStreamName, RTL_TEXTENCODING_UTF8).getStr() << " succeeded" << std::endl;
++#endif
+     }
+     catch (const xml::sax::SAXParseException& r)
+     {
++#ifdef __EMSCRIPTEN__
++        std::cerr << "[SD_XML] SAXParseException: line=" << r.LineNumber << " col=" << r.ColumnNumber << std::endl;
++#endif
+         css::uno::Any ex( cppu::getCaughtException() );
+         // sax parser sends wrapped exceptions,
+         // try to find the original one
+@@ -278,6 +295,9 @@ ErrCodeMsg ReadThroughComponent(
+     }
+     catch (const xml::sax::SAXException& r)
+     {
++#ifdef __EMSCRIPTEN__
++        std::cerr << "[SD_XML] SAXException: " << OUStringToOString(r.Message, RTL_TEXTENCODING_UTF8).getStr() << std::endl;
++#endif
+         css::uno::Any ex( cppu::getCaughtException() );
+         packages::zip::ZipIOException aBrokenPackage;
+         if ( r.WrappedException >>= aBrokenPackage )
+@@ -294,13 +314,19 @@ ErrCodeMsg ReadThroughComponent(
+         TOOLS_WARN_EXCEPTION( "sd.filter", "Zip exception caught while importing");
+         return ERRCODE_IO_BROKENPACKAGE;
+     }
+-    catch (const io::IOException&)
++    catch (const io::IOException& e)
+     {
++#ifdef __EMSCRIPTEN__
++        std::cerr << "[SD_XML] IOException: " << OUStringToOString(e.Message, RTL_TEXTENCODING_UTF8).getStr() << std::endl;
++#endif
+         TOOLS_WARN_EXCEPTION( "sd.filter", "IO exception caught while importing");
+         return SD_XML_READERROR;
+     }
+-    catch (const uno::Exception&)
++    catch (const uno::Exception& e)
+     {
++#ifdef __EMSCRIPTEN__
++        std::cerr << "[SD_XML] uno::Exception: " << OUStringToOString(e.Message, RTL_TEXTENCODING_UTF8).getStr() << std::endl;
++#endif
+         TOOLS_WARN_EXCEPTION( "sd.filter", "uno exception caught while importing");
+         return SD_XML_READERROR;
+     }
+@@ -331,8 +357,14 @@ ErrCodeMsg ReadThroughComponent(
+     }
+     catch (const container::NoSuchElementException&)
+     {
++#ifdef __EMSCRIPTEN__
++        std::cerr << "[SD_XML] ReadThroughComponent(" << pStreamName << "): NoSuchElementException" << std::endl;
++#endif
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[SD_XML] ReadThroughComponent(" << pStreamName << "): bContainsStream=" << bContainsStream << std::endl;
++#endif
+     if (!bContainsStream )
+     {
+         // stream name not found! return immediately with OK signal
+@@ -538,6 +570,9 @@ bool SdXMLFilter::Import( ErrCode& nError )
+ 
+     xInfoSet->setPropertyValue( u"SourceStorage"_ustr, Any( xStorage ) );
+ 
++#ifdef __EMSCRIPTEN__
++    std::cerr << "[SD_XML] xStorage.is()=" << xStorage.is() << std::endl;
++#endif
+     if( !xStorage.is() )
+         nRet = SD_XML_READERROR;
+ 
+@@ -599,29 +634,55 @@ bool SdXMLFilter::Import( ErrCode& nError )
+         ErrCodeMsg nWarn2 = ERRCODE_NONE;
+         // read storage streams
+         // #i103539#: always read meta.xml for generator
++#ifdef __EMSCRIPTEN__
++        std::cerr << "[SD_XML] Reading meta.xml..." << std::endl;
++#endif
+         nWarn = ReadThroughComponent(
+             xStorage, xModelComp, "meta.xml", rxContext,
+             pServices->mpMeta,
+             aEmptyArgs, aName, false );
++#ifdef __EMSCRIPTEN__
++        std::cerr << "[SD_XML] meta.xml OK=" << bool(!nWarn) << std::endl;
++#endif
+ 
+         if( meFilterMode != SdXMLFilterMode::Organizer )
+         {
++#ifdef __EMSCRIPTEN__
++            std::cerr << "[SD_XML] Reading settings.xml..." << std::endl;
++#endif
+             nWarn2 = ReadThroughComponent(
+                 xStorage, xModelComp, "settings.xml", rxContext,
+                 pServices->mpSettings,
+                 aFilterArgs, aName, false );
++#ifdef __EMSCRIPTEN__
++            std::cerr << "[SD_XML] settings.xml OK=" << bool(!nWarn2) << std::endl;
++#endif
+         }
+ 
++#ifdef __EMSCRIPTEN__
++        std::cerr << "[SD_XML] Reading styles.xml..." << std::endl;
++#endif
+         nRet = ReadThroughComponent(
+             xStorage, xModelComp, "styles.xml", rxContext,
+             pServices->mpStyles,
+             aFilterArgs, aName, true );
++#ifdef __EMSCRIPTEN__
++        std::cerr << "[SD_XML] styles.xml OK=" << bool(!nRet) << std::endl;
++#endif
+ 
+         if( !nRet && (meFilterMode != SdXMLFilterMode::Organizer) )
++        {
++#ifdef __EMSCRIPTEN__
++            std::cerr << "[SD_XML] Reading content.xml..." << std::endl;
++#endif
+             nRet = ReadThroughComponent(
+                xStorage, xModelComp, "content.xml", rxContext,
+                pServices->mpContent,
+                aFilterArgs, aName, true );
++#ifdef __EMSCRIPTEN__
++            std::cerr << "[SD_XML] content.xml OK=" << bool(!nRet) << std::endl;
++#endif
++        }
+ 
+         if( !nRet )
+         {

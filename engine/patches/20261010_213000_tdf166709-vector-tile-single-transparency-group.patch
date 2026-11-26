@@ -1,0 +1,48 @@
+diff --git a/drawinglayer/source/processor2d/vclmetafileprocessor2d.cxx b/drawinglayer/source/processor2d/vclmetafileprocessor2d.cxx
+index 127f6819492b..a5df4492754a 100644
+--- a/drawinglayer/source/processor2d/vclmetafileprocessor2d.cxx
++++ b/drawinglayer/source/processor2d/vclmetafileprocessor2d.cxx
+@@ -988,6 +988,43 @@ void VclMetafileProcessor2D::processFillGraphicPrimitive2D(
+             // we have tiling
+             const Graphic& rGraphic(rAttribute.getGraphic());
+ 
++            // tdf#166709 follow-up: a VECTOR tile (WMF/EMF/SVG data behind a
++            // Bitmap-typed Graphic, or a GdiMetafile) has the same problem, worse:
++            // the decomposition wraps EVERY tile's content in its own
++            // UnifiedTransparencePrimitive2D, and each becomes a separate
++            // transparency group (Form XObject + ExtGState) in PDF export. A
++            // full-slide 15%-opaque WMF dot pattern produced ~8,000 groups per
++            // page and a 167 MB PDF from a 622 KB PPTX. Tiles never overlap, so
++            // one uniform transparency around all of them renders identically.
++            const bool bVectorTile(
++                (GraphicType::Bitmap == rGraphic.GetType() && rGraphic.getVectorGraphicData())
++                || GraphicType::GdiMetafile == rGraphic.GetType());
++
++            if (bVectorTile && !rGraphic.IsAnimated())
++            {
++                rtl::Reference<primitive2d::BasePrimitive2D> aPrimitive(
++                    new primitive2d::UnifiedTransparencePrimitive2D(
++                        primitive2d::Primitive2DContainer{
++                            rtl::Reference<primitive2d::FillGraphicPrimitive2D>(
++                                new primitive2d::FillGraphicPrimitive2D(
++                                    rFillGraphicPrimitive2D.getTransformation(),
++                                    attribute::FillGraphicAttribute(
++                                        rGraphic, rAttribute.getGraphicRange(),
++                                        rAttribute.getTiling(), rAttribute.getOffsetX(),
++                                        rAttribute.getOffsetY()))) },
++                        rFillGraphicPrimitive2D.getTransparency()));
++
++                // Variant (b) of tdf#166709, as upstream chose for bitmap tiles
++                // below: process() takes UnifiedTransparencePrimitive2D's
++                // decomposition, which renders the whole tiled fill as ONE bitmap
++                // (capped at 500,000 px). Measured on FG-069's deck: 1.5 MB PDF,
++                // texture kept (soft at high zoom). Variant (a) -- calling
++                // processUnifiedTransparencePrimitive2D() directly -- keeps the
++                // tiles as vectors in one group: exact, but 25.9 MB for that deck.
++                process(*aPrimitive);
++                return;
++            }
++
+             if (GraphicType::Bitmap == rGraphic.GetType() && !rGraphic.IsAnimated()
+                 && !rGraphic.getVectorGraphicData())
+             {

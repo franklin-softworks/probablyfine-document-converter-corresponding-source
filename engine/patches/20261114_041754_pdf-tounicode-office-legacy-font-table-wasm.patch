@@ -1,0 +1,72 @@
+diff --git a/vcl/source/gdi/pdfwriter_impl.cxx b/vcl/source/gdi/pdfwriter_impl.cxx
+index d9240d7..1fd8f0a 100644
+--- a/vcl/source/gdi/pdfwriter_impl.cxx
++++ b/vcl/source/gdi/pdfwriter_impl.cxx
+@@ -6810,6 +6810,51 @@ void PDFWriterImpl::drawHorizontalGlyphs(
+     }
+ }
+ 
++namespace
++{
++// BUG-87: what Microsoft Office writes into the text layer of a PDF for a code of a legacy symbol font. Measured (Word and PowerPoint agree on all 1,120 codes,
++// Office 16.0.17932.21056, burnerdocs-verify run 20261114T040813Z-legacyfont-331e; project-owned data, no third-party table): Office maps only these codes to
++// Unicode and keeps the private-use code U+F000 + code for every other code; Wingdings 2, Wingdings 3 and Webdings map none. A code of one font is NEVER read
++// through another font's table: Wingdings 0xA7 is a small square (U+25AA), Symbol 0xA7 a club.
++struct LegacyFontEntry { sal_uInt8 nCode; sal_Unicode cUnicode; };
++constexpr LegacyFontEntry aWingdingsMap[] = {
++    { 0x4A, 0x263A }, { 0x6C, 0x26AB }, { 0x6E, 0x25FC }, { 0x71, 0x2751 }, { 0x73, 0x2B27 }, { 0x74, 0x29EB }, { 0x75, 0x25C6 },
++    { 0x76, 0x2756 }, { 0xA7, 0x25AA }, { 0xD8, 0x27A2 }, { 0xE0, 0x2192 }, { 0xE8, 0x2794 }, { 0xFC, 0x2713 } };
++constexpr LegacyFontEntry aSymbolMap[] = {
++    { 0x28, 0x0028 }, { 0x29, 0x0029 }, { 0x2B, 0x002B }, { 0x2D, 0x2212 }, { 0x3D, 0x003D }, { 0x5E, 0x22A5 },
++    { 0xAE, 0x2192 }, { 0xB7, 0x2022 }, { 0xBE, 0x23AF }, { 0xD3, 0x00A9 }, { 0xE3, 0x00A9 } };
++
++// cText is the document's character for a glyph drawn in the font the document asked for (rFontName, NOT the substitute): a code 0x20-0xFF, or the private-use
++// U+F020-U+F0FF Word and PowerPoint store it as. Any other character, or any other font, is returned unchanged.
++sal_Unicode lcl_OfficeLegacyFontCodeUnit(const OUString& rFontName, sal_Unicode cText)
++{
++    const bool bLow = cText >= 0x20 && cText <= 0xFF;
++    const bool bPua = cText >= 0xF020 && cText <= 0xF0FF;
++    if (!bLow && !bPua)
++        return cText;
++    OUString aName = rFontName.toAsciiLowerCase().replaceAll(u" ", u"");
++    const LegacyFontEntry* pBegin = nullptr;
++    const LegacyFontEntry* pEnd = nullptr;
++    if (aName == u"wingdings")
++    {
++        pBegin = std::begin(aWingdingsMap);
++        pEnd = std::end(aWingdingsMap);
++    }
++    else if (aName == u"symbol")
++    {
++        pBegin = std::begin(aSymbolMap);
++        pEnd = std::end(aSymbolMap);
++    }
++    else if (aName != u"wingdings2" && aName != u"wingdings3" && aName != u"webdings")
++        return cText;
++    const sal_uInt8 nCode = static_cast<sal_uInt8>(cText & 0xFF);
++    for (const LegacyFontEntry* p = pBegin; p != pEnd; ++p)
++        if (p->nCode == nCode)
++            return p->cUnicode;
++    return static_cast<sal_Unicode>(0xF000 + nCode);
++}
++}
++
+ void PDFWriterImpl::drawLayout( SalLayout& rLayout, const OUString& rText, bool bTextLines )
+ {
+     // relief takes precedence over shadow (see outdev3.cxx)
+@@ -6963,7 +7008,14 @@ void PDFWriterImpl::drawLayout( SalLayout& rLayout, const OUString& rText, bool
+ 
+         assert(pGlyph->charCount() >= 0);
+         for (int n = 0; n < pGlyph->charCount(); n++)
+-            aCodeUnits.push_back(rText[pGlyph->charPos() + n]);
++        {
++            sal_Unicode cCodeUnit = rText[pGlyph->charPos() + n];
++            // BUG-87: a symbol font (Wingdings, Symbol, ...) is drawn through a recode table into the substitute (OpenSymbol). The text layer must name the
++            // character the way Office does, by the font the document asked for (never the substitute's name, and never another symbol font's table).
++            if (pGlyphFont->mpConversion && pGlyph->charCount() == 1)
++                cCodeUnit = lcl_OfficeLegacyFontCodeUnit(pGlyphFont->GetFontSelectPattern().maTargetName, cCodeUnit);
++            aCodeUnits.push_back(cCodeUnit);
++        }
+ 
+         bool bUseActualText = false;
+ 

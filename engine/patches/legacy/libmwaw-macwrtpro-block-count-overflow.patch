@@ -1,0 +1,20 @@
+libmwaw: MacWrtProParser::getStreamForBlock wrapped its block-range check on a block count read from the file (FF-6 option C).
+
+The count (up to 2^31 for a 4-byte link) was checked with input->checkPosition(0x100*unsigned(block+numBlock)), which wraps modulo 2^32 for
+block+numBlock >= 2^24 and so accepted a count the file cannot hold; the loop below then inserted up to billions of entries into
+m_state->m_parsedBlocks (a std::set): minutes of CPU and all the memory. The sum is now bounded by 0x7fffff (0x100 * that fits in 31 bits; a real
+document has far fewer 256-byte blocks), so the existing check cannot wrap. Found by seeded mutation of a real MacWrite file on the standalone legacy
+module: 1 mutant ran for more than 40 s, 18 ms with this patch. Upstream candidate for the owner: upstream-issues/libmwaw-macwrtpro-block-count-overflow.md.
+
+--- a/src/lib/MacWrtProParser.cxx	2026-11-08 23:58:16.602574518 +0000
++++ b/src/lib/MacWrtProParser.cxx	2026-11-08 23:58:16.604939804 +0000
+@@ -453,7 +453,8 @@
+   std::shared_ptr<MWAWStringStream> resInput;
+   while (true) {
+     --block; // block i : (i-1)00..i00
+-    if (numBlock<=0 || block<2 || unsigned(block)+unsigned(numBlock)>=std::numeric_limits<int>::max() ||
++    if (numBlock<=0 || block<2 || unsigned(block)+unsigned(numBlock)>=0x7fffff ||   // 0x100*(block+numBlock) must fit in 31 bits: the check below wrapped around
++        // for a block count read from the file (up to 2^31), which let the loop below insert billions of entries into a std::set
+         !input->checkPosition(0x100*unsigned(block+numBlock))) {
+       MWAW_DEBUG_MSG(("MacWrtProParser::getStreamForBlock: can not read some block %dx%d\n", block, numBlock));
+       break;

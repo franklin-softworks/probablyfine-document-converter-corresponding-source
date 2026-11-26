@@ -1,0 +1,260 @@
+diff --git a/external/redland/redland/redland-emscripten.patch.0 b/external/redland/redland/redland-emscripten.patch.0
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/external/redland/redland/redland-emscripten.patch.0
+@@ -0,0 +1,253 @@
++--- src/rdf_hash_cursor.c.orig
+++++ src/rdf_hash_cursor.c
++@@ -38,6 +38,9 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_hash.h>
+++#include <rdf_internal.h>
+++
++
++ /* private structure */
++ struct librdf_hash_cursor_s {
++--- src/rdf_hash.c.orig
+++++ src/rdf_hash.c
++@@ -37,6 +37,8 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ /* prototypes for local functions */
++ static librdf_hash_datum* librdf_hash_datum_new(librdf_world *world, void *data, size_t size);
++--- src/rdf_storage.c.orig
+++++ src/rdf_storage.c
++@@ -30,6 +30,8 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_raptor.c.orig
+++++ src/rdf_raptor.c
++@@ -34,6 +34,8 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ /**
++  * librdf_world_set_raptor:
++--- src/rdf_init.c.orig
+++++ src/rdf_init.c
++@@ -36,6 +36,8 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ const char * const librdf_short_copyright_string = "Copyright 2000-2013 David Beckett. Copyright 2000-2005 University of Bristol";
++
++--- src/rdf_stream.c.orig
+++++ src/rdf_stream.c
++@@ -29,6 +29,8 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_model.c.orig
+++++ src/rdf_model.c
++@@ -30,6 +30,8 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_iterator.c.orig
+++++ src/rdf_iterator.c
++@@ -29,6 +29,8 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_parser.c.orig
+++++ src/rdf_parser.c
++@@ -30,6 +30,8 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_query.c.orig
+++++ src/rdf_query.c
++@@ -31,6 +31,8 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_serializer.c.orig
+++++ src/rdf_serializer.c
++@@ -29,6 +29,8 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_statement.c.orig
+++++ src/rdf_statement.c
++@@ -36,6 +36,8 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_node.c.orig
+++++ src/rdf_node.c
++@@ -30,6 +30,8 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_uri.c.orig
+++++ src/rdf_uri.c
++@@ -30,6 +30,8 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_concepts.c.orig
+++++ src/rdf_concepts.c
++@@ -29,6 +29,8 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_digest.c.orig
+++++ src/rdf_digest.c
++@@ -33,6 +33,8 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_files.c.orig
+++++ src/rdf_files.c
++@@ -29,6 +29,8 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_list.c.orig
+++++ src/rdf_list.c
++@@ -32,6 +32,8 @@ 
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_log.c.orig
+++++ src/rdf_log.c
++@@ -34,6 +34,8 +
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_avltree.c.orig
+++++ src/rdf_avltree.c
++@@ -35,6 +35,8 +
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_heuristics.c.orig
+++++ src/rdf_heuristics.c
++@@ -28,6 +28,8 +
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_utf8.c.orig
+++++ src/rdf_utf8.c
++@@ -30,6 +30,8 +
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
++--- src/rdf_query_results.c.orig
+++++ src/rdf_query_results.c
++@@ -31,6 +31,8 +
++
++ #include <redland.h>
++
+++#include <rdf_internal.h>
+++
++
++ #ifndef STANDALONE
++
