@@ -1,0 +1,367 @@
+diff --git a/desktop/source/lib/init.cxx b/desktop/source/lib/init.cxx
+index 88b911d4c7f3..0490c71ed9d4 100644
+--- a/desktop/source/lib/init.cxx
++++ b/desktop/source/lib/init.cxx
+@@ -268,6 +268,11 @@ using LanguageToolCfg = officecfg::Office::Linguistic::GrammarChecking::Language
+ 
+ static LibLibreOffice_Impl *gImpl = nullptr;
+ static bool lok_preinit_2_called = false;
++static bool bPreInited = false;  // Moved to file scope for lo_destroy() access
++static bool bUnipoll = false;       // Moved to file scope for lo_destroy() access
++static bool bProfileZones = false;  // Moved to file scope for lo_destroy() access
++static bool bNotebookbar = false;   // Moved to file scope for lo_destroy() access
++static bool alreadyCalled = false;  // Moved to file scope for lo_destroy() access
+ static bool gUseCompactFonts = false;
+ static std::weak_ptr< LibreOfficeKitClass > gOfficeClass;
+ static std::weak_ptr< LibreOfficeKitDocumentClass > gDocumentClass;
+@@ -2821,7 +2826,11 @@ static LibreOfficeKitDocument* lo_documentLoadWithOptions(LibreOfficeKit* pThis,
+ {
+     comphelper::ProfileZone aZone("lo_documentLoadWithOptions");
+ 
++    std::cerr << "[LO_DOCLOAD] lo_documentLoadWithOptions called, URL=" << (pURL ? pURL : "null") << std::endl;
++
++    std::cerr << "[LO_DOCLOAD] Acquiring SolarMutexGuard..." << std::endl;
+     SolarMutexGuard aGuard;
++    std::cerr << "[LO_DOCLOAD] SolarMutexGuard acquired" << std::endl;
+ 
+     static int nDocumentIdCounter = 0;
+ 
+@@ -2829,6 +2838,7 @@ static LibreOfficeKitDocument* lo_documentLoadWithOptions(LibreOfficeKit* pThis,
+     pLib->maLastExceptionMsg.clear();
+ 
+     const OUString aURL(getAbsoluteURL(pURL));
++    std::cerr << "[LO_DOCLOAD] Absolute URL resolved" << std::endl;
+     if (aURL.isEmpty())
+     {
+         pLib->maLastExceptionMsg = u"Filename to load was not provided."_ustr;
+@@ -2845,7 +2855,9 @@ static LibreOfficeKitDocument* lo_documentLoadWithOptions(LibreOfficeKit* pThis,
+         return nullptr;
+     }
+ 
++    std::cerr << "[LO_DOCLOAD] Creating Desktop component loader..." << std::endl;
+     uno::Reference<frame::XDesktop2> xComponentLoader = frame::Desktop::create(xContext);
++    std::cerr << "[LO_DOCLOAD] Desktop component loader created: " << (xComponentLoader.is() ? "OK" : "FAILED") << std::endl;
+ 
+     if (!xComponentLoader.is())
+     {
+@@ -2934,7 +2946,16 @@ static LibreOfficeKitDocument* lo_documentLoadWithOptions(LibreOfficeKit* pThis,
+             if (aFormatter.IsNumberFormat(aMacroSecurityLevel, nFormat, nNumber))
+                 nMacroSecurityLevel = static_cast<int>(nNumber);
+         }
++        std::cerr << "[LO_DOCLOAD] Setting MacroSecurityLevel=" << nMacroSecurityLevel << std::endl;
++#ifdef __EMSCRIPTEN__
++        // Skip SetMacroSecurityLevel in WASM - it triggers ConfigItem write
++        // which deadlocks via UNO configmgr in WASM threading model.
++        // Macros are disabled anyway (--disable-scripting).
++        std::cerr << "[LO_DOCLOAD] WASM: skipping SetMacroSecurityLevel (deadlock)" << std::endl;
++#else
+         SvtSecurityOptions::SetMacroSecurityLevel(nMacroSecurityLevel);
++#endif
++        std::cerr << "[LO_DOCLOAD] MacroSecurityLevel done" << std::endl;
+ 
+         OUString aClientVisibleArea = extractParameter(aOptions, u"ClientVisibleArea");
+         if (!aClientVisibleArea.isEmpty())
+@@ -2981,14 +3002,19 @@ static LibreOfficeKitDocument* lo_documentLoadWithOptions(LibreOfficeKit* pThis,
+         if (const char* pExemptVerifyHost = ::getenv("LOK_EXEMPT_VERIFY_HOST"))
+             HostFilter::setExemptVerifyHost(OUString(pExemptVerifyHost, strlen(pExemptVerifyHost), RTL_TEXTENCODING_UTF8));
+ 
++        std::cerr << "[LO_DOCLOAD] About to call loadComponentFromURL..." << std::endl;
+         const int nThisDocumentId = nDocumentIdCounter++;
+         SfxViewShell::SetCurrentDocId(ViewShellDocId(nThisDocumentId));
+         uno::Reference<lang::XComponent> xComponent = xComponentLoader->loadComponentFromURL(
+                                             aURL, u"_blank"_ustr, 0,
+                                             aFilterOptions);
++        std::cerr << "[LO_DOCLOAD] loadComponentFromURL returned" << std::endl;
+ 
+         assert(!xComponent.is() || pair.second); // concurrent loading of same URL ought to fail
+ 
++        // WASM note: if xComponent is null, the SfxObjectShell fallback
++        // in loadenv.cxx::loadComponentFromURL handles recovery.
++
+         if (!xComponent.is())
+         {
+             pLib->maLastExceptionMsg = u"loadComponentFromURL returned an empty reference"_ustr;
+@@ -3673,7 +3699,12 @@ static int doc_saveAs(LibreOfficeKitDocument* pThis, const char* sUrl, const cha
+ {
+     comphelper::ProfileZone aZone("doc_saveAs");
+ 
++    std::cerr << "[LO_SAVEAS] doc_saveAs called, URL=" << (sUrl ? sUrl : "null")
++              << " format=" << (pFormat ? pFormat : "null") << std::endl;
++
++    std::cerr << "[LO_SAVEAS] Acquiring SolarMutexGuard..." << std::endl;
+     SolarMutexGuard aGuard;
++    std::cerr << "[LO_SAVEAS] SolarMutexGuard acquired" << std::endl;
+     SetLastExceptionMsg();
+ 
+     LibLODocument_Impl* pDocument = static_cast<LibLODocument_Impl*>(pThis);
+@@ -3681,7 +3712,9 @@ static int doc_saveAs(LibreOfficeKitDocument* pThis, const char* sUrl, const cha
+     OUString sFormat = getUString(pFormat);
+     OUString aURL(getAbsoluteURL(sUrl));
+ 
++    std::cerr << "[LO_SAVEAS] Getting XStorable..." << std::endl;
+     uno::Reference<frame::XStorable> xStorable(pDocument->mxComponent, uno::UNO_QUERY_THROW);
++    std::cerr << "[LO_SAVEAS] XStorable obtained" << std::endl;
+ 
+     if (aURL.isEmpty())
+     {
+@@ -3886,11 +3919,15 @@ static int doc_saveAs(LibreOfficeKitDocument* pThis, const char* sUrl, const cha
+         }
+ 
+ 
++        std::cerr << "[LO_SAVEAS] About to call store" << (bTakeOwnership ? "AsURL" : "ToURL")
++                  << " filter=" << OUStringToOString(aFilterName, RTL_TEXTENCODING_UTF8).getStr()
++                  << std::endl;
+         if (bTakeOwnership)
+             xStorable->storeAsURL(aURL, aSaveMediaDescriptor.getAsConstPropertyValueList());
+         else
+             xStorable->storeToURL(aURL, aSaveMediaDescriptor.getAsConstPropertyValueList());
+ 
++        std::cerr << "[LO_SAVEAS] storeToURL/storeAsURL completed successfully" << std::endl;
+         return true;
+     }
+     catch (const uno::Exception& exception)
+@@ -8225,11 +8262,8 @@ static int lo_initialize(LibreOfficeKit* pThis, const char* pAppPath, const char
+         FULL_INIT     // do a standard complete init.
+     } eStage;
+ 
+-    // Did we do a pre-initialize
+-    static bool bPreInited = false;
+-    static bool bUnipoll = false;
+-    static bool bProfileZones = false;
+-    static bool bNotebookbar = false;
++    // bPreInited, bUnipoll, bProfileZones, bNotebookbar, alreadyCalled are now
++    // file-scope statics (near line 271) for lo_destroy() access in WASM
+ 
+     { // cf. string lifetime for preinit
+         std::vector<OUString> aOpts;
+@@ -8281,7 +8315,12 @@ static int lo_initialize(LibreOfficeKit* pThis, const char* pAppPath, const char
+     LibLibreOffice_Impl* pLib = static_cast<LibLibreOffice_Impl*>(pThis);
+ 
+     if (bInitialized)
++    {
++        std::cerr << "[LO_INIT] Already initialized, returning 1" << std::endl;
+         return 1;
++    }
++
++    std::cerr << "[LO_INIT] eStage=" << (int)eStage << " bUnipoll=" << bUnipoll << " bPreInited=" << bPreInited << std::endl;
+ 
+     // Turn profile zones on early
+     if (bProfileZones && eStage == SECOND_INIT)
+@@ -8430,16 +8469,23 @@ static int lo_initialize(LibreOfficeKit* pThis, const char* pAppPath, const char
+         if (eStage != SECOND_INIT)
+         {
+             SAL_INFO("lok", "Attempting to initialize UNO");
++            std::cerr << "[LO_INIT] About to call initialize_uno..." << std::endl;
+ 
+             if (!initialize_uno(aAppURL))
++            {
++                std::cerr << "[LO_INIT] initialize_uno FAILED" << std::endl;
+                 return false;
++            }
++            std::cerr << "[LO_INIT] initialize_uno succeeded" << std::endl;
+ 
+             // Force headless -- this is only for bitmap rendering.
++            std::cerr << "[LO_INIT] Setting SAL_USE_VCLPLUGIN=svp..." << std::endl;
+             rtl::Bootstrap::set(u"SAL_USE_VCLPLUGIN"_ustr, u"svp"_ustr);
+ 
+             // We specifically need to make sure we have the "headless"
+             // command arg set (various code specifically checks via
+             // CommandLineArgs):
++            std::cerr << "[LO_INIT] Setting headless mode..." << std::endl;
+             desktop::Desktop::GetCommandLineArgs().setHeadless();
+ 
+ #ifdef IOS
+@@ -8505,15 +8551,33 @@ static int lo_initialize(LibreOfficeKit* pThis, const char* pAppPath, const char
+                 Application::ReleaseSolarMutex();
+             }
+ 
++            std::cerr << "[LO_INIT] Calling setLanguageAndLocale..." << std::endl;
++#ifdef __EMSCRIPTEN__
++            // Skip setLanguageAndLocale in WASM - the SvtSysLocaleOptions ConfigItem
++            // constructor accesses configmgr via UNO which deadlocks in the WASM
++            // threading model. Language is set via SAL_LOK_OPTIONS env var instead.
++            std::cerr << "[LO_INIT] WASM: skipping setLanguageAndLocale (deadlock)" << std::endl;
++#else
+             setLanguageAndLocale(u"en-US"_ustr);
++#endif
++            std::cerr << "[LO_INIT] setLanguageAndLocale done" << std::endl;
+         }
+ 
+         if (eStage != PRE_INIT)
+         {
+             SAL_INFO("lok", "Re-initialize temp paths");
++            std::cerr << "[LO_INIT] Re-initialize temp paths..." << std::endl;
++#ifdef __EMSCRIPTEN__
++            // Skip SvtPathOptions in WASM - SetTempPath/SetWorkPath trigger
++            // ConfigItem writes which deadlock via SolarMutex in the WASM
++            // threading model. Emscripten VFS manages /tmp directly.
++            std::cerr << "[LO_INIT] WASM: skipping SvtPathOptions (deadlock)" << std::endl;
++#else
+             SvtPathOptions aOptions;
++            std::cerr << "[LO_INIT] SvtPathOptions created" << std::endl;
+             OUString aNewTemp;
+             osl::FileBase::getTempDirURL(aNewTemp);
++            std::cerr << "[LO_INIT] Got temp dir" << std::endl;
+             aOptions.SetTempPath(aNewTemp);
+             {
+                 const char *pWorkPath = getenv("LOK_WORKDIR");
+@@ -8523,7 +8587,10 @@ static int lo_initialize(LibreOfficeKit* pThis, const char* pAppPath, const char
+                     aOptions.SetWorkPath(OStringToOUString(sWorkPath, RTL_TEXTENCODING_UTF8));
+                 }
+             }
++#endif
++            std::cerr << "[LO_INIT] Creating temporary directory..." << std::endl;
+             desktop::Desktop::CreateTemporaryDirectory();
++            std::cerr << "[LO_INIT] Temporary directory created" << std::endl;
+ 
+             // The RequestHandler is specifically set to be ready when all the other
+             // init in Desktop::Main (run from soffice_main) is done. We can enable
+@@ -8533,25 +8600,35 @@ static int lo_initialize(LibreOfficeKit* pThis, const char* pAppPath, const char
+             // continue.
+ 
+             SAL_INFO("lok", "Enabling RequestHandler");
++            std::cerr << "[LO_INIT] Enabling RequestHandler..." << std::endl;
+             RequestHandler::Enable(false);
+             SAL_INFO("lok", "Starting soffice_main");
++            std::cerr << "[LO_INIT] RequestHandler enabled. SetReady(false)..." << std::endl;
+             RequestHandler::SetReady(false);
+             if (!bUnipoll)
+             {
+                 // Start the main thread only in non-unipoll mode (i.e. multithreaded).
++                std::cerr << "[LO_INIT] Non-unipoll: starting lo_startmain thread" << std::endl;
+                 pLib->maThread = osl_createThread(lo_startmain, nullptr);
+                 SAL_INFO("lok", "Waiting for RequestHandler");
++                std::cerr << "[LO_INIT] Waiting for RequestHandler..." << std::endl;
+                 RequestHandler::WaitForReady();
+                 SAL_INFO("lok", "RequestHandler ready -- continuing");
++                std::cerr << "[LO_INIT] RequestHandler ready" << std::endl;
+             }
+             else
++            {
++                std::cerr << "[LO_INIT] Unipoll mode: calling InitVCL()..." << std::endl;
+                 InitVCL();
++                std::cerr << "[LO_INIT] InitVCL() completed" << std::endl;
++            }
+         }
+ 
+         if (eStage != SECOND_INIT)
+             ErrorRegistry::RegisterDisplay(aBasicErrorFunc);
+ 
+         SAL_INFO("lok", "LOK Initialized");
++        std::cerr << "[LO_INIT] LOK Initialized! eStage=" << (int)eStage << std::endl;
+         if (eStage == PRE_INIT)
+             bPreInited = true;
+         else
+@@ -8563,13 +8640,15 @@ static int lo_initialize(LibreOfficeKit* pThis, const char* pAppPath, const char
+                  OUStringToOString(exception.Message, RTL_TEXTENCODING_UTF8).getStr());
+     }
+ 
++    std::cerr << "[LO_INIT] Post-init: ThreadPool/QuickEditing/config..." << std::endl;
++
+     if (eStage == PRE_INIT)
+     {
+         comphelper::ThreadPool::getSharedOptimalPool().shutdown();
+     }
+ 
+ // Turn off quick editing on iOS, Android and Emscripten
+-#if defined IOS || defined ANDROID || defined __EMSCRIPTEN__
++#if defined IOS || defined ANDROID
+     if (officecfg::Office::Impress::Misc::TextObject::QuickEditing::get())
+     {
+         std::shared_ptr<comphelper::ConfigurationChanges> batch(comphelper::ConfigurationChanges::create());
+@@ -8578,10 +8657,13 @@ static int lo_initialize(LibreOfficeKit* pThis, const char* pAppPath, const char
+     }
+ #endif
+ 
+-
++    std::cerr << "[LO_INIT] Calling setHelpRootURL..." << std::endl;
+     setHelpRootURL();
++    std::cerr << "[LO_INIT] Calling setCertificateDir..." << std::endl;
+     setCertificateDir();
++    std::cerr << "[LO_INIT] Calling setDeeplConfig..." << std::endl;
+     setDeeplConfig();
++    std::cerr << "[LO_INIT] Calling setLanguageToolConfig..." << std::endl;
+     setLanguageToolConfig();
+ 
+     if (bNotebookbar)
+@@ -8603,13 +8685,18 @@ static int lo_initialize(LibreOfficeKit* pThis, const char* pAppPath, const char
+     if (eStage == PRE_INIT)
+         rtl_alloc_preInit(false);
+ 
++    std::cerr << "[LO_INIT] lo_initialize() returning " << bInitialized << std::endl;
+     return bInitialized;
+ }
+ 
+ SAL_JNI_EXPORT
+ LibreOfficeKit *libreofficekit_hook_2(const char* install_path, const char* user_profile_url)
+ {
+-    static bool alreadyCalled = false;
++    // alreadyCalled is now a file-scope static for lo_destroy() access in WASM
++
++    std::cerr << "[LO_INIT] libreofficekit_hook_2 called, alreadyCalled=" << alreadyCalled
++              << " lok_preinit_2_called=" << lok_preinit_2_called
++              << " gImpl=" << (void*)gImpl << std::endl;
+ 
+     if ((!lok_preinit_2_called && !gImpl) || (lok_preinit_2_called && !alreadyCalled))
+     {
+@@ -8618,13 +8705,21 @@ LibreOfficeKit *libreofficekit_hook_2(const char* install_path, const char* user
+         if (!lok_preinit_2_called)
+         {
+             SAL_INFO("lok", "Create libreoffice object");
++            std::cerr << "[LO_INIT] Creating LibLibreOffice_Impl..." << std::endl;
+             gImpl = new LibLibreOffice_Impl();
+         }
+ 
++        std::cerr << "[LO_INIT] Calling lo_initialize..." << std::endl;
+         if (!lo_initialize(gImpl, install_path, user_profile_url))
+         {
++            std::cerr << "[LO_INIT] lo_initialize FAILED, calling lo_destroy" << std::endl;
+             lo_destroy(gImpl);
+         }
++        std::cerr << "[LO_INIT] lo_initialize returned" << std::endl;
++    }
++    else
++    {
++        std::cerr << "[LO_INIT] Skipping init (already called or no gImpl)" << std::endl;
+     }
+     return static_cast<LibreOfficeKit*>(gImpl);
+ }
+@@ -8683,6 +8778,38 @@ static void lo_destroy(LibreOfficeKit* pThis)
+ 
+     delete pLib;
+     bInitialized = false;
++
++    // Reset static initialization flags to allow proper reinitialization
++    // This is critical for WASM environments where static state persists
++    // across page refresh. Without this, subsequent lo_initialize() calls
++    // take the SECOND_INIT path which skips initialize_uno().
++    bPreInited = false;
++
++#ifdef __EMSCRIPTEN__
++    // Extended static reset for WASM: reset all known one-time init flags.
++    // V8 caches compiled WASM at the renderer level, so C++ statics persist
++    // across worker recreation. After 4-6 conversions, accumulated stale state
++    // causes documentLoad() to hang indefinitely.
++    bUnipoll = false;
++    bProfileZones = false;
++    bNotebookbar = false;
++    alreadyCalled = false;
++    lok_preinit_2_called = false;
++
++    // Reset comphelper LOK flags to their default values
++    comphelper::LibreOfficeKit::setActive(false);
++    comphelper::LibreOfficeKit::setTiledPainting(false);
++    comphelper::LibreOfficeKit::setDialogPainting(false);
++    comphelper::LibreOfficeKit::setPartInInvalidation(false);
++    comphelper::LibreOfficeKit::setLocalRendering(false);
++    comphelper::LibreOfficeKit::setSlideshowRendering(false);
++    comphelper::LibreOfficeKit::setTiledAnnotations(true);  // default is true
++    comphelper::LibreOfficeKit::setRangeHeaders(false);
++    comphelper::LibreOfficeKit::setViewIdForVisCursorInvalidation(false);
++    comphelper::LibreOfficeKit::setForkedChild(false);
++    comphelper::LibreOfficeKit::resetCompatFlag();
++#endif
++
+     SAL_INFO("lok", "LO Destroy Done");
+ }
+ 

@@ -1,0 +1,98 @@
+--- a/svx/source/form/fmobj.cxx
++++ b/svx/source/form/fmobj.cxx
+@@ -29,6 +29,9 @@
+ 
+ #include <com/sun/star/awt/XDevice.hpp>
+ #include <com/sun/star/beans/XPropertySet.hpp>
++#ifdef __EMSCRIPTEN__
++#include <com/sun/star/beans/UnknownPropertyException.hpp>
++#endif
+ #include <com/sun/star/form/Forms.hpp>
+ #include <com/sun/star/script/XEventAttacherManager.hpp>
+ #include <svx/fmtools.hxx>
+@@ -407,6 +410,39 @@ namespace
+ }
+ 
+ 
++#ifdef __EMSCRIPTEN__
++namespace
++{
++    // FG-165: in the WASM `spreadsheets` module a form has no row set (dbaccess is
++    // not built), so the row-set properties Command and CommandType do not exist
++    // and getPropertyValue throws UnknownPropertyException. ensureModelEnv
++    // compares forms by (Command, CommandType, DataSourceName); with every read
++    // throwing, no form ever equalled even itself, the sibling search ran past
++    // the end of the container, and getByIndex threw IndexOutOfBoundsException
++    // (empty message). That failed the whole load of an .xls with a button
++    // control. A missing property reads as void here, as an unset one would,
++    // so a form compares equal to itself again.
++    Any lcl_getDSSProperty( const Reference< XPropertySet >& _rxForm, const OUString& _rName )
++    {
++        try
++        {
++            return _rxForm->getPropertyValue( _rName );
++        }
++        catch( const UnknownPropertyException& )
++        {
++            return Any();
++        }
++    }
++
++    bool lcl_equalDSS( const Reference< XPropertySet >& _rxForm, const Any& _rCommand, const Any& _rCommandType, const Any& _rDataSource )
++    {
++        return lcl_getDSSProperty( _rxForm, FM_PROP_COMMAND ) == _rCommand
++            && lcl_getDSSProperty( _rxForm, FM_PROP_COMMANDTYPE ) == _rCommandType
++            && lcl_getDSSProperty( _rxForm, FM_PROP_DATASOURCE ) == _rDataSource;
++    }
++}
++#endif
++
+ Reference< XInterface >  FmFormObj::ensureModelEnv(const Reference< XInterface > & _rSourceContainer, const Reference<css::form::XForms>& _rTopLevelDestContainer)
+ {
+     Reference< XInterface >  xTopLevelSource;
+@@ -437,9 +473,15 @@ Reference< XInterface >  FmFormObj::ensureModelEnv(const Reference< XInterface >
+             // the parent access path should refer to a row set
+         try
+         {
++#ifdef __EMSCRIPTEN__
++            aSrcCursorSource        = lcl_getDSSProperty(xSourceForm, FM_PROP_COMMAND);
++            aSrcCursorSourceType    = lcl_getDSSProperty(xSourceForm, FM_PROP_COMMANDTYPE);
++            aSrcDataSource          = lcl_getDSSProperty(xSourceForm, FM_PROP_DATASOURCE);
++#else
+             aSrcCursorSource        = xSourceForm->getPropertyValue(FM_PROP_COMMAND);
+             aSrcCursorSourceType    = xSourceForm->getPropertyValue(FM_PROP_COMMANDTYPE);
+             aSrcDataSource          = xSourceForm->getPropertyValue(FM_PROP_DATASOURCE);
++#endif
+         }
+         catch(Exception&)
+         {
+@@ -463,10 +505,14 @@ Reference< XInterface >  FmFormObj::ensureModelEnv(const Reference< XInterface >
+                 {   // it is a form
+                     try
+                     {
++#ifdef __EMSCRIPTEN__
++                        if ( lcl_equalDSS( xCurrentSourceForm, aSrcCursorSource, aSrcCursorSourceType, aSrcDataSource ) )
++#else
+                         if  (   xCurrentSourceForm->getPropertyValue(FM_PROP_COMMAND) == aSrcCursorSource
+                             &&  xCurrentSourceForm->getPropertyValue(FM_PROP_COMMANDTYPE) == aSrcCursorSourceType
+                             &&  xCurrentSourceForm->getPropertyValue(FM_PROP_DATASOURCE) == aSrcDataSource
+                             )
++#endif
+                         {
+                             bEqualDSS = true;
+                         }
+@@ -495,10 +541,14 @@ Reference< XInterface >  FmFormObj::ensureModelEnv(const Reference< XInterface >
+                 {   // it is a form
+                     try
+                     {
++#ifdef __EMSCRIPTEN__
++                        if ( lcl_equalDSS( xCurrentDestForm, aSrcCursorSource, aSrcCursorSourceType, aSrcDataSource ) )
++#else
+                         if  (   xCurrentDestForm->getPropertyValue(FM_PROP_COMMAND) == aSrcCursorSource
+                             &&  xCurrentDestForm->getPropertyValue(FM_PROP_COMMANDTYPE) == aSrcCursorSourceType
+                             &&  xCurrentDestForm->getPropertyValue(FM_PROP_DATASOURCE) == aSrcDataSource
+                             )
++#endif
+                         {
+                             bEqualDSS = true;
+                         }
