@@ -1,0 +1,31 @@
+A Writer PDF carries no comment annotations unless the caller asks for them.
+
+pdfexport.cxx defaults bExportNotes to true, so every comment of a Writer document became a /Text annotation in the
+PDF. Stock LibreOffice 25.8.7.3 headless writes none (the PDF dialog's configuration default is false), and the
+owner decided on 2026-10-25 (BUG-36, spreadsheet comments) that comments are off by default with an advanced option
+to turn them on, extended to Writer on 2026-10-29. Under __EMSCRIPTEN__ the default is now false. An explicit
+ExportNotes=true in the filter data, which is how the future Advanced option would arrive, is read by the property
+loop below the default and still wins. Editable outputs are not affected: DOCX and ODT keep their comments.
+
+Module-scoped (-documents): the documents module is the Writer module, and it is rebuilt for BUG-48 anyway; the
+bridge is not changed because engine/bridge/ is part of every module's fingerprint.
+
+diff --git a/filter/source/pdf/pdfexport.cxx b/filter/source/pdf/pdfexport.cxx
+--- a/filter/source/pdf/pdfexport.cxx
++++ b/filter/source/pdf/pdfexport.cxx
+@@ -406,7 +406,15 @@
+             bool bUseTaggedPDF = false;
+             sal_Int32 nPDFTypeSelection = 0;
+             bool bPDFUACompliance = false;
++#ifdef __EMSCRIPTEN__
++            // A PDF carries no comment annotations unless the caller asks for them (owner decision: BUG-36 for
++            // spreadsheets, extended to Writer 2026-10-29, matching stock LibreOffice headless). An explicit
++            // FilterData ExportNotes=true, the future Advanced "include comments" option, still wins: the
++            // property loop below assigns it over this default.
++            bool bExportNotes = false;
++#else
+             bool bExportNotes = true;
++#endif
+             bool bExportNotesInMargin = false;
+             bool bExportNotesPages = false;
+             bool bExportOnlyNotesPages = false;

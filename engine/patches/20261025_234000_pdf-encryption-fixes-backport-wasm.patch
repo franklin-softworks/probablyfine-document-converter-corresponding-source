@@ -1,0 +1,638 @@
+Security backport (FG-021, approved by orch for the owner 2026-10-25): upstream LibreOffice's
+PDF encryption fixes from master (August-September 2026), onto our pin 30742500 (25.8.7.3).
+None is on libreoffice-25-8; only aac2961770 is on libreoffice-26-2 (as ff0c1b4fe9).
+Unconditional: correctness and confidentiality fixes for every module's PDF export.
+
+Why: FG-021 build #1 measured our protected PDFs (PDF 2.0, AES-256, R6): every encrypted
+stream carried /Length = the plaintext length while holding IV + padded ciphertext
+(e.g. 375 vs 400 bytes); poppler reported "incorrect stream length" on every file and
+refused one ("Incorrect password"), qpdf recovered silently.
+
+Applied in upstream history order (full hashes; master paths vcl/source/pdf/pdfwriter_impl*.cxx
+and pdfobjectcopier.cxx are vcl/source/gdi/ on 25.8):
+  aac2961770fd  Michael Stahl  2026-08-18  oox,svl,vcl: use more appropriate random numbers
+  01de4c02133b  Michael Stahl  2026-08-18  vcl: PDFEncryptorR6: fix subtle off-by-one in computeHashR6
+  a3623692c3ab  Michael Stahl  2026-08-19  vcl: fix PDFEncryptorR6 padding
+  679f88a775    Michael Stahl  2026-08-19  vcl: PDFEncryptorR6: check result in decryptPerms
+  d46d47657e67  Michael Stahl  2026-08-19  vcl: PDF export: fix a bunch of bad /Length with encryption
+  0f3a469b25    Michael Stahl  2026-08-19  vcl: PDF export: consistency in stream bracketing
+  91970e690b    Michael Stahl  2026-08-19  vcl: PDF export: fix encrypted /Length in PDFObjectCopier
+  e0348ccc9e37  Mike Kaganski  2026-09-30  vcl: encrypt the strings a PDF form field and annotation carry
+The first four applied cleanly. The other four needed the path mapping above and context
+fuzz; two hunks were applied by hand, because 25.8 differs around them:
+  d46d47657e hunk 1 (emitTilings): 25.8 casts the length to sal_Int32; now
+             calculateStreamSize(...) cast to sal_Int64.
+  0f3a469b25 hunk 2 (emitScreenAnnotations): 25.8 builds the EmbeddedFile line with
+             separate appends; same change (calculateStreamSize, and the stream bracketed by
+             checkAndEnableStreamEncryption / disableStreamEncryption).
+Every fuzzed hunk was checked to land in the function upstream changed. e0348ccc9e's commit
+message also describes a state-change annotation (/State, /StateModel); the commit has no hunk
+for it, and 25.8 writes no such annotation, so nothing was left out.
+The vcl/qa unit tests and their data file are omitted (not built here).
+
+diff --git a/include/vcl/filter/pdfdocument.hxx b/include/vcl/filter/pdfdocument.hxx
+index b7ce0b1..71f8357 100644
+--- a/include/vcl/filter/pdfdocument.hxx
++++ b/include/vcl/filter/pdfdocument.hxx
+@@ -601,6 +601,7 @@ public:
+     SAL_DLLPRIVATE bool writeBufferBytes(const void* pBuffer, sal_uInt64 nBytes) override;
+     void checkAndEnableStreamEncryption(sal_Int32 /*nObject*/) override {}
+     void disableStreamEncryption() override {}
++    sal_uInt64 calculateStreamSize(sal_uInt64 const nDataSize) const override { return nDataSize; }
+ };
+ 
+ /// The trailer singleton is at the end of the doc.
+diff --git a/include/vcl/filter/pdfobjectcontainer.hxx b/include/vcl/filter/pdfobjectcontainer.hxx
+index 308ec65..9c3351b 100644
+--- a/include/vcl/filter/pdfobjectcontainer.hxx
++++ b/include/vcl/filter/pdfobjectcontainer.hxx
+@@ -39,6 +39,8 @@ public:
+ 
+     virtual void disableStreamEncryption() = 0;
+ 
++    virtual sal_uInt64 calculateStreamSize(sal_uInt64 nDataSize) const = 0;
++
+ protected:
+     ~PDFObjectContainer() noexcept = default;
+ };
+diff --git a/oox/source/crypto/AgileEngine.cxx b/oox/source/crypto/AgileEngine.cxx
+index c115f2e..3e2dacb 100644
+--- a/oox/source/crypto/AgileEngine.cxx
++++ b/oox/source/crypto/AgileEngine.cxx
+@@ -20,12 +20,12 @@
+ 
+ #include <comphelper/hash.hxx>
+ #include <comphelper/docpasswordhelper.hxx>
+-#include <comphelper/random.hxx>
+ #include <comphelper/processfactory.hxx>
+ #include <comphelper/base64.hxx>
+ #include <comphelper/sequence.hxx>
+ 
+ #include <filter/msfilter/mscodec.hxx>
++#include <rtl/random.h>
+ #include <tools/stream.hxx>
+ #include <tools/XmlWriter.hxx>
+ #include <sax/fastattribs.hxx>
+@@ -318,12 +318,13 @@ namespace
+ 
+ bool generateBytes(std::vector<sal_uInt8> & rBytes, sal_Int32 nSize)
+ {
++    assert(0 <= nSize && o3tl::make_unsigned(nSize) <= rBytes.size());
++    if (nSize <= 0)
++        return false;
++
+     size_t nMax = std::min(rBytes.size(), size_t(nSize));
+ 
+-    for (size_t i = 0; i < nMax; ++i)
+-    {
+-        rBytes[i] = sal_uInt8(comphelper::rng::uniform_uint_distribution(0, 0xFF));
+-    }
++    rtl_random_getBytes(nullptr, rBytes.data(), nMax);
+ 
+     return true;
+ }
+diff --git a/svl/source/crypto/cryptosign.cxx b/svl/source/crypto/cryptosign.cxx
+index 08240d6..430f383 100644
+--- a/svl/source/crypto/cryptosign.cxx
++++ b/svl/source/crypto/cryptosign.cxx
+@@ -22,6 +22,7 @@
+ #endif
+ 
+ #include <rtl/character.hxx>
++#include <rtl/random.h>
+ #include <rtl/strbuf.hxx>
+ #include <rtl/string.hxx>
+ #include <sal/log.hxx>
+@@ -30,7 +31,6 @@
+ #include <comphelper/base64.hxx>
+ #include <comphelper/hash.hxx>
+ #include <comphelper/processfactory.hxx>
+-#include <comphelper/random.hxx>
+ #include <comphelper/scopeguard.hxx>
+ #include <comphelper/lok.hxx>
+ #include <com/sun/star/security/XCertificate.hpp>
+@@ -1086,7 +1086,8 @@ bool Signing::Sign(OStringBuffer& rCMSHexBuffer)
+         src.reqPolicy.data = nullptr;
+         src.reqPolicy.len = 0;
+ 
+-        unsigned int nNonce = comphelper::rng::uniform_uint_distribution(0, SAL_MAX_UINT32);
++        unsigned int nNonce;
++        rtl_random_getBytes(nullptr, &nNonce, sizeof(nNonce));
+         src.nonce.type = siUnsignedInteger;
+         src.nonce.data = reinterpret_cast<unsigned char*>(&nNonce);
+         src.nonce.len = sizeof(nNonce);
+@@ -1481,7 +1482,8 @@ bool Signing::Sign(OStringBuffer& rCMSHexBuffer)
+         CMSG_SIGNER_INFO *pDecodedSignerInfo = reinterpret_cast<CMSG_SIGNER_INFO *>(pDecodedSignerInfoBuf.get());
+ 
+         CRYPT_TIMESTAMP_PARA aTsPara;
+-        unsigned int nNonce = comphelper::rng::uniform_uint_distribution(0, SAL_MAX_UINT32);
++        unsigned int nNonce;
++        rtl_random_getBytes(nullptr, &nNonce, sizeof(nNonce));
+ 
+         aTsPara.pszTSAPolicyId = nullptr;
+         aTsPara.fRequestCerts = TRUE;
+diff --git a/vcl/inc/pdf/pdfwriter_impl.hxx b/vcl/inc/pdf/pdfwriter_impl.hxx
+index 5d008fd..7806a9a 100644
+--- a/vcl/inc/pdf/pdfwriter_impl.hxx
++++ b/vcl/inc/pdf/pdfwriter_impl.hxx
+@@ -860,6 +860,10 @@ private:
+ 
+     void disableStreamEncryption() override;
+ 
++    /** Number of bytes that nDataSize bytes of input data occupy, taking
++        into account encryption overhead. */
++    sal_uInt64 calculateStreamSize(sal_uInt64 nDataSize) const override;
++
+     /* */
+     void enableStringEncryption( sal_Int32 nObject );
+ 
+diff --git a/vcl/source/gdi/pdfobjectcopier.cxx b/vcl/source/gdi/pdfobjectcopier.cxx
+index 3761520..b7dfeed 100644
+--- a/vcl/source/gdi/pdfobjectcopier.cxx
++++ b/vcl/source/gdi/pdfobjectcopier.cxx
+@@ -93,6 +93,13 @@ sal_Int32 PDFObjectCopier::copyExternalResource(SvMemoryStream& rDocBuffer,
+ 
+     OStringBuffer aLine = OString::number(nObject) + " 0 obj\n";
+ 
++    filter::PDFStreamElement* pStream = rObject.GetStream();
++
++    // With encryption, the stream will be longer than the length of the
++    // source document.
++    sal_uInt64 const nDataSize{ pStream ? pStream->GetMemory().GetSize() : 0 };
++    sal_uInt64 const nStreamSize{ m_rContainer.calculateStreamSize(nDataSize) };
++
+     if (rObject.GetDictionary())
+     {
+         aLine.append("<< ");
+@@ -105,13 +112,19 @@ sal_Int32 PDFObjectCopier::copyExternalResource(SvMemoryStream& rDocBuffer,
+                 aLine.append(" ");
+ 
+             aLine.append("/" + rPair.first + " ");
+-            copyRecursively(aLine, *rPair.second, rDocBuffer, rCopiedResources);
++            if (rPair.first == "Length" && pStream && nStreamSize != nDataSize)
++            {
++                aLine.append(static_cast<sal_Int64>(nStreamSize));
++            }
++            else
++            {
++                copyRecursively(aLine, *rPair.second, rDocBuffer, rCopiedResources);
++            }
+         }
+ 
+         aLine.append(" >>\n");
+     }
+ 
+-    filter::PDFStreamElement* pStream = rObject.GetStream();
+     if (pStream)
+     {
+         aLine.append("stream\n");
+diff --git a/vcl/source/gdi/pdfwriter_impl.cxx b/vcl/source/gdi/pdfwriter_impl.cxx
+index eae5cd2..d9240d7 100644
+--- a/vcl/source/gdi/pdfwriter_impl.cxx
++++ b/vcl/source/gdi/pdfwriter_impl.cxx
+@@ -1959,7 +1959,7 @@ void PDFWriterImpl::emitNamespaces()
+         aWriter.startObject(nObject);
+         aWriter.startDict();
+         aWriter.write("/Type", "/Namespace");
+-        aWriter.writeKeyAndLiteral("/NS", sNamespace);
++        aWriter.writeKeyAndLiteralEncrypt("/NS", sNamespace, nObject);
+         if( ! m_aRoleMap.empty() )
+         {
+             aLine.append( "/RoleMapNS<<" );
+@@ -2285,7 +2285,7 @@ bool PDFWriterImpl::emitTilings()
+         if( bDeflate )
+             aTilingObj.append( "/Filter/FlateDecode" );
+         aTilingObj.append( "/Length "
+-            + OString::number(static_cast<sal_Int32>(nTilingStreamSize))
++            + OString::number(static_cast<sal_Int64>(calculateStreamSize(nTilingStreamSize)))
+             + ">>\nstream\n" );
+         if ( !updateObject( tiling.m_nObject ) ) return false;
+         if ( !writeBuffer( aTilingObj ) ) return false;
+@@ -2671,17 +2671,23 @@ bool PDFWriterImpl::emitType3Font(const vcl::font::PhysicalFontFace* pFace,
+                                  "Q\n");
+             }
+ 
++            // The newline before `endstream` is not counted as within the stream
++            assert(aContents[aContents.getLength() - 1] == '\n');
++            aContents.setLength(aContents.getLength() - 1);
++            assert(aContents[aContents.getLength() - 1] != '\n');
+             aLine.setLength(0);
+             aLine.append(OString::number(nStream)
+                 + " 0 obj\n<</Length "
+-                + OString::number(aContents.getLength() - 1) // Trailing newline doesn't count
++                + OString::number(calculateStreamSize(aContents.getLength()))
+                 + ">>\nstream\n");
+             if (!writeBuffer(aLine))
+                 return false;
++            checkAndEnableStreamEncryption(nStream);
+             if (!writeBuffer(aContents))
+                 return false;
++            disableStreamEncryption();
+             aLine.setLength(0);
+-            aLine.append("endstream\nendobj\n\n");
++            aLine.append("\nendstream\nendobj\n\n");
+             if (!writeBuffer(aLine))
+                 return false;
+         }
+@@ -2886,10 +2892,10 @@ sal_Int32 PDFWriterImpl::createToUnicodeCMap( sal_uInt8 const * pEncoding,
+     {
+         nLen = aStream.Tell();
+         aStream.Seek( 0 );
+-        aLine.append( OString::number(nLen) + "/Filter/FlateDecode" );
++        aLine.append(OString::number(calculateStreamSize(nLen)) + "/Filter/FlateDecode");
+     }
+     else
+-        aLine.append( aContents.getLength() );
++        aLine.append(OString::number(calculateStreamSize(aContents.getLength())));
+     aLine.append( ">>\nstream\n" );
+     if (!writeBuffer(aLine)) return 0;
+     checkAndEnableStreamEncryption( nStream );
+@@ -3488,14 +3494,16 @@ bool PDFWriterImpl::emitScreenAnnotations()
+             aLine.append(rScreen.m_nTempFileObject);
+             aLine.append(" 0 obj\n");
+             aLine.append("<< /Type /EmbeddedFile /Length ");
+-            aLine.append(static_cast<sal_Int64>(aMemoryStream.GetSize()));
++            aLine.append(static_cast<sal_Int64>(calculateStreamSize(aMemoryStream.GetSize())));
+             aLine.append(" >>\nstream\n");
+             if (!writeBuffer(aLine))
+                 return false;
+             aLine.setLength(0);
+ 
++            checkAndEnableStreamEncryption(rScreen.m_nTempFileObject);
+             if (!writeBufferBytes(aMemoryStream.GetData(), aMemoryStream.GetSize()))
+                 return false;
++            disableStreamEncryption();
+ 
+             aLine.append("\nendstream\nendobj\n\n");
+             if (!writeBuffer(aLine))
+@@ -3532,10 +3540,11 @@ bool PDFWriterImpl::emitScreenAnnotations()
+         aLine.append("/C<</Type/MediaClip /S/MCD ");
+         if (bEmbed)
+         {
+-            aLine.append("\n/D << /Type /Filespec /F (<embedded file>) ");
++            aLine.append("\n/D << /Type /Filespec ");
++            aWriter.writeKeyAndLiteralEncrypt("/F", "<embedded file>", rScreen.m_nObject);
+             if (PDFWriter::PDFVersion::PDF_1_7 <= m_aContext.Version)
+             {   // ISO 14289-1:2014, Clause: 7.11
+-                aLine.append("/UF (<embedded file>) ");
++                aWriter.writeKeyAndLiteralEncrypt("/UF", "<embedded file>", rScreen.m_nObject);
+             }
+             aLine.append("/EF << /F ");
+             aLine.append(rScreen.m_nTempFileObject);
+@@ -3560,13 +3569,17 @@ bool PDFWriterImpl::emitScreenAnnotations()
+         }
+         aLine.append(" >>\n"); // end of /D
+         // Allow playing the video via a tempfile.
+-        aLine.append("/P <</TF (TEMPACCESS)>>");
++        aLine.append("/P <<");
++        aWriter.writeKeyAndLiteralEncrypt("/TF", "TEMPACCESS", rScreen.m_nObject);
++        aLine.append(">>");
+         // ISO 14289-1:2014, Clause: 7.18.6.2
+         aLine.append("/CT ");
+         aWriter.writeLiteralEncrypt(rScreen.m_MimeType, rScreen.m_nObject);
+         // ISO 14289-1:2014, Clause: 7.18.6.2
+         // Alt text is a "Multi-language Text Array"
+-        aLine.append(" /Alt [ () ");
++        aLine.append(" /Alt [ ");
++        aWriter.writeLiteralEncrypt("", rScreen.m_nObject);
++        aLine.append(" ");
+         aWriter.writeUnicodeEncrypt(rScreen.m_AltText, rScreen.m_nObject);
+         aLine.append(" ] "
+                      ">>");
+@@ -3983,9 +3996,10 @@ void PDFWriterImpl::emitTextAnnotationLine(OStringBuffer & aLine, PDFNoteEntry c
+ 
+     auto & rDateTime = rNote.m_aContents.maModificationDate;
+ 
+-    aLine.append("/M (");
+-    appendPdfTimeDate(aLine, rDateTime.Year, rDateTime.Month, rDateTime.Day, rDateTime.Hours, rDateTime.Minutes, rDateTime.Seconds, 0);
+-    aLine.append(") ");
++    OStringBuffer aDate;
++    appendPdfTimeDate(aDate, rDateTime.Year, rDateTime.Month, rDateTime.Day, rDateTime.Hours,
++                      rDateTime.Minutes, rDateTime.Seconds, 0);
++    aWriter.writeKeyAndLiteralEncrypt("/M", aDate, rNote.m_nObject);
+ 
+     // contents of the note (type text string)
+     aLine.append("/Contents ");
+@@ -4627,7 +4641,7 @@ bool PDFWriterImpl::emitAppearances( PDFWidget& rWidget, OStringBuffer& rAnnotDi
+                 aLine.append( getResourceDictObj() );
+                 aLine.append( " 0 R\n"
+                               "/Length " );
+-                aLine.append( nStreamLen );
++                aLine.append(static_cast<sal_Int64>(calculateStreamSize(nStreamLen)));
+                 aLine.append( "\n" );
+                 if( bDeflate )
+                     aLine.append( "/Filter/FlateDecode\n" );
+@@ -4918,51 +4932,52 @@ bool PDFWriterImpl::emitWidgetAnnotations()
+                 {
+                     // Get the hexadecimal code
+                     sal_UCS4 cChar = rWidget.m_aCurrencySymbol.iterateCodePoints(&o3tl::temporary(sal_Int32(1)), -1);
+-                    aHexText = "\\\\u" + OString::number(cChar, 16);
++                    aHexText = "\\u" + OString::number(cChar, 16);
+                 }
+ 
++                const OString aArgs = OString::number(rWidget.m_nDecimalAccuracy) + ", 0, 0, 0, \""
++                                      + aHexText + "\","
++                                      + OString::boolean(rWidget.m_bPrependCurrencySymbol) + ");";
+                 aLine.append("/AA<<\n");
+-                aLine.append("/F<</JS(AFNumber_Format\\(");
+-                aLine.append(OString::number(rWidget.m_nDecimalAccuracy));
+-                aLine.append(", 0, 0, 0, \"");
+-                aLine.append( aHexText );
+-                aLine.append("\",");
+-                aLine.append(OString::boolean(rWidget.m_bPrependCurrencySymbol));
+-                aLine.append("\\);)");
++                aLine.append("/F<<");
++                const OString aFormatJS = "AFNumber_Format(" + aArgs;
++                aWriter.writeKeyAndLiteralEncrypt("/JS", aFormatJS, rWidget.m_nObject);
+                 aLine.append("/S/JavaScript>>\n");
+-                aLine.append("/K<</JS(AFNumber_Keystroke\\(");
+-                aLine.append(OString::number(rWidget.m_nDecimalAccuracy));
+-                aLine.append(", 0, 0, 0, \"");
+-                aLine.append( aHexText );
+-                aLine.append("\",");
+-                aLine.append(OString::boolean(rWidget.m_bPrependCurrencySymbol));
+-                aLine.append("\\);)");
++                aLine.append("/K<<");
++                const OString aKeystrokeJS = "AFNumber_Keystroke(" + aArgs;
++                aWriter.writeKeyAndLiteralEncrypt("/JS", aKeystrokeJS, rWidget.m_nObject);
+                 aLine.append("/S/JavaScript>>\n");
+                 aLine.append(">>\n");
+             }
+             else if ( rWidget.m_nFormat == PDFWriter::Time )
+             {
++                const OString aArg
++                    = "(\"" + OUStringToOString(rWidget.m_aTimeFormat, RTL_TEXTENCODING_ASCII_US)
++                      + "\");";
+                 aLine.append("/AA<<\n");
+-                aLine.append("/F<</JS(AFTime_FormatEx\\(\"");
+-                aLine.append(OUStringToOString(rWidget.m_aTimeFormat, RTL_TEXTENCODING_ASCII_US));
+-                aLine.append("\"\\);)");
++                aLine.append("/F<<");
++                const OString aFormatJS = "AFTime_FormatEx" + aArg;
++                aWriter.writeKeyAndLiteralEncrypt("/JS", aFormatJS, rWidget.m_nObject);
+                 aLine.append("/S/JavaScript>>\n");
+-                aLine.append("/K<</JS(AFTime_KeystrokeEx\\(\"");
+-                aLine.append(OUStringToOString(rWidget.m_aTimeFormat, RTL_TEXTENCODING_ASCII_US));
+-                aLine.append("\"\\);)");
++                aLine.append("/K<<");
++                const OString aKeystrokeJS = "AFTime_KeystrokeEx" + aArg;
++                aWriter.writeKeyAndLiteralEncrypt("/JS", aKeystrokeJS, rWidget.m_nObject);
+                 aLine.append("/S/JavaScript>>\n");
+                 aLine.append(">>\n");
+             }
+             else if ( rWidget.m_nFormat == PDFWriter::Date )
+             {
++                const OString aArg
++                    = "(\"" + OUStringToOString(rWidget.m_aDateFormat, RTL_TEXTENCODING_ASCII_US)
++                      + "\");";
+                 aLine.append("/AA<<\n");
+-                aLine.append("/F<</JS(AFDate_FormatEx\\(\"");
+-                aLine.append(OUStringToOString(rWidget.m_aDateFormat, RTL_TEXTENCODING_ASCII_US));
+-                aLine.append("\"\\);)");
++                aLine.append("/F<<");
++                const OString aFormatJS = "AFDate_FormatEx" + aArg;
++                aWriter.writeKeyAndLiteralEncrypt("/JS", aFormatJS, rWidget.m_nObject);
+                 aLine.append("/S/JavaScript>>\n");
+-                aLine.append("/K<</JS(AFDate_KeystrokeEx\\(\"");
+-                aLine.append(OUStringToOString(rWidget.m_aDateFormat, RTL_TEXTENCODING_ASCII_US));
+-                aLine.append("\"\\);)");
++                aLine.append("/K<<");
++                const OString aKeystrokeJS = "AFDate_KeystrokeEx" + aArg;
++                aWriter.writeKeyAndLiteralEncrypt("/JS", aKeystrokeJS, rWidget.m_nObject);
+                 aLine.append("/S/JavaScript>>\n");
+                 aLine.append(">>\n");
+             }
+@@ -5017,9 +5032,10 @@ bool PDFWriterImpl::emitWidgetAnnotations()
+                 else
+                 {
+                     // create a URI action
+-                    aLine.append( "/AA<</D<</Type/Action/S/URI/URI(" );
+-                    aLine.append( OUStringToOString( rWidget.m_aListEntries.front(), RTL_TEXTENCODING_ASCII_US ) );
+-                    aLine.append( ")>>>>\n" );
++                    aLine.append("/AA<</D<</Type/Action/S/URI/URI");
++                    aWriter.writeLiteralEncrypt(rWidget.m_aListEntries.front(), rWidget.m_nObject,
++                                                RTL_TEXTENCODING_ASCII_US);
++                    aLine.append(">>>>\n");
+                 }
+             }
+             else
+@@ -5134,11 +5150,12 @@ bool PDFWriterImpl::emitEmbeddedFiles()
+         sal_Int64 nSize{};
+         if (!rEmbeddedFile.m_aDataContainer.isEmpty())
+         {
+-            nSize = rEmbeddedFile.m_aDataContainer.getSize();
+             checkAndEnableStreamEncryption(rEmbeddedFile.m_nObject);
++            sal_uInt64 const nStartPos{getCurrentFilePosition()};
+             if (!writeBufferBytes(rEmbeddedFile.m_aDataContainer.getData(), rEmbeddedFile.m_aDataContainer.getSize()))
+                 return false;
+             disableStreamEncryption();
++            nSize = sal_Int64(getCurrentFilePosition() - nStartPos);
+         }
+         else if (rEmbeddedFile.m_pStream)
+         {
+@@ -5984,13 +6001,18 @@ sal_Int32 PDFWriterImpl::emitDocumentMetadata()
+     lcl_assignMeta(m_aContext.DocumentInfo.Creator, aMetadata.m_sCreatorTool);
+     aMetadata.m_sCreateDate = m_aCreationMetaDateString;
+ 
++    bool const bEncryptMetadata{m_pPDFEncryptor && m_pPDFEncryptor->isMetadataEncrypted()};
++
+     {
++        sal_uInt64 const nLength{bEncryptMetadata
++                ? calculateStreamSize(aMetadata.getSize())
++                : aMetadata.getSize()};
+         COSWriter aWriter;
+         aWriter.startObject(nObject);
+         aWriter.startDict();
+         aWriter.write("/Type", "/Metadata");
+         aWriter.write("/Subtype", "/XML");
+-        aWriter.write("/Length", sal_Int32(aMetadata.getSize()));
++        aWriter.write("/Length", sal_Int32(nLength));
+         aWriter.endDict();
+         aWriter.startStream();
+         if (!writeBuffer(aWriter.getLine()))
+@@ -5998,7 +6020,6 @@ sal_Int32 PDFWriterImpl::emitDocumentMetadata()
+     }
+ 
+     //emit the stream
+-    bool bEncryptMetadata = m_pPDFEncryptor && m_pPDFEncryptor->isMetadataEncrypted();
+     if (bEncryptMetadata)
+         checkAndEnableStreamEncryption(nObject);
+ 
+@@ -8864,7 +8885,7 @@ void PDFWriterImpl::writeTransparentObject( TransparencyEmit& rObject )
+     }
+ 
+     aLine.append( "/Length " );
+-    aLine.append( static_cast<sal_Int32>(nSize) );
++    aLine.append(static_cast<sal_Int64>(calculateStreamSize(nSize)));
+     aLine.append( "\n" );
+     if( bFlateFilter )
+         aLine.append( "/Filter/FlateDecode\n" );
+@@ -9178,7 +9199,7 @@ void PDFWriterImpl::writeJPG( const JPGEmit& rObject )
+     else
+         aLine.append( "/ColorSpace/DeviceGray" );
+     aLine.append( "/Filter/DCTDecode/Length " );
+-    aLine.append( static_cast<sal_Int64>(nLength) );
++    aLine.append(static_cast<sal_Int64>(calculateStreamSize(nLength)));
+     if( nMaskObject )
+     {
+         aLine.append(" /SMask ");
+@@ -9392,7 +9413,7 @@ void PDFWriterImpl::writeReferenceXObject(const ReferenceXObjectEmit& rEmit)
+         bool bIsTaggedNonReferenceXObject = m_aContext.Tagged && !m_aContext.UseReferenceXObject;
+         sal_Int32 nLength = PDFObjectCopier::copyPageStreams(aContentStreams, aStream, bCompressed,
+                                                              bIsTaggedNonReferenceXObject);
+-        aLine.append(nLength);
++        aLine.append(static_cast<sal_Int64>(calculateStreamSize(nLength)));
+ 
+         aLine.append(">>\nstream\n");
+         if (g_bDebugDisableCompression)
+@@ -9457,10 +9478,12 @@ void PDFWriterImpl::writeReferenceXObject(const ReferenceXObjectEmit& rEmit)
+     if (m_aContext.UseReferenceXObject && rEmit.m_nEmbeddedObject > 0)
+     {
+         // Write the reference dictionary.
+-        aLine.append("/Ref<< /F << /Type /Filespec /F (<embedded file>) ");
++        COSWriter aWriter(aLine, m_aContext.Encryption.getParams(), m_pPDFEncryptor);
++        aLine.append("/Ref<< /F << /Type /Filespec ");
++        aWriter.writeKeyAndLiteralEncrypt("/F", "<embedded file>", rEmit.m_nFormObject);
+         if (PDFWriter::PDFVersion::PDF_1_7 <= m_aContext.Version)
+         {   // ISO 14289-1:2014, Clause: 7.11
+-            aLine.append("/UF (<embedded file>) ");
++            aWriter.writeKeyAndLiteralEncrypt("/UF", "<embedded file>", rEmit.m_nFormObject);
+         }
+         aLine.append("/EF << /F ");
+         aLine.append(rEmit.m_nEmbeddedObject);
+@@ -9507,7 +9530,7 @@ void PDFWriterImpl::writeReferenceXObject(const ReferenceXObjectEmit& rEmit)
+         aStream.append(" Do\n");
+     }
+     aStream.append("Q");
+-    aLine.append(aStream.getLength());
++    aLine.append(static_cast<sal_Int64>(calculateStreamSize(aStream.getLength())));
+ 
+     aLine.append(">>\nstream\n");
+     if (!writeBuffer(aLine))
+diff --git a/vcl/source/gdi/pdfwriter_impl2.cxx b/vcl/source/gdi/pdfwriter_impl2.cxx
+index 61452c1..5793ae1 100644
+--- a/vcl/source/gdi/pdfwriter_impl2.cxx
++++ b/vcl/source/gdi/pdfwriter_impl2.cxx
+@@ -1040,6 +1040,16 @@ void PDFWriterImpl::disableStreamEncryption()
+         m_pPDFEncryptor->disableStreamEncryption();
+ }
+ 
++sal_uInt64 PDFWriterImpl::calculateStreamSize(sal_uInt64 const nDataSize) const
++{
++    if (!m_aContext.Encryption.canEncrypt() || !m_pPDFEncryptor)
++    {
++        return nDataSize;
++    }
++
++    return m_pPDFEncryptor->calculateSizeIncludingHeader(nDataSize);
++}
++
+ void PDFWriterImpl::enableStringEncryption(sal_Int32 nObject)
+ {
+     if (!m_aContext.Encryption.canEncrypt() || !m_pPDFEncryptor)
+diff --git a/vcl/source/pdf/PDFEncryptor.cxx b/vcl/source/pdf/PDFEncryptor.cxx
+index 315a2c6..86ab23c 100644
+--- a/vcl/source/pdf/PDFEncryptor.cxx
++++ b/vcl/source/pdf/PDFEncryptor.cxx
+@@ -13,7 +13,6 @@
+ #include <vcl/pdfwriter.hxx>
+ #include <comphelper/crypto/Crypto.hxx>
+ #include <comphelper/hash.hxx>
+-#include <comphelper/random.hxx>
+ #include <comphelper/diagnose_ex.hxx>
+ #include <array>
+ 
+diff --git a/vcl/source/pdf/PDFEncryptorR6.cxx b/vcl/source/pdf/PDFEncryptorR6.cxx
+index 71e2b6e..de3bf2f 100644
+--- a/vcl/source/pdf/PDFEncryptorR6.cxx
++++ b/vcl/source/pdf/PDFEncryptorR6.cxx
+@@ -12,7 +12,7 @@
+ #include <pdf/pdfwriter_impl.hxx>
+ #include <comphelper/crypto/Crypto.hxx>
+ #include <comphelper/hash.hxx>
+-#include <comphelper/random.hxx>
++#include <rtl/random.h>
+ 
+ using namespace css;
+ 
+@@ -38,8 +38,10 @@ void generateBytes(std::vector<sal_uInt8>& rBytes, size_t nSize)
+ {
+     rBytes.resize(nSize);
+ 
+-    for (size_t i = 0; i < rBytes.size(); ++i)
+-        rBytes[i] = sal_uInt8(comphelper::rng::uniform_uint_distribution(0, 0xFF));
++    if (rBytes.empty())
++        return;
++
++    rtl_random_getBytes(nullptr, rBytes.data(), rBytes.size());
+ }
+ 
+ } // end anonymous
+@@ -136,11 +138,16 @@ std::vector<sal_uInt8> decryptKey(const sal_uInt8* pPass, size_t nLength, std::v
+ std::vector<sal_uInt8> decryptPerms(std::vector<sal_uInt8>& rPermsEncrypted,
+                                     std::vector<sal_uInt8>& rFileEncryptionKey)
+ {
+-    std::vector<sal_uInt8> aPermsDecrpyted(rPermsEncrypted.size());
++    std::vector<sal_uInt8> aPermsDecrypted(rPermsEncrypted.size());
+     std::vector<sal_uInt8> iv(IV_SIZE, 0);
+     comphelper::Decrypt aDecryptor(rFileEncryptionKey, iv, comphelper::CryptoType::AES_256_ECB);
+-    aDecryptor.update(aPermsDecrpyted, rPermsEncrypted);
+-    return aPermsDecrpyted;
++    aDecryptor.update(aPermsDecrypted, rPermsEncrypted);
++    if (aPermsDecrypted[9] == 'a' && aPermsDecrypted[10] == 'd' && aPermsDecrypted[11] == 'b')
++    {
++        return aPermsDecrypted;
++    }
++    SAL_INFO("vcl.pdfwriter", "decryptPerms failed");
++    return {};
+ }
+ 
+ /** Algorithm 10 step f) */
+@@ -190,7 +197,9 @@ std::vector<sal_uInt8> computeHashR6(const sal_uInt8* pPassword, size_t nPasswor
+ 
+     std::vector<sal_uInt8> E;
+ 
+-    sal_Int32 nRound = 1; // round 0 is done already
++    // Counts the repetitions of steps a) to d) done so far.
++    // K is the input to the first repetition and is not counted.
++    sal_Int32 nRound = 0;
+     do
+     {
+         // Step a)
+@@ -235,7 +244,7 @@ std::vector<sal_uInt8> computeHashR6(const sal_uInt8* pPassword, size_t nPasswor
+     }
+     // Step e) and f)
+     // We stop iteration if we do at least 64 rounds and (the last element of E <= round number - 32)
+-    while (nRound <= 64 || E.back() > (nRound - 32));
++    while (nRound < 64 || E.back() > (nRound - 32));
+ 
+     // Output - first 32 bytes
+     return std::vector<sal_uInt8>(K.begin(), K.begin() + 32);
+@@ -243,13 +252,10 @@ std::vector<sal_uInt8> computeHashR6(const sal_uInt8* pPassword, size_t nPasswor
+ 
+ size_t addPaddingToVector(std::vector<sal_uInt8>& rVector, size_t nBlockSize)
+ {
+-    size_t nPaddedSize = comphelper::roundUp(rVector.size(), size_t(nBlockSize));
+-    if (nPaddedSize > rVector.size())
+-    {
+-        sal_uInt8 nPaddedValue = sal_uInt8(nPaddedSize - rVector.size());
+-        rVector.resize(nPaddedSize, nPaddedValue);
+-    }
+-    return nPaddedSize;
++    // RFC 8018 PKCS #5: Always add padding, between 1 and nBlockSize bytes.
++    size_t nPaddingSize = nBlockSize - (rVector.size() % nBlockSize);
++    rVector.resize(rVector.size() + nPaddingSize, sal_uInt8(nPaddingSize));
++    return rVector.size();
+ }
+ 
+ class VCL_DLLPUBLIC EncryptionContext
+@@ -349,7 +355,8 @@ void PDFEncryptorR6::setupKeysAndCheck(vcl::PDFEncryptionProperties& rProperties
+ 
+ sal_uInt64 PDFEncryptorR6::calculateSizeIncludingHeader(sal_uInt64 nSize)
+ {
+-    return IV_SIZE + comphelper::roundUp<sal_uInt64>(nSize, BLOCK_SIZE);
++    // IV goes before the data, and padding adds 1 to BLOCK_SIZE bytes.
++    return IV_SIZE + nSize + (BLOCK_SIZE - nSize % BLOCK_SIZE);
+ }
+ 
+ void PDFEncryptorR6::setupEncryption(std::vector<sal_uInt8>& rEncryptionKey, sal_Int32 /*nObject*/)
