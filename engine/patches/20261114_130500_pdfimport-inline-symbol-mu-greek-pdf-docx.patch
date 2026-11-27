@@ -1,0 +1,53 @@
+diff --git a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+index 181c5fa..b051cfa 100644
+--- a/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
++++ b/sdext/source/pdfimport/xpdfwrapper/pdfioutdev_gpl.cxx
+@@ -57,6 +57,7 @@
+ #include <memory>
+ #include <vector>
+ #include <algorithm>
++#include <cctype>
+ #include <cmath>
+ #include <limits>
+ 
+@@ -1570,10 +1571,39 @@ void PDFOutDev::drawChar(GfxState *state, double x, double y,
+     (void)&mapUCS2;
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++    // BUG-82: the Symbol font's code 0x6D is the glyph named "mu"; poppler's name table turns it into U+00B5 MICRO SIGN, while Microsoft Office's own PDF of the
++    // same text carries U+03BC GREEK SMALL LETTER MU (a screen reader says "micro" for the first, "mu" for the second, and the Greek letter is what the glyph is).
++    // Only in a font named Symbol: a Latin font's U+00B5 is a micro sign.
++    bool bSymbolFont = false;
++#if POPPLER_CHECK_VERSION(22, 6, 0)
++    GfxFont* pDrawFont = state->getFont().get();
++#else
++    GfxFont* pDrawFont = state->getFont();
++#endif
++    if( pDrawFont )
++    {
++#if POPPLER_CHECK_VERSION(20, 12, 0)
++        std::string aDrawFontName = pDrawFont->getNameWithoutSubsetTag();
++#else
++        std::string aDrawFontName = pDrawFont->getName() ? pDrawFont->getName()->toStr() : std::string();
++#endif
++        for( char& rCh : aDrawFontName )
++            rCh = static_cast<char>(std::tolower(static_cast<unsigned char>(rCh)));
++        bSymbolFont = aDrawFontName.find("symbol") != std::string::npos
++                      && aDrawFontName.find("symbolneu") == std::string::npos;
++    }
++#endif
++
+     char buf[9];
+     for( int i=0; i<uLen; ++i )
+     {
+-        buf[ m_pUtf8Map->mapUnicode(u[i], buf, sizeof(buf)-1) ] = 0;
++        Unicode nChar = u[i];
++#ifdef __EMSCRIPTEN__
++        if( bSymbolFont && nChar == 0x00B5 )
++            nChar = 0x03BC;
++#endif
++        buf[ m_pUtf8Map->mapUnicode(nChar, buf, sizeof(buf)-1) ] = 0;
+         std::vector<char> aEsc( lcl_escapeLineFeeds(buf) );
+         printf( "%s", aEsc.data() );
+     }

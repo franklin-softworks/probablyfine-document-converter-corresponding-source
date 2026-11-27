@@ -1,0 +1,106 @@
+FG-054: EOT decoding is on only when the HOST asks, never because of the document.
+
+libeot is built into the presentations module (--enable-eot). This makes embeddedfontshelper decode an
+embedded EOT font only when the engine's environment has LO_WASM_ALLOW_EOT=1; otherwise the font is
+treated exactly as in a build without EOT (not decoded, not used, its temporary file removed).
+
+The converter's worker sets the variable in preRun when INIT carries allowEmbeddedEot === true
+(web/js/conversion_worker.js). The website's driver sends it; the MCP builds INIT itself from a fixed
+field list and sends nothing, so it keeps an engine that refuses EOT (the WAF's condition, 2026-10-24,
+docs/converter-contract.md F-CC-006 in the MCP repo). Anything but exactly "1" refuses.
+
+Module-scoped (-presentations): ENABLE_EOT is off in every other module, so this code is not compiled
+there.
+
+Rights (owner decision 2026-10-29): an EOT font follows the same rights rule as every other embedded font, not
+libeot's EOTcanLegallyEdit (installable or editable only), which stays in use outside WASM. Preview & Print is
+accepted for every output, the least restrictive usage bit wins, Restricted alone and bitmap-only are refused, and
+no-subsetting refuses PDF output only. The rule is applied to the fsType in the EOT header (lcl_eotHeaderRights,
+the same decision order as lcl_sufficientRights) AND to the decoded font's own OS/2 fsType
+(lcl_sufficientRights); both must pass. The converter's font extractor sees only the header, so requiring both
+means it can never skip a substitute download for a font the engine refuses; a header that allows what the font
+forbids costs one extra conversion (the driver's verify-and-retry). The font file that is written is the decoded
+font itself, so a re-embedded font keeps its real fsType.
+
+diff --git a/vcl/source/gdi/embeddedfontshelper.cxx b/vcl/source/gdi/embeddedfontshelper.cxx
+--- a/vcl/source/gdi/embeddedfontshelper.cxx
++++ b/vcl/source/gdi/embeddedfontshelper.cxx
+@@ -31,6 +31,7 @@
+ #include <sft.hxx>
+ 
+ #if ENABLE_EOT
++#include <cstdlib>
+ extern "C"
+ {
+ namespace libeot
+@@ -38,6 +39,43 @@
+ #include <libeot/libeot.h>
+ } // namespace libeot
+ } // extern "C"
++
++// FG-054: whether EOT is decoded is decided by the EMBEDDER, never by the document. The converter's
++// browser driver asks for it (INIT.allowEmbeddedEot); its worker then sets LO_WASM_ALLOW_EOT=1 in the
++// engine's environment before the engine starts. A host that does not (the MCP) gets the engine as it
++// is without EOT: the font is not decoded and not used. Anything but exactly "1" refuses.
++static bool lcl_eotAllowed()
++{
++#ifdef __EMSCRIPTEN__
++    const char* p = getenv( "LO_WASM_ALLOW_EOT" );
++    return p && p[0] == '1' && p[1] == '\0';
++#else
++    return true;
++#endif
++}
++
++#ifdef __EMSCRIPTEN__
++// Owner decision 2026-10-29: an EOT font follows the same rights rule as every other embedded font. This is
++// that rule (lcl_sufficientRights, below, is the same decision order) for the fsType in the EOT header, which
++// the converter's font extractor also reads. The engine requires the header AND the decoded font's own OS/2
++// fsType to pass, so the extractor, which sees only the header, can never skip a substitute download for a
++// font the engine then refuses unseen: the only disagreement left is a header that allows what the font
++// forbids, which costs one extra conversion (the driver's verify-and-retry), never a missing face.
++static bool lcl_eotHeaderRights( sal_uInt32 nFsType, bool bPdfOnly )
++{
++    if( nFsType & 0x0200 )
++        return false; // bitmap embedding only
++    if( bPdfOnly && ( nFsType & 0x0100 ) )
++        return false; // no subsetting
++    if( nFsType & 0x0008 )
++        return true; // Editable (wins over 0x0002 and 0x0004)
++    if( nFsType & 0x0004 )
++        return true; // Preview & Print: every output
++    if( nFsType & 0x0002 )
++        return false; // Restricted alone
++    return true; // Installable
++}
++#endif
+ #endif
+ 
+ using namespace com::sun::star;
+@@ -165,7 +203,7 @@
+     }
+     bool sufficientFontRights(false);
+ #if ENABLE_EOT
+-    if( eot )
++    if( eot && lcl_eotAllowed() )
+     {
+         unsigned uncompressedFontSize = 0;
+         unsigned char *nakedPointerToUncompressedFont = nullptr;
+@@ -191,7 +229,17 @@
+             }
+             writtenTotal += written;
+         }
++#ifdef __EMSCRIPTEN__
++        // Owner decision 2026-10-29: the same rights rule as every other embedded font (the 2026-10-22 rule:
++        // Preview & Print counts for every output, the least restrictive usage bit wins, Restricted alone and
++        // bitmap-only are refused, no-subsetting refuses PDF only), applied to the EOT header's fsType and to
++        // the decoded font's own OS/2 fsType; both must pass. libeot's EOTcanLegallyEdit (installable or
++        // editable only) is not used here.
++        sufficientFontRights = lcl_eotHeaderRights( eotMetadata.permissions, bPdfOnly )
++            && lcl_sufficientRights( uncompressedFont.get(), uncompressedFontSize, bPdfOnly );
++#else
+         sufficientFontRights = libeot::EOTcanLegallyEdit( &eotMetadata );
++#endif
+         libeot::EOTfreeMetadata( &eotMetadata );
+     }
+ #endif
