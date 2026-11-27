@@ -1,0 +1,49 @@
+diff --git a/oox/source/drawingml/textfield.cxx b/oox/source/drawingml/textfield.cxx
+index 17f503e..bf09f25 100644
+--- a/oox/source/drawingml/textfield.cxx
++++ b/oox/source/drawingml/textfield.cxx
+@@ -20,6 +20,7 @@
+ #include <sal/config.h>
+ 
+ #include <string_view>
++#include <cstdlib>
+ 
+ #include <drawingml/textfield.hxx>
+ 
+@@ -189,7 +190,10 @@ std::vector<Reference<XTextField>> TextField::createFieldsWasm(
+     //
+     // Every OTHER field type stays live — slide number in particular, which is
+     // computed from the slide being rendered and has no cached alternative.
+-    if (o3tl::starts_with(msType, u"datetime"))
++    // BUG-85: ONLY in the document conversion-time mode (the default). With a conversion time of "system" or an explicit one the field IS live: it
++    // formats the engine clock, which the worker has pinned to the typed time ("explicit") or left real ("system"), in the field's own format: the
++    // same rule as a DOCX date field. The worker tells the engine per conversion (set_live_datetime -> LO_WASM_LIVE_DATETIME).
++    if (o3tl::starts_with(msType, u"datetime") && !(getenv("LO_WASM_LIVE_DATETIME") != nullptr && getenv("LO_WASM_LIVE_DATETIME")[0] == '1'))
+         return aFields;
+ 
+     lclCreateTextFields(aFields, xModel, msType);
+diff --git a/oox/source/ppt/pptshape.cxx b/oox/source/ppt/pptshape.cxx
+index 30287fb..1d9bb9c 100644
+--- a/oox/source/ppt/pptshape.cxx
++++ b/oox/source/ppt/pptshape.cxx
+@@ -43,6 +43,7 @@
+ #include <oox/token/tokens.hxx>
+ #include <oox/token/properties.hxx>
+ #include <o3tl/string_view.hxx>
++#include <cstdlib>
+ 
+ using namespace ::oox::core;
+ using namespace ::oox::drawingml;
+@@ -269,7 +270,11 @@ void PPTShape::addShape(
+                                     // be a worse defect than a wrong one.
+                                     {
+                                         const OUString aCachedDate = pTextRun->getText();
+-                                        if (!aCachedDate.isEmpty())
++                                        // BUG-85: not when the conversion time is "system" or explicit: then the date stays LIVE (formatted from the engine clock,
++                                        // which the worker pinned to the typed time or left real), in the field's own format, as a DOCX date field is
++                                        const char* pLive = getenv("LO_WASM_LIVE_DATETIME");
++                                        const bool bLive = pLive != nullptr && pLive[0] == '1';
++                                        if (!aCachedDate.isEmpty() && !bLive)
+                                         {
+                                             xPropertySet->setPropertyValue( u"IsDateTimeVisible"_ustr, Any(true) );
+                                             xPropertySet->setPropertyValue( u"IsDateTimeFixed"_ustr, Any(true) );
