@@ -1,0 +1,30 @@
+FG-054 / D2 (owner decision 2026-10-18): the PPTX export writes each embedded font's
+real OS/2 fsType into its EOT header instead of 0 (Installable).
+
+vcl/source/font/EOTConverter.cxx wrote nFsType = 0 for every font it embeds into
+ppt/fonts/*.fntdata (upstream FIXME: "some TrueType fonts set it to an
+over-restrictive value"). A re-embedded Editable (8) or Preview & Print (4) face
+therefore came out labelled Installable: wider rights than the font grants. WASM
+only; EOTConverter is compiled whether or not --enable-eot is set (it is the
+encoder; libeot is the decoder).
+
+--- a/vcl/source/font/EOTConverter.cxx
++++ b/vcl/source/font/EOTConverter.cxx
+@@ -90,9 +90,17 @@
+ 
+         pEot->nItalic = pOS2->nFsSelection & 0x01;
+         pEot->nWeight = pOS2->nWeightClass;
++#ifdef __EMSCRIPTEN__
++        // FG-054 / D2: write the font's real OS/2 fsType into the EOT header. Writing 0
++        // (Installable) told every reader the font may be installed and edited freely,
++        // whatever its licence said: a re-embedded Preview & Print or Editable face came
++        // out as Installable. The rights are the font's, not ours to widen.
++        pEot->nFsType = pOS2->nFsType;
++#else
+         // FIXME: Should use OS2->fsType, but some TrueType fonts set it to an over-restrictive value.
+         // Since ATS does not enforce this on Mac OS X, we do not enforce it either.
+         pEot->nFsType = 0x0000;
++#endif
+         pEot->nUnicodeRange1 = pOS2->nUnicodeRange1;
+         pEot->nUnicodeRange2 = pOS2->nUnicodeRange2;
+         pEot->nUnicodeRange3 = pOS2->nUnicodeRange3;
