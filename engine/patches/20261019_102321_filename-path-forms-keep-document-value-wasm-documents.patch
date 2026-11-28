@@ -1,0 +1,76 @@
+FG-161 hybrid (owner-approved 2026-10-18): Writer FILENAME path forms keep the value
+the document carried.
+
+The browser converter stages every input in its own VFS (/tmp/in/<sanitised name>);
+the user's real location is unknown to a browser. SwFileNameField::ExpandImpl
+re-evaluates a non-fixed field from the load URL, so FILENAME \p (DOC/DOCX) and ODF
+text:file-name text:display="full" printed /tmp/in/<name>, and display="path" printed
+/tmp/in/. Under __EMSCRIPTEN__, for those two path forms only:
+  - keep m_aContent when the document supplied it (Word's cached field result, ODF's
+    element text, set on import through FIELD_PROP_PAR3; for DOC the WW8 importer now
+    passes the field result too, ww8par5.cxx Read_F_FileName) -- what Word prints;
+  - otherwise show FF_PATHNAME as the sanitised file name (FF_NAME) and FF_PATH as "".
+Name forms (FF_NAME, FF_NAME_NOEXT) are unchanged: the sanitised staged name (#473).
+
+diff --git a/sw/source/core/fields/docufld.cxx b/sw/source/core/fields/docufld.cxx
+index bfe5f65c876f..acdb6f313d08 100644
+--- a/sw/source/core/fields/docufld.cxx
++++ b/sw/source/core/fields/docufld.cxx
+@@ -492,7 +492,30 @@ SwFileNameField::SwFileNameField(SwFileNameFieldType* pTyp, sal_uInt32 nFormat)
+ OUString SwFileNameField::ExpandImpl(SwRootFrame const*const) const
+ {
+     if (!IsFixed())
++    {
++#ifdef __EMSCRIPTEN__
++        // The browser converter loads every document from a staging path in its own
++        // virtual filesystem (/tmp/in/<sanitised name>), never from the user's real
++        // location, which the browser does not know. A path form re-evaluated here
++        // therefore always printed that staging path. For the two path forms keep the
++        // value the document itself carried (Word's cached result, ODF's element
++        // text), which is what Word prints; with none, show the full form as the
++        // (sanitised) file name and the directory form as nothing. The name forms
++        // are unchanged: they show the staged, sanitised name.
++        const sal_uInt32 nForm = GetFormat() & ~FF_FIXED;
++        if (nForm == FF_PATHNAME || nForm == FF_PATH)
++        {
++            const SwFileNameFieldType* pType = static_cast<SwFileNameFieldType*>(GetTyp());
++            const OUString aLive = pType->Expand(GetFormat());
++            if (!m_aContent.isEmpty() && m_aContent != aLive && !m_aContent.startsWith("/tmp/"))
++                return m_aContent;
++            const_cast<SwFileNameField*>(this)->m_aContent
++                = nForm == FF_PATHNAME ? pType->Expand(FF_NAME) : OUString();
++            return m_aContent;
++        }
++#endif
+         const_cast<SwFileNameField*>(this)->m_aContent = static_cast<SwFileNameFieldType*>(GetTyp())->Expand(GetFormat());
++    }
+ 
+     return m_aContent;
+ }
+diff --git a/sw/source/filter/ww8/ww8par5.cxx b/sw/source/filter/ww8/ww8par5.cxx
+index 029184747a57..ba05cd82bd14 100644
+--- a/sw/source/filter/ww8/ww8par5.cxx
++++ b/sw/source/filter/ww8/ww8par5.cxx
+@@ -1949,7 +1949,7 @@ eF_ResT SwWW8ImplReader::Read_F_DateTime( WW8FieldDesc*pF, OUString& rStr )
+     return eF_ResT::OK;
+ }
+ 
+-eF_ResT SwWW8ImplReader::Read_F_FileName(WW8FieldDesc*, OUString &rStr)
++eF_ResT SwWW8ImplReader::Read_F_FileName(WW8FieldDesc* pF, OUString &rStr)
+ {
+     SwFileNameFormat eType = FF_NAME;
+     WW8ReadFieldParams aReadParam(rStr);
+@@ -1975,6 +1975,13 @@ eF_ResT SwWW8ImplReader::Read_F_FileName(WW8FieldDesc*, OUString &rStr)
+ 
+     SwFileNameField aField(
+         static_cast<SwFileNameFieldType*>(m_rDoc.getIDocumentFieldsAccess().GetSysFieldType(SwFieldIds::Filename)), eType);
++#ifdef __EMSCRIPTEN__
++    // FG-161: keep the path Word cached for FILENAME \p (e.g. "E:\r\rdot.doc"), as the
++    // DOCX and ODF importers already do; SwFileNameField::ExpandImpl prints it instead
++    // of the converter's staging path.
++    if (eType == FF_PATHNAME && pF)
++        aField.SetExpansion(GetFieldResult(pF));
++#endif
+     m_rDoc.getIDocumentContentOperations().InsertPoolItem(*m_pPaM, SwFormatField(aField));
+     return eF_ResT::OK;
+ }
