@@ -1,0 +1,24 @@
+diff --git a/sc/source/core/data/excelrowpitch.cxx b/sc/source/core/data/excelrowpitch.cxx
+index ecaca7bb4721..1876c5fb14b2 100644
+--- a/sc/source/core/data/excelrowpitch.cxx
++++ b/sc/source/core/data/excelrowpitch.cxx
+@@ -91,7 +91,8 @@ const Alias aAliases[] = {
+     { "calibri", 1 },         { "carlito", 1 },
+     { "cambria", 2 },         { "caladea", 2 },
+     { "comic sans ms", 3 },
+-    { "courier new", 4 },     { "courier", 4 },       { "monaco", 4 },       { "liberation mono", 4 }, { "cousine", 4 },
++    // "Courier" is the raster font: Excel gives its rows the Arial pitch (corpus: three Courier 10 workbooks print 12.35 pt rows; Courier New 10 prints 11.52)
++    { "courier new", 4 },     { "courier", 0 },       { "monaco", 4 },       { "liberation mono", 4 }, { "cousine", 4 },
+     { "segoe ui", 5 },
+     { "tahoma", 6 },
+     { "times new roman", 7 }, { "times", 7 },         { "tms rmn", 7 },        { "new york", 7 },        { "liberation serif", 7 }, { "tinos", 7 },
+@@ -175,7 +176,8 @@ int autoRowUnits(const Context& rCtx, int nStoredPx, int nFontPx, bool bWrap)
+ {
+     bool bKept = false;
+     int nFloor = rCtx.nNormalPx;
+-    if (rCtx.eKind != Kind::Ooxml && nStoredPx == rCtx.nDefPx && rCtx.nDefPx != rCtx.nNormalPx && (rCtx.nDefPx < rCtx.nNormalPx || rCtx.bDefFlag))
++    // a file without a DEFAULTROWHEIGHT record has none to keep (nDefPx 0 equalled a stored 0 and dropped the Normal floor)
++    if (rCtx.eKind != Kind::Ooxml && rCtx.nDefPx > 0 && nStoredPx == rCtx.nDefPx && rCtx.nDefPx != rCtx.nNormalPx && (rCtx.nDefPx < rCtx.nNormalPx || rCtx.bDefFlag))
+     {
+         bKept = true;   // a BIFF file's own default row height: honoured when it is below the Normal's or marked
+         nFloor = rCtx.nDefPx;
