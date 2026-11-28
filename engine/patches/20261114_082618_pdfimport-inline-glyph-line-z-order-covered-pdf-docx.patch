@@ -1,0 +1,192 @@
+diff --git a/sdext/source/pdfimport/inc/pdfiprocessor.hxx b/sdext/source/pdfimport/inc/pdfiprocessor.hxx
+index 43d3e79..75c1e39 100644
+--- a/sdext/source/pdfimport/inc/pdfiprocessor.hxx
++++ b/sdext/source/pdfimport/inc/pdfiprocessor.hxx
+@@ -84,6 +84,12 @@ namespace pdfi
+ 
+     private:
+         void processGlyphLine();
++#ifdef __EMSCRIPTEN__
++        // BUG-83: close the pending glyph line (so it takes its z-order NOW) when the opaque graphic about to be drawn covers it
++        void flushGlyphLineIfCoveredBy(const basegfx::B2DPolyPolygon& rArea);
++        // the page's work budget for those tests (and whether a graphic's own geometry is within the cap)
++        bool chargeCoverWork(sal_Int64 nUnits);
++#endif
+ 
+         // ContentSink interface implementation
+ 
+@@ -189,6 +195,12 @@ namespace pdfi
+         typedef std::vector<GraphicsContext> GraphicsContextStack;
+ 
+         std::vector<CharGlyph>             m_GlyphsList;
++#ifdef __EMSCRIPTEN__
++        // BUG-83: the centres of the pending glyphs and their range, kept as the line grows and cleared with it; the page's budget of coverage work
++        std::vector<basegfx::B2DPoint>     m_aGlyphCentres;
++        basegfx::B2DRange                  m_aGlyphCentreRange;
++        sal_Int64                          m_nCoverBudget = 0;
++#endif
+ 
+         std::shared_ptr<DocumentElement> m_pDocument;
+         PageElement*                       m_pCurPage;
+diff --git a/sdext/source/pdfimport/tree/pdfiprocessor.cxx b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+index 23af199..702ee0c 100644
+--- a/sdext/source/pdfimport/tree/pdfiprocessor.cxx
++++ b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+@@ -276,7 +276,71 @@ void PDFIProcessor::processGlyphLine()
+     }
+ 
+     m_GlyphsList.clear();
++#ifdef __EMSCRIPTEN__
++    m_aGlyphCentres.clear();
++    m_aGlyphCentreRange.reset();
++#endif
++}
++
++#ifdef __EMSCRIPTEN__
++namespace
++{
++    // a graphic with more vertices than this is not tested (treated as not covering): the test is a bounded decision, not a rasteriser
++    constexpr sal_uInt32 MAX_COVER_VERTICES = 10000;
++    // at most this many glyph centres are tested per graphic, evenly spaced over the line (deterministic: the output must be reproducible)
++    constexpr size_t MAX_COVER_SAMPLES = 64;
++
++    sal_uInt32 lcl_vertexCount(const basegfx::B2DPolyPolygon& rPoly)
++    {
++        sal_uInt32 nCount = 0;
++        for (sal_uInt32 i = 0; i < rPoly.count(); ++i)
++            nCount += rPoly.getB2DPolygon(i).count();
++        return nCount;
++    }
++}
++
++// BUG-83: spend from the page's budget; once it is spent every test says no, so the page keeps the order it had before this fix (never dropping text)
++bool PDFIProcessor::chargeCoverWork(sal_Int64 nUnits)
++{
++    if (m_nCoverBudget < nUnits)
++    {
++        m_nCoverBudget = 0;
++        return false;
++    }
++    m_nCoverBudget -= nUnits;
++    return true;
++}
++
++// BUG-83: a glyph line is only closed when the NEXT glyph does not continue it, so a line sat pending in m_GlyphsList while later graphics were drawn, and took its
++// z-order (m_nNextZOrder) AFTER them: text a PDF draws and then covers with an opaque picture or fill (a page-number artifact under a background strip, text under a
++// box, a poor redaction) came out ON TOP of the cover, visible. The text is kept (complete conversions only); what changes is where it sits: the line is closed, and
++// numbered, before the covering graphic. Only when the graphic covers at least half of the pending glyphs' centres, so an underline, a rule or a table border
++// (which touch a line without covering it) never split one. BOUNDED: the centres are kept incrementally, at most MAX_COVER_SAMPLES of them (evenly spaced) are tested
++// per graphic, a graphic of more than MAX_COVER_VERTICES vertices is not tested, and the page has a work budget (chargeCoverWork).
++void PDFIProcessor::flushGlyphLineIfCoveredBy(const basegfx::B2DPolyPolygon& rArea)
++{
++    if (m_aGlyphCentres.empty() || !rArea.count())
++        return;
++    if (!rArea.getB2DRange().overlaps(m_aGlyphCentreRange))
++        return;
++    const sal_uInt32 nVertices = lcl_vertexCount(rArea);
++    if (nVertices > MAX_COVER_VERTICES)
++        return;
++    const size_t nGlyphs = m_aGlyphCentres.size();
++    const size_t nSamples = std::min(nGlyphs, MAX_COVER_SAMPLES);
++    if (!chargeCoverWork(static_cast<sal_Int64>(nSamples) * (nVertices + 1)))
++        return;
++    size_t nCovered = 0;
++    for (size_t i = 0; i < nSamples; ++i)
++    {
++        const size_t nIndex = nSamples > 1 ? (i * (nGlyphs - 1)) / (nSamples - 1) : 0;
++        if (basegfx::utils::isInside(rArea, m_aGlyphCentres[nIndex], true))
++            ++nCovered;
++    }
++    if (nCovered * 2 >= nSamples)
++        processGlyphLine();
+ }
++#endif
+ 
+ void PDFIProcessor::drawGlyphs( const OUString&             rGlyphs,
+                                 const geometry::RealRectangle2D& rRect,
+@@ -360,6 +424,16 @@ void PDFIProcessor::drawGlyphs( const OUString&             rGlyphs,
+         processGlyphLine();
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    {
++        // BUG-83: the centre of this glyph's box, kept with the pending line (the box starts at the translation of its transformation, see processGlyphLine, and is
++        // its width wide and one font size high)
++        const basegfx::B2DPoint aCentre(totalTextMatrix1.get(0, 2) + charWidth * 0.5,
++                                        totalTextMatrix1.get(1, 2) + getFont(getCurrentContext().FontId).size * 0.5);
++        m_aGlyphCentres.push_back(aCentre);
++        m_aGlyphCentreRange.expand(aCentre);
++    }
++#endif
+     CharGlyph aGlyph(m_pCurElement, getCurrentContext(), charWidth, prevSpaceWidth, rGlyphs);
+     aGlyph.getGC().Transformation = totalTextMatrix1;
+     m_GlyphsList.push_back(aGlyph);
+@@ -398,6 +472,22 @@ void PDFIProcessor::setupImage(ImageId nImage)
+     double fRotate, fShearX;
+     rGC.Transformation.decompose(aScale, aTranslation, fRotate, fShearX);
+ 
++#ifdef __EMSCRIPTEN__
++    // BUG-83: a pending text line this picture covers is closed (and numbered) before it
++    if (!m_aGlyphCentres.empty())
++    {
++        basegfx::B2DPolyPolygon aCover(basegfx::utils::createPolygonFromRect(basegfx::B2DRange(0.0, 0.0, 1.0, 1.0)));
++        aCover.transform(rGC.Transformation);
++        // the clip only when the picture reaches the line at all, and only a clip of bounded size (and within the page's budget)
++        if (aCover.getB2DRange().overlaps(m_aGlyphCentreRange))
++        {
++            if (!rGC.Clip.count())
++                flushGlyphLineIfCoveredBy(aCover);
++            else if (lcl_vertexCount(rGC.Clip) <= MAX_COVER_VERTICES && chargeCoverWork(lcl_vertexCount(rGC.Clip) + 1))
++                flushGlyphLineIfCoveredBy(basegfx::utils::clipPolyPolygonOnPolyPolygon(aCover, rGC.Clip, true, false));
++        }
++    }
++#endif
+     const sal_Int32 nGCId = getGCId(rGC);
+     FrameElement* pFrame = ElementFactory::createFrameElement( m_pCurElement, nGCId );
+     ImageElement* pImageElement = ElementFactory::createImageElement( pFrame, nGCId, nImage );
+@@ -541,6 +631,11 @@ void PDFIProcessor::shadedFill(const geometry::RealRectangle2D& rRect,
+     if (!aPoly.count())
+         return;
+ 
++#ifdef __EMSCRIPTEN__
++    // BUG-83: a pending text line this opaque shading covers is closed (and numbered) before it
++    if (getCurrentContext().FillColor.Alpha >= 1.0)
++        flushGlyphLineIfCoveredBy(aPoly);
++#endif
+     PolyPolyElement* pPoly = ElementFactory::createPolyPolyElement(
+         m_pCurElement,
+         getGCId(getCurrentContext()),
+@@ -732,6 +827,11 @@ void PDFIProcessor::fillPath( const uno::Reference< rendering::XPolyPolygon2D >&
+         return;
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++    // BUG-83: a pending text line this opaque fill covers is closed (and numbered) before it
++    if (getCurrentContext().FillColor.Alpha >= 1.0)
++        flushGlyphLineIfCoveredBy(aPoly);
++#endif
+     PolyPolyElement* pPoly = ElementFactory::createPolyPolyElement(
+         m_pCurElement,
+         getGCId(getCurrentContext()),
+@@ -759,6 +859,11 @@ void PDFIProcessor::eoFillPath( const uno::Reference< rendering::XPolyPolygon2D
+         return;
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++    // BUG-83: a pending text line this opaque fill covers is closed (and numbered) before it
++    if (getCurrentContext().FillColor.Alpha >= 1.0)
++        flushGlyphLineIfCoveredBy(aPoly);
++#endif
+     PolyPolyElement* pPoly = ElementFactory::createPolyPolyElement(
+         m_pCurElement,
+         getGCId(getCurrentContext()),
+@@ -976,6 +1081,9 @@ void PDFIProcessor::startPage( const geometry::RealSize2D& rSize )
+     m_pCurPage->w = rSize.Width;
+     m_pCurPage->h = rSize.Height;
+     m_nNextZOrder = 1;
++#ifdef __EMSCRIPTEN__
++    m_nCoverBudget = 30000000; // BUG-83: units of centre x vertex tests per page; spent, the page keeps today's order (never drops text)
++#endif
+ 
+ 
+ }

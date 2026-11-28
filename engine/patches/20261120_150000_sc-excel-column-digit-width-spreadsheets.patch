@@ -1,0 +1,90 @@
+diff --git a/sc/inc/excelrowpitch.hxx b/sc/inc/excelrowpitch.hxx
+index 7a7e3913c4b2..d4f05b9e2e3b 100644
+--- a/sc/inc/excelrowpitch.hxx
++++ b/sc/inc/excelrowpitch.hxx
+@@ -52,6 +52,11 @@ struct SheetInfo
+ SC_DLLPUBLIC void SetSheetInfo(const ScDocument& rDoc, SCTAB nTab, SheetInfo aInfo);
+ SC_DLLPUBLIC void ApplyPrintRowHeights(ScDocument& rDoc);
+ 
++// Column widths of an Excel workbook as Excel PRINTS them (BUG-92 horizontal page splits): a column of w characters prints at w times the digit advance of the Normal font at its
++// size, rounded to a whole 1/600 inch (measured on the Office reference: 75 workbooks, 15 fonts, 5 sizes). Returns that digit width in twips (a fraction: k x 2.4), or 0 when the
++// environment variable LO_WASM_EXCEL_PRINT_ROWS is not "1" or the font or size is not covered (the caller then keeps the width it measured on the substitute font).
++SC_DLLPUBLIC double GetExcelColumnDigitTwips(const OUString& rFontName, double fHeightPt);
++
+ // A4-declared Excel sheets printed in Letter mode (owner decision 2026-11-14: follow the Office reference). Excel paginates the sheet ON A4 and scales every A4 page onto
+ // the Letter page. Calc lays the sheet out exactly as on A4 (100 %: the same rows and columns on each page, the same cell text layout) and the PDF export draws that A4
+ // page scaled and shifted onto a Letter page: getRenderer reports the Letter page size and a "ScWasmPageTransform" property that filter/source/pdf/pdfexport.cxx applies
+diff --git a/sc/source/core/data/excelrowpitch.cxx b/sc/source/core/data/excelrowpitch.cxx
+index 1876c5fb14b2..9714ea32a24c 100644
+--- a/sc/source/core/data/excelrowpitch.cxx
++++ b/sc/source/core/data/excelrowpitch.cxx
+@@ -123,6 +123,10 @@ bool lookupFont(const OUString& rName, double fPt, Metrics& rOut)
+     return true;
+ }
+ 
++// digit advance (em) of the Normal font as Excel prints column widths, by the index of aAliases (measured per font and size on the Office reference; every size of a font gave one value
++// that rounds to the printed whole 1/600 inch): 0 arial 1 calibri 2 cambria 3 comic sans ms 4 courier new 5 segoe ui 6 tahoma 7 times new roman 8 trebuchet ms 9 verdana
++const double aDigitAdvanceEm[10] = { 0.5565, 0.5086, 0.5542, 0.6112, 0.6000, 0.5400, 0.5468, 0.5037, 0.5235, 0.6378 };
++
+ // printed units of a row whose screen height is nPx pixels (custom rows, taller fonts, wrapped lines)
+ int path2Units(int nPx) { return static_cast<int>(std::floor(nPx * 6.059 + 0.15)); }
+ 
+@@ -282,6 +286,32 @@ void applySheet(ScDocument& rDoc, SCTAB nTab, const SheetInfo& rInfo)
+ }
+ }
+ 
++double GetExcelColumnDigitTwips(const OUString& rFontName, double fHeightPt)
++{
++    const char* pEnv = std::getenv("LO_WASM_EXCEL_PRINT_ROWS");
++    if (!pEnv || pEnv[0] != '1')
++        return 0.0;
++    int nFont = -1;
++    for (const Alias& rAlias : aAliases)
++        if (rFontName.equalsIgnoreAsciiCaseAscii(rAlias.pName))
++        {
++            nFont = rAlias.nFont;
++            break;
++        }
++    // "Century" is not a row-pitch font (no oracle for its rows) but its columns print like Arial's
++    if (nFont < 0 && rFontName.equalsIgnoreAsciiCaseAscii("century"))
++        nFont = 0;
++    if (nFont < 0 || fHeightPt < 5.75 || fHeightPt > 20.25)
++        return 0.0;
++    // whole 1/600 inch per character; an exact half goes to the even unit (measured: Segoe UI 9 pt, 40.5, prints 40; Segoe UI 11 pt, 49.5, prints 50)
++    const double fUnits = aDigitAdvanceEm[nFont] * fHeightPt * 600.0 / 72.0;
++    const double fFloor = std::floor(fUnits);
++    long nUnits = std::lround(fUnits);
++    if (std::abs(fUnits - fFloor - 0.5) < 1e-6)
++        nUnits = (static_cast<long>(fFloor) % 2 == 0) ? static_cast<long>(fFloor) : static_cast<long>(fFloor) + 1;
++    return nUnits * kTwipsPerUnit;
++}
++
+ void SetSheetInfo(const ScDocument& rDoc, SCTAB nTab, SheetInfo aInfo)
+ {
+     // Only a conversion that will print through this rule records anything (the bridge sets the variable before the load): a reused engine must not
+diff --git a/sc/source/filter/oox/unitconverter.cxx b/sc/source/filter/oox/unitconverter.cxx
+index 3b5e7e30e118..0165aac38b1e 100644
+--- a/sc/source/filter/oox/unitconverter.cxx
++++ b/sc/source/filter/oox/unitconverter.cxx
+@@ -32,6 +32,7 @@
+ #include <oox/helper/propertyset.hxx>
+ #include <oox/token/properties.hxx>
+ #include <stylesbuffer.hxx>
++#include <excelrowpitch.hxx>
+ #include <biffhelper.hxx>
+ #include <docuno.hxx>
+ 
+@@ -132,6 +133,13 @@ void UnitConverter::finalizeImport()
+     for( sal_Unicode cChar = '0'; cChar <= '9'; ++cChar )
+         nDigitWidth = ::std::max(nDigitWidth, o3tl::convert(xFont->getCharWidth(cChar),
+                                                             o3tl::Length::twip, o3tl::Length::emu));
++    // BUG-92: for a PDF conversion Excel's own printed width of a character (a table by font and size; zero when not applicable) replaces the width measured on the substitute font
++    {
++        const oox::xls::FontModel& rDefModel = pDefFont->getModel();
++        const double fOfficeTwips = sc::excelpitch::GetExcelColumnDigitTwips(rDefModel.maName, rDefModel.mfHeight);
++        if( fOfficeTwips > 0.0 )
++            nDigitWidth = std::llround(fOfficeTwips * 635.0);   // twips to EMU
++    }
+     if( nDigitWidth > 0 )
+         maCoeffs[ Unit::Digit ] = nDigitWidth;
+     // get width of space character
