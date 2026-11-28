@@ -1,0 +1,36 @@
+--- a/vcl/source/fontsubset/sft.cxx
++++ b/vcl/source/fontsubset/sft.cxx
+@@ -628,21 +628,30 @@
+ static OString nameExtract( const sal_uInt8* name, int nTableSize, int n, int dbFlag, OUString* ucs2result )
+ {
+     OStringBuffer res;
+-    const sal_uInt8* ptr = name + GetUInt16(name, 4) + GetUInt16(name + 6, 12 * n + 10);
++    // BUG-82 (font name, WAF review): the string offset is added up and checked as an INTEGER against the table size before the pointer is formed: for a hostile
++    // font (embedded in an untrusted document) name + stringOffset + recordOffset lies up to ~128 KB past the table, and forming a pointer past the end of the object is
++    // undefined behaviour (a pointer-overflow sanitizer reports it) even if it is never dereferenced. The check and its outcome are the same as before.
++    const sal_uInt32 nStringOffset = static_cast<sal_uInt32>(GetUInt16(name, 4)) + GetUInt16(name + 6, 12 * n + 10);
+     int len = GetUInt16(name+6, 12 * n + 8);
+ 
+     // sanity check
+-    const sal_uInt8* end_table = name+nTableSize;
+-    const int available_space = ptr > end_table ? 0 : (end_table - ptr);
++    const int available_space = (nTableSize < 0 || nStringOffset > static_cast<sal_uInt32>(nTableSize)) ? 0 : (nTableSize - static_cast<int>(nStringOffset));
+     if( (len <= 0) || len > available_space)
+     {
+         if( ucs2result )
+             ucs2result->clear();
+         return OString();
+     }
++    const sal_uInt8* ptr = name + nStringOffset;
+ 
+     if( ucs2result )
+         ucs2result->clear();
++    // BUG-82 (font name): a record the font declares as UTF-16 (platform 0 or 3) whose length is ODD is not UTF-16. Some embedded subset fonts (WordPerfect's, found in
++    // PDFs) hold 8-bit text there, e.g. 17 bytes "DBHKCJ+WPPhonetic" under platform 0: read as UTF-16BE it became eight CJK characters (and dropped the last byte), the
++    // family name was lost, and the PDF import wrote that garbage as the run's font. Give no name for such a record, so the caller falls through to the next
++    // candidate (the Macintosh record of the same font holds the 8-bit name). A well-formed UTF-16 record always has an even length: nothing valid changes.
++    if (dbFlag && (len & 1))
++        return OString();
+     if (dbFlag) {
+         res.setLength(len/2);
+         for (int i = 0; i < len/2; i++)
