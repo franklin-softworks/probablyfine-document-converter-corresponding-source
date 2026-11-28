@@ -1,0 +1,67 @@
+diff --git a/vcl/source/gdi/pdfwriter_impl.cxx b/vcl/source/gdi/pdfwriter_impl.cxx
+index c03e37a37c66..eb0adf90decb 100644
+--- a/vcl/source/gdi/pdfwriter_impl.cxx
++++ b/vcl/source/gdi/pdfwriter_impl.cxx
+@@ -3018,14 +3018,39 @@ void PDFWriterImpl::appendBuildinFontsToDict( OStringBuffer& rDict ) const
+     }
+ }
+ 
++namespace
++{
++// BUG-94: the subsets of the fonts a document uses are kept in a std::map keyed by the font face's ADDRESS, so iterating it writes the font objects in
++// address order, which is not the same from one run to the next (heap layout): two runs of one conversion gave PDFs that differ only in the order of
++// the font objects. Each face's first subset takes its font id when the face is first used, so that id is the deterministic order (document order of
++// first use); the address is only the tie-break for an entry with no subset.
++template <typename Map, typename FirstId>
++std::vector<const typename Map::value_type*> inFirstUseOrder(const Map& rMap, FirstId firstId)
++{
++    std::vector<const typename Map::value_type*> aOrder;
++    aOrder.reserve(rMap.size());
++    for (const auto& rEntry : rMap)
++        aOrder.push_back(&rEntry);
++    std::stable_sort(aOrder.begin(), aOrder.end(),
++                     [&](const typename Map::value_type* a, const typename Map::value_type* b) { return firstId(*a) < firstId(*b); });
++    return aOrder;
++}
++template <typename Entry>
++sal_Int32 firstSubsetId(const Entry& rEntry)
++{
++    return rEntry.second.m_aSubsets.empty() ? SAL_MAX_INT32 : rEntry.second.m_aSubsets.front().m_nFontID;
++}
++}
++
+ bool PDFWriterImpl::emitFonts()
+ {
+     OStringBuffer aLine( 1024 );
+ 
+     std::map< sal_Int32, sal_Int32 > aFontIDToObject;
+ 
+-    for (const auto & subset : m_aSubsets)
++    for (const auto* pSubsetEntry : inFirstUseOrder(m_aSubsets, [](const auto& e) { return firstSubsetId(e); }))
+     {
++        const auto& subset = *pSubsetEntry;
+         for (auto & s_subset :subset.second.m_aSubsets)
+         {
+             sal_GlyphId pGlyphIds[ 256 ] = {};
+@@ -3193,8 +3218,9 @@ bool PDFWriterImpl::emitFonts()
+     }
+ 
+     // emit system fonts
+-    for (auto const& systemFont : m_aSystemFonts)
++    for (const auto* pSystemEntry : inFirstUseOrder(m_aSystemFonts, [](const auto& e) { return e.second.m_nNormalFontID; }))
+     {
++        const auto& systemFont = *pSystemEntry;
+         std::map< sal_Int32, sal_Int32 > aObjects = emitSystemFont( systemFont.first, systemFont.second );
+         for (auto const& item : aObjects)
+         {
+@@ -3204,8 +3230,9 @@ bool PDFWriterImpl::emitFonts()
+     }
+ 
+     // emit Type3 fonts
+-    for (auto const& it : m_aType3Fonts)
++    for (const auto* pType3Entry : inFirstUseOrder(m_aType3Fonts, [](const auto& e) { return firstSubsetId(e); }))
+     {
++        const auto& it = *pType3Entry;
+         if (!emitType3Font(it.first, it.second, aFontIDToObject))
+             return false;
+     }
