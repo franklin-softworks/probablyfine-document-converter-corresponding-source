@@ -1,0 +1,155 @@
+diff --git a/sdext/source/pdfimport/inc/pdfiprocessor.hxx b/sdext/source/pdfimport/inc/pdfiprocessor.hxx
+index cce8707593e1..f0c36c802496 100644
+--- a/sdext/source/pdfimport/inc/pdfiprocessor.hxx
++++ b/sdext/source/pdfimport/inc/pdfiprocessor.hxx
+@@ -103,6 +103,11 @@ namespace pdfi
+         void flushGlyphLineIfCoveredBy(const basegfx::B2DPolyPolygon& rArea);
+         // the page's work budget for those tests (and whether a graphic's own geometry is within the cap)
+         bool chargeCoverWork(sal_Int64 nUnits);
++        // FEAT-27: a line a later opaque graphic covers is COUNTED per page (always) and, when the opt-in flag file /tmp/lo_pdf_drop_hidden exists, not emitted at all (the opt-in
++        // "remove text hidden under shapes"); the counts go to a small JSON file the worker reads (/tmp/lo_pdf_hidden_text.json), written ONCE, at the end of the last page, and only when the engine was asked to count (the flag file /tmp/lo_pdf_hidden_report, or the drop flag)
++        void noteHiddenLine(bool bDropped);
++        void noteUndecidedPage();
++        void writeHiddenTextReport() const;
+ #endif
+ 
+         // ContentSink interface implementation
+@@ -214,6 +219,19 @@ namespace pdfi
+         std::vector<basegfx::B2DPoint>     m_aGlyphCentres;
+         basegfx::B2DRange                  m_aGlyphCentreRange;
+         sal_Int64                          m_nCoverBudget = 0;
++        // FEAT-27: the page being read (1-based), the covered lines per page, the pages whose budget ran out before every test was made, the total dropped
++        sal_Int32                          m_nPageNo = 0;
++        std::vector<std::pair<sal_Int32, sal_Int32>> m_aHiddenPages;   // the first 200 pages with a covered line, and how many each
++        std::vector<sal_Int32>             m_aUndecidedPages;           // the first 200 undecided pages
++        sal_Int32                          m_nHiddenLines = 0;          // every covered line, however many pages
++        sal_Int32                          m_nHiddenPagesTotal = 0;     // every page with a covered line
++        sal_Int32                          m_nLastHiddenPage = 0;
++        sal_Int32                          m_nUndecidedTotal = 0;
++        sal_Int32                          m_nLastUndecided = 0;
++        sal_Int32                          m_nHiddenDropped = 0;
++        bool                               m_bReportHidden = false;     // the flag file /tmp/lo_pdf_hidden_report (or the drop flag) exists: only then is anything counted
++        bool                               m_bHiddenDirty = false;
++        bool                               m_bDropHidden = false;   // the opt-in "remove text hidden under shapes" (a flag file the worker creates)
+ #endif
+ 
+         std::shared_ptr<DocumentElement> m_pDocument;
+diff --git a/sdext/source/pdfimport/tree/pdfiprocessor.cxx b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+index fa6f811897c0..66005e35bca3 100644
+--- a/sdext/source/pdfimport/tree/pdfiprocessor.cxx
++++ b/sdext/source/pdfimport/tree/pdfiprocessor.cxx
+@@ -57,6 +57,10 @@ using namespace com::sun::star;
+ #include <drawinglayer/processor2d/linegeometryextractor2d.hxx>
+ 
+ #include <iostream>
++#ifdef __EMSCRIPTEN__
++#include <cstdlib>
++#include <fstream>
++#endif
+ 
+ namespace pdfi
+ {
+@@ -322,6 +326,7 @@ bool PDFIProcessor::chargeCoverWork(sal_Int64 nUnits)
+     if (m_nCoverBudget < nUnits)
+     {
+         m_nCoverBudget = 0;
++        noteUndecidedPage();   // FEAT-27: this page may hide text the test could not decide (it keeps today's order and drops nothing)
+         return false;
+     }
+     m_nCoverBudget -= nUnits;
+@@ -355,7 +360,67 @@ void PDFIProcessor::flushGlyphLineIfCoveredBy(const basegfx::B2DPolyPolygon& rAr
+             ++nCovered;
+     }
+     if (nCovered * 2 >= nSamples)
+-        processGlyphLine();
++    {
++        // FEAT-27: a covered line. Dropped only on the opt-in (the worker creates /tmp/lo_pdf_drop_hidden for a PDF input when the setting is on; the JS ENV is read once at start-up, so a per-conversion switch is a file); otherwise kept, as before
++        const bool bDrop = m_bDropHidden;
++        if (m_bReportHidden)
++            noteHiddenLine(bDrop);
++        if (bDrop)
++        {
++            m_GlyphsList.clear();
++            m_aGlyphCentres.clear();
++            m_aGlyphCentreRange.reset();
++            processGlyphLine();   // nothing left to emit; resets the line's bracket state as every line end does
++        }
++        else
++            processGlyphLine();
++    }
++}
++
++void PDFIProcessor::noteHiddenLine(bool bDropped)
++{
++    constexpr size_t MAX_REPORT_PAGES = 200;   // the report, and so the notice, lists at most this many pages; the totals are exact
++    ++m_nHiddenLines;
++    if (m_nLastHiddenPage != m_nPageNo)
++    {
++        m_nLastHiddenPage = m_nPageNo;
++        ++m_nHiddenPagesTotal;
++        if (m_aHiddenPages.size() < MAX_REPORT_PAGES)
++            m_aHiddenPages.emplace_back(m_nPageNo, 1);
++    }
++    else if (!m_aHiddenPages.empty() && m_aHiddenPages.back().first == m_nPageNo)
++        ++m_aHiddenPages.back().second;
++    if (bDropped)
++        ++m_nHiddenDropped;
++    m_bHiddenDirty = true;
++}
++
++void PDFIProcessor::noteUndecidedPage()
++{
++    if (!m_bReportHidden || m_nLastUndecided == m_nPageNo)
++        return;
++    constexpr size_t MAX_REPORT_PAGES = 200;   // as in noteHiddenLine
++    m_nLastUndecided = m_nPageNo;
++    ++m_nUndecidedTotal;
++    if (m_aUndecidedPages.size() < MAX_REPORT_PAGES)
++        m_aUndecidedPages.push_back(m_nPageNo);
++    m_bHiddenDirty = true;
++}
++
++// the counts the worker reads after the conversion: {"lines":N,"dropped":D,"pagesTotal":T,"pages":[[page,lines],...],"undecidedTotal":U,"undecided":[page,...]}; written once, at the end of the
++// last page (so the cost does not grow with the number of covered lines: an OCR'd scan, a text layer under a page image, covers EVERY line of every page)
++void PDFIProcessor::writeHiddenTextReport() const
++{
++    std::ofstream aOut("/tmp/lo_pdf_hidden_text.json", std::ios::trunc);
++    if (!aOut)
++        return;
++    aOut << "{\"lines\":" << m_nHiddenLines << ",\"dropped\":" << m_nHiddenDropped << ",\"pagesTotal\":" << m_nHiddenPagesTotal << ",\"pages\":[";
++    for (size_t i = 0; i < m_aHiddenPages.size(); ++i)
++        aOut << (i ? "," : "") << "[" << m_aHiddenPages[i].first << "," << m_aHiddenPages[i].second << "]";
++    aOut << "],\"undecidedTotal\":" << m_nUndecidedTotal << ",\"undecided\":[";
++    for (size_t i = 0; i < m_aUndecidedPages.size(); ++i)
++        aOut << (i ? "," : "") << m_aUndecidedPages[i];
++    aOut << "]}";
+ }
+ #endif
+ 
+@@ -1068,6 +1133,14 @@ const GraphicsContext& PDFIProcessor::getGraphicsContext( sal_Int32 nGCId ) cons
+ void PDFIProcessor::endPage()
+ {
+     processGlyphLine(); // draw last line
++#ifdef __EMSCRIPTEN__
++    // FEAT-27: the report is written ONCE, when the last page ends
++    if (m_bHiddenDirty && m_pCurPage && m_pCurPage->PageNumber == m_nPages)
++    {
++        writeHiddenTextReport();
++        m_bHiddenDirty = false;
++    }
++#endif
+     if( m_xStatusIndicator.is()
+         && m_pCurPage
+         && m_pCurPage->PageNumber == m_nPages
+@@ -1122,6 +1195,11 @@ void PDFIProcessor::startPage( const geometry::RealSize2D& rSize )
+     m_pCurPage->h = rSize.Height;
+     m_nNextZOrder = 1;
+ #ifdef __EMSCRIPTEN__
++    if (++m_nPageNo == 1)   // FEAT-27: what the worker asked for is read once per document: nothing is counted, written or dropped unless it asked
++    {
++        m_bDropHidden = std::ifstream("/tmp/lo_pdf_drop_hidden").good();
++        m_bReportHidden = m_bDropHidden || std::ifstream("/tmp/lo_pdf_hidden_report").good();
++    }
+     m_nCoverBudget = 30000000; // BUG-83: units of centre x vertex tests per page; spent, the page keeps today's order (never drops text)
+ #endif
+ 
