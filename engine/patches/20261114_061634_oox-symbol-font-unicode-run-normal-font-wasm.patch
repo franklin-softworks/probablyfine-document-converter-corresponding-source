@@ -1,0 +1,224 @@
+--- a/oox/source/export/drawingml.cxx
++++ b/oox/source/export/drawingml.cxx
+@@ -2508,6 +2508,133 @@
+     return sTarget;
+ }
+ 
++namespace
++{
++
++// BUG-82: how a run in a legacy symbol font (Symbol, Wingdings, Wingdings 2/3, Webdings) whose text is REAL Unicode (what the PDF import makes of a PDF's symbol font) is written to
++// pptx. Office reads the text of such a font as that font's CODES (U+F020..U+F0FF) and has no glyph for a real Unicode character in it: it draws an empty box (or, for the geometric
++// shapes U+25A0..U+25FF and other "ambiguous" characters, takes the glyph of the same code from the symbol font in the east-asian slot). Three ways, by CHARACTER:
++//  - a character a NORMAL font really has (a bullet, an arrow, a Greek letter, Latin and punctuation: the fixed list below, WGL4 less the geometric shapes, which Arial and the
++//    other common fonts do not have as text: PowerPoint draws them as a picture) moves to a normal font: Arial for the usual bullets, otherwise the font the run inherits;
++//  - a character Office's own legacy-font table maps FROM a legacy font (corpus agent's measurement of Word and PowerPoint, 2026-11-14: Wingdings 0xA7 -> U+25AA, 0x6E -> U+25FC,
++//    0x6C -> U+26AB, 0x75 -> U+25C6, 0x76 -> U+2756, 0xD8 -> U+27A2, 0xFC -> U+2713 ... ) is written BACK as that code in the legacy font (Wingdings + U+F0A7), which is what the
++//    original decks hold: Office then draws it AND writes the Unicode into its own PDF text layer;
++//  - everything else stays as before (the run moves to a normal font).
++enum class SymbolRunKind { Plain, MoveToNormal, LegacyCodes };
++
++struct SymbolRunDecision
++{
++    SymbolRunKind eKind = SymbolRunKind::Plain;
++    bool bOnlyBullets = false;  // MoveToNormal: every character is a bullet sign, so the usual bullet font (Arial) is named
++    OUString aText;             // LegacyCodes: the run text with each character replaced by its private-use code
++};
++
++bool lcl_isSymbolFontName(const OUString& rName, OUString& rKey)
++{
++    rKey = rName.toAsciiLowerCase().replaceAll(u" ", u"");
++    return rKey == u"symbol" || rKey == u"wingdings" || rKey == u"wingdings2" || rKey == u"wingdings3" || rKey == u"webdings";
++}
++
++// The characters a normal font has as text. WGL4 (the Windows Glyph List, what Arial, Times New Roman, Calibri and the other common fonts cover): Latin Extended-A,
++// Greek, Cyrillic, the general punctuation (incl. the bullet U+2022), the currency/letterlike signs, the arrows U+2190..U+2195 and U+21A8, the mathematical signs of the Symbol font
++// (U+2202 U+2206 U+220F U+2211 U+2212 U+2215 U+2219 U+221A U+221E U+221F U+2229 U+222B U+2248 U+2260 U+2261 U+2264 U+2265) and the micro sign. NOT in the list: the geometric
++// shapes U+25A0..U+25FF (U+25AA drew as a picture in PowerPoint), the dingbats U+2700..U+27BF, U+2B00.. and the miscellaneous symbols U+2600..U+26FF: those are Wingdings' own.
++bool lcl_normalFontsHaveGlyph(sal_Unicode c)
++{
++    struct Range { sal_Unicode nLo, nHi; };
++    static constexpr Range aRanges[] = {
++        { 0x00B5, 0x00B5 }, { 0x0100, 0x017F }, { 0x0192, 0x0192 }, { 0x01FA, 0x01FF }, { 0x02C6, 0x02C7 }, { 0x02D8, 0x02DD },
++        { 0x0384, 0x038A }, { 0x038C, 0x038C }, { 0x038E, 0x03A1 }, { 0x03A3, 0x03CE },
++        { 0x0400, 0x045F }, { 0x0490, 0x0491 },
++        { 0x2013, 0x2015 }, { 0x2017, 0x201E }, { 0x2020, 0x2022 }, { 0x2026, 0x2026 }, { 0x2030, 0x2030 }, { 0x2032, 0x2033 }, { 0x2039, 0x203A }, { 0x203C, 0x203C },
++        { 0x203E, 0x203E }, { 0x2044, 0x2044 }, { 0x207F, 0x207F }, { 0x20A3, 0x20A4 }, { 0x20A7, 0x20A7 }, { 0x20AC, 0x20AC },
++        { 0x2105, 0x2105 }, { 0x2113, 0x2113 }, { 0x2116, 0x2116 }, { 0x2122, 0x2122 }, { 0x2126, 0x2126 }, { 0x212E, 0x212E }, { 0x215B, 0x215E },
++        { 0x2190, 0x2195 }, { 0x21A8, 0x21A8 },
++        { 0x2202, 0x2202 }, { 0x2206, 0x2206 }, { 0x220F, 0x220F }, { 0x2211, 0x2212 }, { 0x2215, 0x2215 }, { 0x2219, 0x221A }, { 0x221E, 0x221F }, { 0x2229, 0x2229 },
++        { 0x222B, 0x222B }, { 0x2248, 0x2248 }, { 0x2260, 0x2261 }, { 0x2264, 0x2265 },
++    };
++    for (const Range& r : aRanges)
++        if (c >= r.nLo && c <= r.nHi)
++            return true;
++    return false;
++}
++
++// Office's table, inverted: the Unicode character Office writes into its PDF text layer for a code of a legacy font -> that code. Only the characters a normal font does NOT have
++// (the others are handled by lcl_normalFontsHaveGlyph). Wingdings: 13 codes (0xE0 -> U+2192 is an arrow, a normal font has it); Symbol: 11 codes (all but U+22A5 and U+23AF are
++// Latin or mathematical signs a normal font has). Wingdings 2, Wingdings 3 and Webdings: Office maps none (it keeps the private-use code, so nothing arrives as Unicode).
++sal_uInt8 lcl_legacyCodeFor(const OUString& rFontKey, sal_Unicode c)
++{
++    struct Entry { sal_Unicode nUni; sal_uInt8 nCode; };
++    static constexpr Entry aWingdings[] = { { 0x263A, 0x4A }, { 0x26AB, 0x6C }, { 0x25FC, 0x6E }, { 0x2751, 0x71 }, { 0x2B27, 0x73 }, { 0x29EB, 0x74 },
++                                            { 0x25C6, 0x75 }, { 0x2756, 0x76 }, { 0x25AA, 0xA7 }, { 0x27A2, 0xD8 }, { 0x2794, 0xE8 }, { 0x2713, 0xFC } };
++    static constexpr Entry aSymbol[] = { { 0x22A5, 0x5E }, { 0x23AF, 0xBE } };
++    if (rFontKey == u"wingdings")
++    {
++        for (const Entry& e : aWingdings)
++            if (e.nUni == c)
++                return e.nCode;
++    }
++    else if (rFontKey == u"symbol")
++    {
++        for (const Entry& e : aSymbol)
++            if (e.nUni == c)
++                return e.nCode;
++    }
++    return 0;
++}
++
++SymbolRunDecision lcl_decideSymbolRun(const OUString& rText, const OUString& rFontName)
++{
++    SymbolRunDecision aRes;
++    OUString aKey;
++    if (!lcl_isSymbolFontName(rFontName, aKey))
++        return aRes;
++    bool bAnyUnicode = false;
++    bool bAnyCode = false;
++    bool bOnlyBullets = !rText.isEmpty();
++    sal_Int32 nCovered = 0, nLegacy = 0, nOther = 0;
++    for (sal_Int32 i = 0; i < rText.getLength(); ++i)
++    {
++        const sal_Unicode c = rText[i];
++        // U+00B5 is the exception below U+0100: an older PDF import turned Symbol's code 0x6D (glyph "mu") into the micro sign; only characters from U+0100 up that are not private-use
++        // count as real Unicode, so a code is never taken for Unicode
++        if (c == 0xB5 || (c >= 0x100 && !(c >= 0xE000 && c <= 0xF8FF)))
++        {
++            bAnyUnicode = true;
++            if (c != 0x2022 && c != 0x25AA && c != 0x25CF && c != 0x25A0 && c != 0x25E6 && c != 0x2013)
++                bOnlyBullets = false;
++            if (lcl_normalFontsHaveGlyph(c))
++                ++nCovered;
++            else if (lcl_legacyCodeFor(aKey, c) != 0)
++                ++nLegacy;
++            else
++                ++nOther;
++        }
++        else if (c != 0x20) // a space is a space in a symbol font and in a normal font: it decides nothing (a PDF import keeps the space after a bullet in the run)
++            bAnyCode = true;
++    }
++    if (!bAnyUnicode || bAnyCode)
++        return aRes; // a run of real codes (U+F0xx, or 0x20-0xFF) keeps its symbol font in every slot: that is how Office writes them
++    if (nLegacy > 0 && nCovered == 0 && nOther == 0)
++    {
++        OUStringBuffer aBuf(rText.getLength());
++        for (sal_Int32 i = 0; i < rText.getLength(); ++i)
++        {
++            const sal_Unicode c = rText[i];
++            const sal_uInt8 nCode = c == 0x20 ? 0 : lcl_legacyCodeFor(aKey, c);
++            aBuf.append(nCode ? static_cast<sal_Unicode>(0xF000 + nCode) : c);
++        }
++        aRes.eKind = SymbolRunKind::LegacyCodes;
++        aRes.aText = aBuf.makeStringAndClear();
++        return aRes;
++    }
++    aRes.eKind = SymbolRunKind::MoveToNormal;
++    aRes.bOnlyBullets = bOnlyBullets;
++    return aRes;
++}
++
++}
++
+ void DrawingML::WriteRunProperties( const Reference< XPropertySet >& rRun, bool bIsField, sal_Int32 nElement,
+                                     bool bCheckDirect,bool& rbOverridingCharHeight, sal_Int32& rnCharHeight,
+                                     sal_Int16 nScriptType, const Reference< XPropertySet >& rXShapePropSet)
+@@ -2859,6 +2986,14 @@
+         }
+     }
+ 
++    // BUG-82: a run of a legacy symbol font whose text is real Unicode (see lcl_decideSymbolRun above): per slot, by the font that slot names
++    OUString aSymbolRunText;
++    {
++        css::uno::Reference<css::text::XTextRange> xRunRange(rRun, css::uno::UNO_QUERY);
++        if (xRunRange.is())
++            aSymbolRunText = xRunRange->getString();
++    }
++
+     if (GetProperty(rXPropSet, u"CharFontName"_ustr))
+     {
+         const char* const pitch = nullptr;
+@@ -2867,17 +3002,23 @@
+ 
+         mAny >>= usTypeface;
+ 
+-        if (!mbEmbedFonts || EmbeddedFontsHelper::isCommonFont(usTypeface))
++        const SymbolRunDecision aSymbolRun = lcl_decideSymbolRun(aSymbolRunText, usTypeface);
++        const bool bMovedFromSymbol = aSymbolRun.eKind == SymbolRunKind::MoveToNormal;
++        if (bMovedFromSymbol)
++            usTypeface = aSymbolRun.bOnlyBullets ? u"Arial"_ustr : OUString();
++
++        if (!bMovedFromSymbol && (!mbEmbedFonts || EmbeddedFontsHelper::isCommonFont(usTypeface)))
+         {
+             OUString aSubstName( GetSubsFontName( usTypeface, SubsFontFlags::ONLYONE | SubsFontFlags::MS ) );
+             if (!aSubstName.isEmpty())
+                 usTypeface = aSubstName;
+         }
+ 
+-        mpFS->singleElementNS( XML_a, XML_latin,
+-                               XML_typeface, usTypeface,
+-                               XML_pitchFamily, pitch,
+-                               XML_charset, charset );
++        if (!usTypeface.isEmpty())
++            mpFS->singleElementNS( XML_a, XML_latin,
++                                   XML_typeface, usTypeface,
++                                   XML_pitchFamily, pitch,
++                                   XML_charset, charset );
+     }
+ 
+     if ((bComplex
+@@ -2892,16 +3033,22 @@
+         OUString usTypeface;
+ 
+         mAny >>= usTypeface;
+-        if (!mbEmbedFonts || EmbeddedFontsHelper::isCommonFont(usTypeface))
++        // BUG-82: the east-asian and complex slots too (see above): a run of real Unicode never keeps a symbol font in ANY slot
++        const SymbolRunDecision aSymbolRun = lcl_decideSymbolRun(aSymbolRunText, usTypeface);
++        const bool bMovedFromSymbol = aSymbolRun.eKind == SymbolRunKind::MoveToNormal;
++        if (bMovedFromSymbol)
++            usTypeface = aSymbolRun.bOnlyBullets ? u"Arial"_ustr : OUString();
++        if (!bMovedFromSymbol && (!mbEmbedFonts || EmbeddedFontsHelper::isCommonFont(usTypeface)))
+         {
+             OUString aSubstName( GetSubsFontName( usTypeface, SubsFontFlags::ONLYONE | SubsFontFlags::MS ) );
+             if (!aSubstName.isEmpty())
+                 usTypeface = aSubstName;
+         }
+-        mpFS->singleElementNS( XML_a, bComplex ? XML_cs : XML_ea,
+-                               XML_typeface, usTypeface,
+-                               XML_pitchFamily, pitch,
+-                               XML_charset, charset );
++        if (!usTypeface.isEmpty())
++            mpFS->singleElementNS( XML_a, bComplex ? XML_cs : XML_ea,
++                                   XML_typeface, usTypeface,
++                                   XML_pitchFamily, pitch,
++                                   XML_charset, charset );
+     }
+ 
+     if( bIsField )
+@@ -3189,6 +3336,15 @@
+         Reference< XPropertySet > xPropSet( rRun, uno::UNO_QUERY );
+ 
+         WriteRunProperties( xPropSet, bIsURLField, XML_rPr, true, rbOverridingCharHeight, rnCharHeight, GetScriptType(sText), rXShapePropSet);
++        {
++            // BUG-82: a legacy symbol font run of real Unicode that Office's table maps from that font is written back as the font's code (Wingdings + U+F0A7)
++            OUString aRunFontName;
++            if (GetProperty(xPropSet, u"CharFontName"_ustr))
++                mAny >>= aRunFontName;
++            const SymbolRunDecision aSymbolRun = lcl_decideSymbolRun(sText, aRunFontName);
++            if (aSymbolRun.eKind == SymbolRunKind::LegacyCodes)
++                sText = aSymbolRun.aText;
++        }
+         mpFS->startElementNS(XML_a, XML_t);
+         mpFS->writeEscaped( sText );
+         mpFS->endElementNS( XML_a, XML_t );
